@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能雷达跟点</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 {
+            font-size: 1.5em;
+            margin-bottom: 16px;
+            color: #00d4ff;
+        }
+        .container {
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+            justify-content: center;
+            max-width: 1200px;
+            width: 100%;
+        }
+        .panel {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }
+        .panel-title {
+            font-size: 1em;
+            color: #888;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .preview-area {
+            position: relative;
+        }
+        canvas, img {
+            border-radius: 8px;
+            display: block;
+            background: #2b2b2b;
+        }
+        #minimapCanvas {
+            cursor: crosshair;
+            width: 300px;
+            height: 300px;
+            object-fit: contain;
+        }
+        #resultImg {
+            width: 500px;
+            height: 500px;
+            object-fit: contain;
+        }
+        .status-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            margin-top: 16px;
+        }
+        .status-item {
+            background: #0f3460;
+            padding: 10px 14px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .status-label { font-size: 0.75em; color: #999; }
+        .status-value { font-size: 1.1em; font-weight: bold; margin-top: 4px; }
+        .state-global { color: #ffa726; }
+        .state-local { color: #66bb6a; }
+        .state-lost { color: #ef5350; }
+        .found-yes { color: #66bb6a; }
+        .found-no { color: #ef5350; }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: #00d4ff; color: #000; }
+        .btn-primary:hover { background: #00b8e6; transform: translateY(-1px); }
+        .btn-secondary { background: #333; color: #fff; border: 1px solid #555; }
+        .btn-secondary:hover { background: #444; }
+        .btn-danger { background: #e53935; color: #fff; }
+        .btn-danger:hover { background: #c62828; }
+
+        input[type="file"] { display: none; }
+        label.file-label {
+            display: inline-block;
+            padding: 10px 20px;
+            background: #5c6bc0;
+            color: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        label.file-label:hover { background: #3f51b5; }
+
+        .mode-toggle {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        .mode-btn {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            background: #222;
+            color: #aaa;
+            border: 1px solid #444;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .mode-btn.active {
+            background: #00d4ff;
+            color: #000;
+            border-color: #00d4ff;
+        }
+
+        /* 测试图片选择器 */
+        .test-images {
+            display: none;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #333;
+        }
+        .test-images.show { display: block; }
+        .test-label {
+            font-size: 0.8em;
+            color: #888;
+            margin-bottom: 8px;
+        }
+        .test-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .test-item {
+            width: 50px;
+            height: 50px;
+            border-radius: 6px;
+            object-fit: cover;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: border-color 0.2s;
+        }
+        .test-item:hover { border-color: #00d4ff; }
+        .test-item.selected { border-color: #66bb6a; }
+
+        /* 悬浮输入面板 */
+        .float-panel {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            z-index: 100;
+        }
+        .float-toggle {
+            background: #16213e;
+            border: 1px solid #00d4ff;
+            color: #00d4ff;
+            padding: 10px 18px;
+            border-radius: 24px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.25s;
+            box-shadow: 0 4px 16px rgba(0,212,255,0.2);
+            user-select: none;
+            white-space: nowrap;
+        }
+        .float-toggle:hover { background: #1a3a5c; transform: scale(1.03); }
+        .float-toggle .arrow { transition: transform 0.3s; font-size: 0.8em; }
+        .float-toggle.expanded .arrow { transform: rotate(180deg); }
+        .float-body {
+            display: none;
+            margin-top: 10px;
+            background: #16213e;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            max-width: 520px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .float-body.show { display: block; animation: fadeSlideIn 0.2s ease; }
+        @keyframes fadeSlideIn { from{opacity:0;transform:translateY(-8px);} to{opacity:1;transform:translateY(0);} }
+
+        /* 屏幕捕获 & 圆形选区 */
+        #screenVideoContainer {
+            position: relative;
+            display: inline-block;
+        }
+        #screenPreview {
+            width: 480px;
+            height: 270px;
+            object-fit: contain;
+            border-radius: 8px;
+            background: #111;
+        }
+        .region-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+        .region-box {
+            position: absolute;
+            border: 2px dashed #00d4ff;
+            background: rgba(0, 212, 255, 0.08);
+            border-radius: 50%;
+            cursor: move;
+            pointer-events: auto;
+            box-shadow: 0 0 12px rgba(0, 212, 255, 0.35);
+            user-select: none;
+        }
+        .region-handle {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            background: #00d4ff;
+            border: 2px solid #fff;
+            border-radius: 50%;
+            right: -6px;
+            top: 50%;
+            margin-top: -6px;
+            cursor: ew-resize;
+        }
+
+        .region-info {
+            font-size: 0.75em;
+            color: #00d4ff;
+            margin-top: 4px;
+            font-family: monospace;
+            white-space: nowrap;
+        }
+
+        #logArea {
+            margin-top: 16px;
+            background: #0a0a15;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 0.8em;
+            color: #0f0;
+            max-height: 150px;
+            overflow-y: auto;
+            width: 100%;
+        }
+
+        @media (max-width: 900px) {
+            #resultImg { width: 350px; height: 350px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 识别模式切换 -->
+    <div class="mode-toggle" id="algoModeToggle" style="display:none;">
+        <span style="color:#888; font-size:0.85em; margin-right:8px;">识别引擎:</span>
+        <button class="mode-btn active" id="algoSift" onclick="switchAlgo('sift')">⚡ SIFT (快速)</button>
+        <button class="mode-btn" id="algoLoftr" onclick="switchAlgo('loftr')">🧠 LoFTR (AI)</button>
+    </div>
+
+    <div class="mode-toggle" style="display:none;">
+        <button class="mode-btn active" id="modeFile" onclick="setMode('file')">📁 文件上传</button>
+        <button class="mode-btn" id="modeScreen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
+    </div>
+
+    <div class="container">
+        <!-- 右侧：结果输出（独占） -->
+        <div class="panel" style="max-width:700px;">
+            <div class="panel-title" style="display:none;">🗺️ 地图追踪结果</div>
+            <div class="preview-area">
+                <img id="resultImg" src="" alt="等待分析...">
+            </div>
+            <div class="status-bar">
+                <div class="status-item">
+                    <div class="status-label">引擎</div>
+                    <div class="status-value" id="statusMode" style="color:#00d4ff;">SIFT</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">状态</div>
+                    <div class="status-value state-global" id="statusState">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">坐标 X</div>
+                    <div class="status-value" id="statusX">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">坐标 Y</div>
+                    <div class="status-value" id="statusY">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">是否找到</div>
+                    <div class="status-value found-no" id="statusFound">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">匹配点数</div>
+                    <div class="status-value" id="statusMatches">--</div>
+                </div>
+            </div>
+            <div id="logArea"></div>
+        </div>
+    </div>
+
+    <!-- 悬浮输入面板 -->
+    <div class="float-panel" id="floatPanel">
+        <div class="float-toggle" id="floatToggle" onclick="toggleFloatPanel()">
+            📍 <span class="arrow">▼</span>
+        </div>
+        <div class="float-body" id="floatBody">
+            <!-- 模式切换 -->
+            <div class="mode-toggle" style="margin-bottom:12px;">
+                <button class="mode-btn active" id="modeFile" onclick="setMode('file')">📁 文件上传</button>
+                <button class="mode-btn" id="modeScreen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
+            </div>
+
+            <!-- 预览区 -->
+            <div class="preview-area">
+                <canvas id="minimapCanvas" width="300" height="300"></canvas>
+                <div id="screenVideoContainer" style="display:none;">
+                    <video id="screenPreview" autoplay playsinline muted></video>
+                    <div class="region-overlay" id="regionOverlay">
+                        <div class="region-box" id="regionBox">
+                            <div class="region-handle"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="region-info" id="regionInfo" style="display:none;">区域: --</div>
+
+            <!-- 按钮行 -->
+            <div class="btn-row">
+                <label for="fileInput" class="file-label">📂 上传图片</label>
+                <input type="file" id="fileInput" accept="image/*">
+                <button class="btn-primary" onclick="processImage()">▶️ 分析定位</button>
+                <button class="btn-danger" onclick="stopScreenCapture()" id="stopScreenBtn" style="display:none;">⏹ 停止捕获</button>
+            </div>
+
+            <!-- 测试小地图选择器 -->
+            <div class="test-images" id="testImagesArea" style="display:none;">
+                <div class="test-label">🧪 测试图片（点击选择）：</div>
+                <div class="test-grid" id="testGrid"></div>
+            </div>
+        </div>
+    </div>
+
+<script>
+let currentMode = 'file';
+let currentAlgo = 'sift';
+let currentImageData = null;
+
+// ========== 日志工具（必须最先定义，所有函数都依赖它）==========
+function log(msg) {
+    const el = document.getElementById('logArea');
+    if (!el) return;
+    const time = new Date().toLocaleTimeString();
+    el.textContent += `[${time}] ${msg}\n`;
+    // 保持最新日志在底部可见，限制总长度
+    if (el.textContent.length > 5000) {
+        el.textContent = el.textContent.slice(el.textContent.length - 4000);
+    }
+    el.scrollTop = el.scrollHeight;
+}
+
+// ========== 屏幕捕获状态 ==========
+let screenStream = null;
+let screenVideoEl = null;
+let screenAutoId = null;
+let screenRunning = false;
+// 选框区域 (圆形: cx,cy 归一化中心 0~1, r 归一化半径)
+// 原矩形 (1189,66)→125x127 @1362x806 → 中心 (1251,130), 半径≈63
+let selCircle = { cx: (1189+62.5)/1362, cy: (66+63.5)/806, r: Math.max(62.5/1362, 63.5/806) };
+// 拖拽状态
+let dragState = { active: false, type: '', startX: 0, startY: 0, startCircle: null };
+
+// ========== 悬浮面板 ==========
+function toggleFloatPanel() {
+    const body = document.getElementById('floatBody');
+    const toggle = document.getElementById('floatToggle');
+    body.classList.toggle('show');
+    toggle.classList.toggle('expanded');
+}
+
+// ========== 屏幕捕获 & 区域选择 ==========
+
+async function startScreenCapture() {
+    try {
+        screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: { cursor: 'always', displaySurface: 'monitor' },
+            audio: false,
+        });
+    } catch(e) {
+        log('屏幕捕获失败/已取消: ' + e.message);
+        return;
+    }
+
+    // 切换 UI
+    currentMode = 'screen';
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('modeScreen').classList.add('active');
+
+    const canvas = document.getElementById('minimapCanvas');
+    const container = document.getElementById('screenVideoContainer');
+    const screenVid = document.getElementById('screenPreview');
+    const stopBtn = document.getElementById('stopScreenBtn');
+    const regionInfo = document.getElementById('regionInfo');
+
+    // 隐藏其他
+    canvas.style.display = 'none';
+    document.getElementById('testImagesArea').classList.remove('show');
+    if (screenAutoRunning) { screenAutoRunning = false; }
+
+    // 显示屏幕预览
+    container.style.display = '';
+    stopBtn.style.display = '';
+    regionInfo.style.display = '';
+
+    screenVideoEl = screenVid;
+    screenVid.srcObject = screenStream;
+    screenVid.onloadedmetadata = () => {
+        initRegionBox(screenVid);
+        setupRegionDrag(screenVid);
+    };
+
+    // 监听用户停止共享
+    screenStream.getVideoTracks()[0].onended = () => stopScreenCapture();
+
+    log('🖥️ 屏幕捕获已开始 — 请拖动蓝色选框框选小地图区域');
+}
+
+function stopScreenCapture() {
+    if (screenAutoId) { cancelAnimationFrame(screenAutoId); screenAutoId = null; }
+    screenRunning = false;
+    if (screenStream) {
+        screenStream.getTracks().forEach(t => t.stop());
+        screenStream = null;
+    }
+    if (screenVideoEl) { screenVideoEl.srcObject = null; }
+
+    document.getElementById('screenVideoContainer').style.display = 'none';
+    document.getElementById('stopScreenBtn').style.display = 'none';
+    document.getElementById('regionInfo').style.display = 'none';
+
+    // 回到文件模式
+    setMode('file');
+    log('⏹ 屏幕捕获已停止');
+}
+
+function initRegionBox(videoEl) {
+    const overlay = document.getElementById('regionOverlay');
+    const box = document.getElementById('regionBox');
+
+    function updateCircleSize() {
+        const rect = videoEl.getBoundingClientRect();
+        overlay.style.width = rect.width + 'px';
+        overlay.style.height = rect.height + 'px';
+
+        // 归一化 → 像素（取宽高中较小的作为基准，保证圆不越界）
+        const size = Math.min(rect.width, rect.height);
+        box.style.left  = (selCircle.cx * rect.width - selCircle.r * size) + 'px';
+        box.style.top   = (selCircle.cy * rect.height - selCircle.r * size) + 'px';
+        const diameter = selCircle.r * size * 2;
+        box.style.width  = diameter + 'px';
+        box.style.height = diameter + 'px';
+
+        // 信息显示
+        const realCX = Math.round(selCircle.cx * videoEl.videoWidth);
+        const realCY = Math.round(selCircle.cy * videoEl.videoHeight);
+        const realR  = Math.round(selCircle.r * Math.min(videoEl.videoWidth, videoEl.videoHeight));
+        document.getElementById('regionInfo').textContent =
+            `圆形选区: 中心(${realCX}, ${realCY}) 半径${realR}px [${videoEl.videoWidth}x${videoEl.videoHeight}]`;
+    }
+
+    updateCircleSize();
+    window.__updateRegionBox = updateCircleSize;
+}
+
+function setupRegionDrag(videoEl) {
+    const box = document.getElementById('regionBox');
+    const overlay = document.getElementById('regionOverlay');
+    const handle = box.querySelector('.region-handle');
+
+    function getPos(e) {
+        const rect = overlay.getBoundingClientRect();
+        return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    }
+
+    function onDown(type, e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const p = getPos(e);
+        dragState = { active: true, type,
+            startX: p.x, startY: p.y,
+            startCircle: { ...selCircle },
+        };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    }
+
+    function onMove(e) {
+        if (!dragState.active) return;
+        const p = getPos(e);
+        const rect = overlay.getBoundingClientRect();
+        const dx = (p.x - dragState.startX) / Math.min(rect.width, rect.height);
+        const dy = (p.y - dragState.startY) / Math.min(rect.width, rect.height);
+        const sc = dragState.startCircle;
+
+        if (dragState.type === 'move') {
+            // 限制圆心在圆内
+            selCircle.cx = clamp(sc.cx + dx, sc.r, 1 - sc.r);
+            selCircle.cy = clamp(sc.cy + dy, sc.r, 1 - sc.r);
+        } else {
+            // resize: 拖拽右侧手柄改变半径
+            selCircle.r = clamp(sc.r + dx, 0.03, Math.min(0.45, 1 - sc.cx, sc.cx, 1 - sc.cy, sc.cy));
+        }
+        window.__updateRegionBox && window.__updateRegionBox();
+    }
+
+    function onUp() {
+        dragState.active = false;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+    }
+
+    box.addEventListener('mousedown', (e) => onDown('move', e));
+    handle && handle.addEventListener('mousedown', (e) => onDown('resize', e));
+
+    // 触屏
+    box.addEventListener('touchstart', (e) => onDown('move', e.touches[0]), { passive: false });
+    handle && handle.addEventListener('touchstart', (e) => onDown('resize', e.touches[0]), { passive: false });
+    document.addEventListener('touchmove', (e) => { if (dragState.active && e.touches[0]) onMove(e.touches[0]); }, { passive: false });
+    document.addEventListener('touchend', onUp);
+
+    box.addEventListener('dblclick', () => toggleScreenAutoTrack());
+
+    videoEl.addEventListener('resize', () => {
+        setTimeout(() => { window.__updateRegionBox && window.__updateRegionBox(); }, 100);
+    });
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// 屏幕捕获防重入锁
+let screenSending = false;
+
+// 从视频中截取选区并发送识别（async，会等待完成）
+async function captureAndSendScreenFrame() {
+    if (!screenVideoEl || !screenVideoEl.videoWidth) return;
+    if (screenSending) return;
+    screenSending = true;
+
+    const vw = screenVideoEl.videoWidth;
+    const vh = screenVideoEl.videoHeight;
+    const baseSize = Math.min(vw, vh);
+    // 圆形选区 → 外接正方形（canvas 只能截矩形）
+    const cx = selCircle.cx * vw;
+    const cy = selCircle.cy * vh;
+    const r = selCircle.r * baseSize;
+    const size = Math.max(10, Math.round(r * 2));
+    const rx = Math.round(cx - r);
+    const ry = Math.round(cy - r);
+
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = size;
+    tmpCanvas.height = size;
+    const ctx = tmpCanvas.getContext('2d');
+
+    // 裁剪为圆形
+    ctx.beginPath();
+    ctx.arc(size/2, size/2, size/2, 0, Math.PI*2);
+    ctx.closePath();
+    ctx.clip();
+    ctx.drawImage(screenVideoEl, rx, ry, size, size, 0, 0, size, size);
+
+    // JPEG 压缩发送（更快更小）
+    currentImageData = tmpCanvas.toDataURL('image/jpeg', 0.80);
+
+    try {
+        await processImage();  // 等待服务端响应
+    } catch(e) {
+        console.error('识别出错:', e);
+    } finally {
+        screenSending = false;  // 解锁
+    }
+}
+
+// 屏幕模式自动追踪开关
+let screenAutoRunning = false;
+function toggleScreenAutoTrack() {
+    screenAutoRunning = !screenAutoRunning;
+    const btn = document.getElementById('stopScreenBtn');
+    if (screenAutoRunning) {
+        btn.textContent = '⏸ 暂停追踪';
+        log(`🔄 屏幕自动追踪已开启 (${currentAlgo === 'sift' ? '~20fps' : '~5fps'})`);
+        runScreenAutoLoop();
+    } else {
+        btn.textContent = '⏹ 停止捕获';
+        log('⏸ 屏幕自动追踪已暂停');
+        screenSending = false;  // 重置锁
+    }
+}
+
+function runScreenAutoLoop() {
+    if (!screenAutoRunning || currentMode !== 'screen') return;
+    captureAndSendScreenFrame();  // 内部有防重入锁，不等完成就 schedule 下一次
+    const interval = currentAlgo === 'sift' ? 50 : 200;
+    screenAutoId = setTimeout(() => { requestAnimationFrame(runScreenAutoLoop); }, interval);
+}
+
+// ========== 文件 / 摄像头模式 (原有逻辑) ==========
+
+async function setMode(mode) {
+    currentMode = mode;
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('modeFile').classList.add('active');
+
+    const canvas = document.getElementById('minimapCanvas');
+
+    // 隐藏屏幕相关
+    document.getElementById('screenVideoContainer').style.display = 'none';
+    document.getElementById('stopScreenBtn').style.display = 'none';
+    document.getElementById('regionInfo').style.display = 'none';
+    if (screenAutoRunning && currentMode !== 'screen') {
+        screenAutoRunning = false;
+    }
+
+    // 文件模式
+    canvas.style.display = 'block';
+    document.getElementById('testImagesArea').classList.add('show');
+}
+
+// 文件上传
+document.getElementById('fileInput').addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(ev) {
+        const img = new Image();
+        img.onload = () => {
+            const cvs = document.getElementById('minimapCanvas');
+            const ctx = cvs.getContext('2d');
+            ctx.clearRect(0, 0, 300, 300);
+            // 等比缩放绘制
+            const scale = Math.min(300 / img.width, 300 / img.height);
+            const w = img.width * scale;
+            const h = img.height * scale;
+            ctx.drawImage(img, (300 - w) / 2, (300 - h) / 2, w, h);
+            currentImageData = cvs.toDataURL('image/png');
+            log(`已加载图片: ${img.width}x${img.height}`);
+        };
+        img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+});
+
+// 发送到后端处理
+async function processImage() {
+    let dataToSend = currentImageData;
+
+    // 屏幕模式：直接用 currentImageData（已在 captureAndSendScreenFrame 中设置）
+    if (!dataToSend) {
+        // 文件/摄像头模式：从 canvas 取
+        const cvs = document.getElementById('minimapCanvas');
+        if (cvs && cvs.style.display !== 'none') {
+            dataToSend = cvs.toDataURL('image/png');
+        }
+    }
+
+    if (!dataToSend) {
+        log('请先上传、截取或捕获小地图！');
+        return;
+    }
+
+    log(`正在 ${currentAlgo === 'sift' ? 'SIFT' : 'LoFTR AI'} 分析...`);
+
+    try {
+        const response = await fetch('/api/upload_minimap', {
+            method: 'POST',
+            body: JSON.stringify({ image: dataToSend }),
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        let result;
+        if (!response.ok) {
+            // 备选：FormData 方式
+            const blob = await (await fetch(dataToSend)).blob();
+            const formData = new FormData();
+            formData.append('image', blob, 'minimap.png');
+            result = await (await fetch('/api/upload_minimap', { method: 'POST', body: formData })).json();
+        } else {
+            result = await response.json();
+        }
+
+        if (result.image) {
+            document.getElementById('resultImg').src = 'data:image/png;base64,' + result.image;
+        }
+
+        if (result.status) {
+            updateStatus(result.status);
+            log(`分析完成 | ${result.status.found ? '✅ 找到位置' : '❌ 未找到'} (${result.status.matches} 匹配点)`);
+        } else {
+            log('分析完成，但未返回状态信息');
+        }
+    } catch(err) {
+        log('错误: ' + err.message);
+        console.error(err);
+    }
+}
+
+// ========== 测试图片功能 ==========
+let testImages = [];
+let selectedTestImg = null;
+
+async function loadTestImages() {
+    try {
+        testImages = await (await fetch('/api/test_images')).json();
+        const grid = document.getElementById('testGrid');
+        grid.innerHTML = '';
+        testImages.forEach(src => {
+            const img = document.createElement('img');
+            img.src = src;
+            img.className = 'test-item';
+            img.title = src;
+            img.onclick = () => selectTestImage(img, src);
+            grid.appendChild(img);
+        });
+        if (testImages.length > 0) {
+            document.getElementById('testImagesArea').classList.add('show');
+            log(`已加载 ${testImages.length} 张测试图片`);
+        }
+    } catch(e) {
+        console.log('无测试图片或加载失败:', e.message);
+    }
+}
+
+function selectTestImage(el, src) {
+    document.querySelectorAll('.test-item').forEach(i => i.classList.remove('selected'));
+    el.classList.add('selected');
+
+    const img = new Image();
+    img.onload = () => {
+        const cvs = document.getElementById('minimapCanvas');
+        const ctx = cvs.getContext('2d');
+        ctx.clearRect(0, 0, 300, 300);
+        const scale = Math.min(300 / img.width, 300 / img.height);
+        const w = img.width * scale;
+        const h = img.height * scale;
+        ctx.drawImage(img, (300 - w) / 2, (300 - h) / 2, w, h);
+        currentImageData = cvs.toDataURL('image/png');
+        selectedTestImg = src;
+        log(`已选择测试图: ${src} (${img.width}x${img.height})`);
+    };
+    img.src = src;
+}
+
+// 页面加载时拉取测试图片列表
+loadTestImages();
+
+function updateStatus(status) {
+    const stateEl = document.getElementById('statusState');
+    const foundEl = document.getElementById('statusFound');
+
+    // 显示当前引擎
+    const modeEl = document.getElementById('statusMode');
+    if (status.mode) {
+        modeEl.textContent = status.mode.toUpperCase();
+        modeEl.style.color = status.mode === 'sift' ? '#ffa726' : '#00d4ff';
+    }
+
+    // 根据模式和状态显示文字
+    let stateText = '--';
+    if (status.mode === 'sift') {
+        if (status.state === 'INERTIAL') stateText = '惯性导航';
+        else if (status.state === 'FOUND') stateText = 'SIFT 追踪';
+        else stateText = 'SIFT 搜索';
+    } else {
+        stateText = status.state === 'GLOBAL_SCAN' ? '全局扫描' : '局部追踪';
+    }
+    stateEl.textContent = stateText;
+
+    if (status.mode === 'sift') {
+        stateEl.className = 'status-value state-local';
+    } else {
+        stateEl.className = 'status-value ' + (
+            status.state === 'GLOBAL_SCAN' ? 'state-global' : 'state-local'
+        );
+    }
+
+    document.getElementById('statusX').textContent = status.position.x;
+    document.getElementById('statusY').textContent = status.position.y;
+
+    foundEl.textContent = status.found ? '✅ 是' : '❌ 否';
+    foundEl.className = 'status-value ' + (status.found ? 'found-yes' : 'found-no');
+
+    document.getElementById('statusMatches').textContent = status.matches;
+}
+
+// 系统就绪 + 检测可用引擎
+log('系统就绪，请选择小地图输入方式');
+checkAvailableEngines();
+
+async function checkAvailableEngines() {
+    try {
+        // 尝试切换到 loftr 探测是否可用
+        const testResp = await fetch('/api/mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'loftr' })
+        });
+        const testResult = await testResp.json();
+        if (!testResult.success) {
+            // LoFTR 不可用，隐藏按钮
+            document.getElementById('algoLoftr').style.display = 'none';
+            log('⚠ SIFT-only 模式：LoFTR 不可用（需不带 cpu 参数重启启用 AI）');
+        } else {
+            // 可用但刚才被切到 loftr 了，切回 sift
+            await fetch('/api/mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mode: 'sift' })
+            });
+        }
+    } catch(e) {
+        console.log('引擎检测跳过:', e.message);
+    }
+}
+</script>
+</body>
+</html>
