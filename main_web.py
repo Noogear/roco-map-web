@@ -606,4 +606,4 @@ if __name__ == "__main__":
     print("  打开浏览器访问: http://0.0.0.0:8686")
     print("  WebSocket: ws://0.0.0.0:8686/socket.io/?transport=websocket")
     print("=" * 50)
-    socketio.run(app, host='0.0.0.0', port=8686, debug=False)
+    socketio.run(app, host='0.0.0.0', port=8686, debug=False, allow_unsafe_werkzeug=True)
