@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>大地图 - 实时追踪</title>
+    <style>
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{
+            font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+            background:#0a0a12;color:#eee;overflow:hidden;
+            width:100vw;height:100vh;display:flex;flex-direction:column;
+        }
+        .topbar{
+            display:flex;align-items:center;justify-content:space-between;
+            padding:8px 16px;background:linear-gradient(135deg,#16213e,#0f3460);
+            border-bottom:1px solid rgba(0,212,255,.2);flex-shrink:0;z-index:50;
+        }
+        .topbar-left{display:flex;align-items:center;gap:10px}
+        h1{font-size:14px;font-weight:700;color:#00d4ff;white-space:nowrap}
+        .topbar a{font-size:11px;color:#888;text-decoration:none;padding:4px 10px;border:1px solid #333;border-radius:12px;transition:all .2s}
+        .topbar a:hover{color:#00d4ff;border-color:#00d4ff}
+        .status-inline{display:flex;align-items:center;gap:12px}
+        .coord-pair{display:flex;gap:8px}
+        .ci{background:rgba(0,0,0,.35);padding:3px 10px;border-radius:6px;font-size:12px;font-family:monospace}
+        .ci .lbl{color:#666;font-size:9px;margin-right:3px}
+        .cx{color:#f97316}.cy{color:#3b82f6}
+        .sb{padding:3px 10px;border-radius:6px;font-size:11px;font-weight:600}
+        .sb-ok{background:rgba(34,197,94,.2);color:#22c55e}
+        .sb-warn{background:rgba(234,179,8,.2);color:#eab308}
+        .sb-err{background:rgba(239,68,68,.2);color:#ef4444}
+
+        /* 缩放控件 - 放在顶栏 */
+        .zoom-bar{
+            display:flex;align-items:center;gap:3px;background:rgba(0,0,0,.35);
+            padding:3px 8px;border-radius:8px;
+        }
+        .zb{
+            width:28px;height:24px;border-radius:5px;background:transparent;
+            color:#00d4ff;border:1px solid rgba(0,212,255,.25);
+            font-size:14px;cursor:pointer;display:flex;align-items:center;
+            justify-content:center;transition:all .12s;line-height:1;
+        }
+        .zb:hover{background:rgba(0,212,255,.18)}
+        .zl{font-size:10px;color:#00d4ff;font-family:monospace;text-align:center;min-width:34px;padding:0 2px}
+        #mc{flex:1;position:relative;overflow:hidden;cursor:grab;touch-action:none;background:#111}
+        #mc.dragging{cursor:grabbing}
+        #mw{position:absolute;transform-origin:0 0;will-change:transform}
+        #mi{display:block}
+        #dot{
+            position:absolute;width:18px;height:18px;border-radius:50%;
+            background:#ff1744;border:2px solid #fff;
+            box-shadow:0 0 10px rgba(255,23,68,.9),0 0 30px rgba(255,23,68,.4);
+            transform:translate(-50%,-50%);pointer-events:none;z-index:10;
+            transition:left .05s linear,top .05s linear,opacity .15s,background .15s;
+        }
+        #dot.inertial{background:#ffab00;box-shadow:0 0 10px rgba(255,171,0,.9),0 0 30px rgba(255,171,0,.4)}
+        #dot.lost{background:#555;border-color:#888;box-shadow:none;opacity:.4}
+        @keyframes pulse{
+            0%{box-shadow:0 0 10px rgba(255,23,68,.9),0 0 20px rgba(255,23,68,.4)}
+            50%{box-shadow:0 0 14px rgba(255,23,68,1),0 0 36px rgba(255,23,68,.6)}
+            100%{box-shadow:0 0 10px rgba(255,23,68,.9),0 0 20px rgba(255,23,68,.4)}
+        }
+        #dot:not(.lost){animation:pulse 1.5s infinite}
+        #ch{
+            position:absolute;pointer-events:none;z-index:9;
+            transform:translate(-50%,-50%);
+            transition:left .05s linear,top .05s linear,opacity .15s;opacity:.25;
+        }
+
+        /* 地图容器 */
+        .float-panel{
+            position:fixed;bottom:16px;right:16px;z-index:100;
+        }
+        .float-toggle{
+            background:#16213e;border:1px solid #00d4ff;color:#00d4ff;
+            padding:10px 18px;border-radius:24px;cursor:pointer;
+            font-size:.9em;font-weight:600;display:flex;align-items:center;gap:6px;
+            transition:all .25s;box-shadow:0 4px 16px rgba(0,212,255,.2);
+            user-select:none;white-space:nowrap;
+        }
+        .float-toggle:hover{background:#1a3a5c;transform:scale(1.03)}
+        .float-toggle .arrow{transition:transform .3s;font-size:.8em}
+        .float-toggle.expanded .arrow{transform:rotate(180deg)}
+        .float-body{
+            display:none;margin-top:10px;background:#16213e;
+            border-radius:12px;padding:16px;
+            box-shadow:0 8px 32px rgba(0,0,0,.5);
+            max-width:420px;max-height:70vh;overflow-y:auto;
+        }
+        .float-body.show{display:block;animation:fadeSlideIn .2s ease}
+        @keyframes fadeSlideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+
+        /* 面板内部控件 */
+        .float-body .mode-toggle{
+            display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;
+        }
+        .float-body .mode-btn{
+            padding:6px 14px;border-radius:20px;font-size:.82em;
+            background:#222;color:#aaa;border:1px solid #444;cursor:pointer;transition:all .2s;
+        }
+        .float-body .mode-btn.active{background:#00d4ff;color:#000;border-color:#00d4ff}
+
+        .float-body .preview-area{position:relative;margin-bottom:8px}
+        .float-body canvas,.float-body video,.float-body img{
+            border-radius:6px;display:block;background:#2b2b2b;
+        }
+        #minimapCanvas{width:220px;height:220px;object-fit:contain}
+        #scrPrev{width:280px;height:158px;object-fit:contain;border-radius:6px;background:#000;border:1px solid #333}
+
+        .region-overlay{position:absolute;top:0;left:0;pointer-events:none}
+        .region-box{
+            position:absolute;border:2px dashed #00d4ff;
+            background:rgba(0,212,255,.08);border-radius:50%;
+            cursor:move;pointer-events:auto;
+            box-shadow:0 0 12px rgba(0,212,255,.35);user-select:none;
+        }
+        .region-handle{
+            position:absolute;width:10px;height:10px;background:#00d4ff;
+            border:2px solid #fff;border-radius:50%;right:-5px;top:50%;margin-top:-5px;cursor:ew-resize;
+        }
+
+        .region-info{font-size:.72em;color:#00d4ff;margin-top:3px;font-family:monospace;white-space:nowrap}
+
+        .float-body .btn-row{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+        .float-body button{padding:7px 14px;border:none;border-radius:8px;cursor:pointer;font-size:.82em;font-weight:600;transition:all .15s;white-space:nowrap}
+        .bp{background:#00d4ff;color:#000}.bp:hover{background:#00b8e6}
+        .bs{background:#222;color:#ccc;border:1px solid #444}.bs:hover{background:#333}
+        .bd{background:#e53935;color:#fff}.bd:hover{background:#c62828}
+        .ba{background:#22c55e;color:#000}
+        label.fl{
+            display:inline-block;padding:7px 14px;background:#5c6bc0;color:white;
+            border-radius:8px;cursor:pointer;font-weight:600;transition:background .2s;font-size:.82em
+        }
+        label.fl:hover{background:#3f51b5}
+        input[type=file]{display:none}
+
+        #logArea{
+            font-family:monospace;font-size:.72em;color:#0f0;background:#0a0a15;
+            border-radius:6px;padding:6px 8px;max-height:80px;overflow-y:auto;margin-top:8px;
+        }
+
+        #ldMask{
+            position:fixed;inset:0;background:#0a0a12;display:flex;flex-direction:column;
+            align-items:center;justify-content:center;z-index:9999;transition:opacity .4s
+        }
+        #ldMask.hide{opacity:0;pointer-events:none}
+        .spin{width:48px;height:48px;border:4px solid #222;border-top-color:#00d4ff;border-radius:50%;animation:spin .8s linear infinite}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        .lt{margin-top:16px;color:#888;font-size:13px}
+    </style>
+</head>
+<body>
+
+<div id="ldMask"><div class="spin"></div><div class="lt">正在加载地图...</div></div>
+
+<div class="topbar">
+    <div class="topbar-left">
+        <h1>&#127963; 大地图实时追踪</h1>
+        <a href="/">&#8617; 返回控制台</a>
+    </div>
+    <div class="status-inline">
+        <div class="coord-pair">
+            <div class="ci"><span class="lbl">X</span><span class="cx" id="sx">--</span></div>
+            <div class="ci"><span class="lbl">Y</span><span class="cy" id="sy">--</span></div>
+        </div>
+        <div class="sb sb-warn" id="ss">等待分析</div>
+        <!-- 缩放控件 -->
+        <div class="zoom-bar">
+            <button class="zb" onclick="doZ(1.4)" title="放大">+</button>
+            <div class="zl" id="zl">100%</div>
+            <button class="zb" onclick="doZ(.6)" title="缩小">-</button>
+            <button class="zb" onclick="resetV()" title="重置视图">&#8635;</button>
+            <button class="zb" onclick="centerP()" title="居中玩家">&#9679;</button>
+        </div>
+    </div>
+</div>
+
+<div id="mc">
+    <div id="mw">
+        <img id="mi" draggable="false" alt="map">
+        <svg id="ch" width="44" height="44" viewBox="0 0 44 44">
+            <line x1="22" y1="0" x2="22" y2="16" stroke="#00d4ff" stroke-width="1"/>
+            <line x1="22" y1="28" x2="22" y2="44" stroke="#00d4ff" stroke-width="1"/>
+            <line x1="0" y1="22" x2="16" y2="22" stroke="#00d4ff" stroke-width="1"/>
+            <line x1="28" y1="22" x2="44" y2="22" stroke="#00d4ff" stroke-width="1"/>
+            <circle cx="22" cy="22" r="10" stroke="#00d4ff" stroke-width="1" fill="none" opacity=".5"/>
+        </svg>
+        <div id="dot"></div>
+    </div>
+</div>
+
+<!-- 悬浮输入面板 (和 index 一致的风格) -->
+<div class="float-panel" id="floatPanel">
+    <div class="float-toggle" id="floatToggle" onclick="toggleFloatPanel()">
+        &#128205; <span class="arrow">&#9660;</span>
+    </div>
+    <div class="float-body" id="floatBody">
+        <!-- 模式切换 -->
+        <div class="mode-toggle">
+            <button class="mode-btn active" id="mf" onclick="setIM('file')">文件上传</button>
+            <button class="mode-btn" id="ms" onclick="startSC()">屏幕捕获</button>
+        </div>
+
+        <!-- 预览区 -->
+        <div class="preview-area">
+            <canvas id="minimapCanvas" width="220" height="220"></canvas>
+            <div id="scrArea" style="display:none;">
+                <video id="scrPrev" autoplay playsinline muted></video>
+                <div class="region-overlay" id="regionOverlay">
+                    <div class="region-box" id="regionBox">
+                        <div class="region-handle"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="region-info" id="regionInfo" style="display:none;">区域: --</div>
+
+        <!-- 按钮行 -->
+        <div class="btn-row">
+            <label class="fl" for="fi">选择图片</label><input type="file" id="fi" accept="image/*">
+            <button class="bp" onclick="analyzeOnce()">分析</button>
+            <button class="bs" id="autoBtn" onclick="toggleAuto()">自动追踪</button>
+            <button class="bd" id="stpBtn" style="display:none" onclick="stopSC()">停止</button>
+        </div>
+
+        <div id="logArea"></div>
+    </div>
+</div>
+
+<video id="osVid" autoplay playsinline muted style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;"></video>
+
+<script src="js/tracker-core.js"></script>
+<script>
+var $ = function(id){ return document.getElementById(id); };
+var MC=$('mc'), MW=$('mw'), MI=$('mi'), DOT=$('dot'), CH=$('ch');
+var SX=$('sx'), SY=$('sy'), SS=$('ss'), ZL=$('zl');
+
+var mapInfo=null;
+var sc=1, ox=0, oy=0;
+var dragging=false, dsx=0, dsy=0, dox=0, doy=0;
+var lx=null, ly=null, lf=false;
+var autoRun=false, autoT=null;
+var sending=false;
+
+const MIN_S=.08, MAX_S=15;
+
+// ========== 初始化 ==========
+TC.init({
+    logEl: 'logArea',
+    onImageLoaded: function(dataURL) {
+        analyzeOnce();
+    },
+    onAnalyzeResult: function(result) {
+        if (result.status) {
+            lx = result.status.position.x;
+            ly = result.status.position.y;
+            lf = !!result.status.found;
+            setDot(lx, ly, result.status.state || '', lf);
+            updUIBig(result);
+            if (autoRun && lf) ensureVis(lx, ly);
+        }
+    },
+});
+
+async function init() {
+    try { mapInfo = await (await fetch('/api/map_info')).json(); }
+    catch(e){ alert('\u83b7\u53d6\u5730\u56fe\u4fe1\u606f\u5931\u8d25: '+e.message); return; }
+    MI.src = mapInfo.display_map_url + '?t='+Date.now();
+    await new Promise(function(ok,no){ MI.onload=ok; MI.onerror=function(){no(new Error('\u5730\u56fe\u52a0\u8f7d\u5931\u8d25'));}; });
+    fitMap();
+    setTimeout(function(){ $('ldMask').classList.add('hide'); },300);
+    bindEv();
+    TC.log('\u5c31\u7eea - ' + mapInfo.map_width + 'x' + mapInfo.map_height);
+}
+
+function fitMap() {
+    if(!MC||!mapInfo) return;
+    var cw=MC.clientWidth, ch=MC.clientHeight;
+    sc=Math.min(cw/mapInfo.map_width,ch/mapInfo.map_height);
+    ox=(cw-mapInfo.map_width*sc)/2;
+    oy=(ch-mapInfo.map_height*sc)/2;
+    applyT();
+}
+function applyT() { MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')'; ZL.textContent=Math.round(sc*100)+'%'; }
+
+// ========== 红点 & UI 更新 ==========
+function setDot(x,y,state,found){
+    DOT.style.left=x+'px';DOT.style.top=y+'px';
+    CH.style.left=x+'px';CH.style.top=y+'px';
+    DOT.classList.remove('inertial','lost');
+    if(!found)DOT.classList.add('lost');
+    else if(state==='INERTIAL')DOT.classList.add('inertial');
+    CH.style.opacity=found?'.25':'0';
+    SX.textContent=x;SY.textContent=y;
+}
+
+function updUIBig(d){
+    var f = TC.formatStatus(d.status || d);
+    SS.textContent=f.stateText;SS.className='sb sb-'+f.stateClass;
+}
+
+// ========== 缩放/拖拽 ==========
+function doZ(f,px,py){
+    if(px==null){px=MC.clientWidth/2;py=MC.clientHeight/2;}
+    var ns=TC.clamp(sc*f,MIN_S,MAX_S);
+    ox=px-(px-ox)*(ns/sc);
+    oy=py-(py-oy)*(ns/sc);
+    sc=ns;applyT();
+}
+function resetV(){fitMap()}
+function centerP(){
+    if(lx==null)return;
+    var cw=MC.clientWidth,ch=MC.clientHeight;
+    ox=cw/2-lx*sc;oy=ch/2-ly*sc;applyT();
+}
+function ensureVis(px,py){
+    var cw=MC.clientWidth,ch=MC.clientHeight;
+    var sx=px*sc+ox,sy=py*sc+oy,pad=80;
+    var chg=false;
+    if(sx<pad){ox+=pad-sx;chg=true}
+    if(sx>cw-pad){ox+=cw-pad-sx;chg=true}
+    if(sy<pad){oy+=pad-sy;chg=true}
+    if(sy>ch-pad){oy+=ch-pad-sy;chg=true}
+    if(chg)applyT();
+}
+
+function bindEv(){
+    MC.addEventListener('mousedown',function(e){
+        if(e.target.tagName==='BUTTON')return;
+        dragging=true;MC.classList.add('dragging');
+        dsx=e.clientX;dsy=e.clientY;dox=ox;doy=oy;
+        document.addEventListener('mousemove',onDragMove);
+        document.addEventListener('mouseup',onDragUp);
+        e.preventDefault();
+    });
+    function onDragMove(e){if(!dragging)return;ox=dox+(e.clientX-dsx);oy=doy+(e.clientY-dsy);applyT();}
+    function onDragUp(){dragging=false;MC.classList.remove('dragging');document.removeEventListener('mousemove',onDragMove);document.removeEventListener('mouseup',onDragUp)}
+
+    MC.addEventListener('touchstart',function(e){
+        if(e.target.tagName==='BUTTON')return;
+        var t=e.touches[0];dragging=true;dsx=t.clientX;dsy=t.clientY;dox=ox;doy=oy;
+    },{passive:true});
+    MC.addEventListener('touchmove',function(e){
+        if(!dragging||!e.touches[0])return;
+        var t=e.touches[0];ox=dox+(t.clientX-dsx);oy=doy+(t.clientY-dsy);applyT();
+    },{passive:true});
+    MC.addEventListener('touchend',function(){dragging=false});
+
+    MC.addEventListener('wheel',function(e){
+        e.preventDefault();
+        var rect=MC.getBoundingClientRect();
+        doZ(e.deltaY<0?1.12:.88, e.clientX-rect.left, e.clientY-rect.top);
+    },{passive:false});
+
+    window.addEventListener('resize',function(){requestAnimationFrame(fitMap);});
+
+    // 文件输入 - 绑定到 TC
+    TC.bindFileInput($('fi'), $('minimapCanvas'));
+
+    // 屏幕捕获圆形选区拖拽
+    setupRegionDrag();
+
+    MC.addEventListener('dblclick',centerP);
+}
+
+// ========== 悬浮面板 ==========
+function toggleFloatPanel() {
+    $('floatBody').classList.toggle('show');
+    $('floatToggle').classList.toggle('expanded');
+}
+
+// ========== 屏幕捕获圆形选区 (和 index 一致) ==========
+var dragState = { active:false, type:'', startX:0, startY:0, startCircle:null };
+function setupRegionDrag() {
+    var box = $('regionBox');
+    var overlay = $('regionOverlay');
+    var handle = box ? box.querySelector('.region-handle') : null;
+    var preview = $('scrPrev');
+    if (!box || !overlay || !preview) return;
+
+    function updateCircleSize() {
+        var rect = preview.getBoundingClientRect();
+        overlay.style.width = rect.width + 'px'; overlay.style.height = rect.height + 'px';
+        var size = Math.min(rect.width, rect.height);
+        box.style.left = (TC.selCircle.cx * rect.width - TC.selCircle.r * size) + 'px';
+        box.style.top = (TC.selCircle.cy * rect.height - TC.selCircle.r * size) + 'px';
+        var d = TC.selCircle.r * size * 2;
+        box.style.width = d + 'px'; box.style.height = d + 'px';
+        if (preview.videoWidth) {
+            var realCX = Math.round(TC.selCircle.cx * preview.videoWidth);
+            var realCY = Math.round(TC.selCircle.cy * preview.videoHeight);
+            var realR = Math.round(TC.selCircle.r * Math.min(preview.videoWidth, preview.videoHeight));
+            $('regionInfo').textContent =
+                '\u9009\u533a: ('+realCX+','+realCY+') r'+realR+' ['+preview.videoWidth+'x'+preview.videoHeight+']';
+        }
+    }
+
+    function getPos(e) { var r = overlay.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; }
+    function onDown(type, e) {
+        e.preventDefault(); e.stopPropagation();
+        dragState = { active:true, type:type, startX:getPos(e).x, startY:getPos(e).y, startCircle:{cx:TC.selCircle.cx,cy:TC.selCircle.cy,r:TC.selCircle.r} };
+        document.addEventListener('mousemove',onMove);
+        document.addEventListener('mouseup',onUp);
+    }
+    function onMove(e) {
+        if(!dragState.active) return;
+        var p=getPos(e), rect=overlay.getBoundingClientRect(), base=Math.min(rect.width,rect.height);
+        var dx=(p.x-dragState.startX)/base, dy=(p.y-dragState.startY)/base, sc=dragState.startCircle;
+        if(dragState.type==='move'){TC.selCircle.cx=TC.clamp(sc.cx+dx,0,1);TC.selCircle.cy=TC.clamp(sc.cy+dy,0,1);}
+        else{var maxR=Math.max(sc.cx,1-sc.cx,sc.cy,1-sc.cy);TC.selCircle.r=TC.clamp(sc.r+dx,0.03,Math.min(0.49,maxR));}
+        updateCircleSize();
+    }
+    function onUp(){dragState.active=false;document.removeEventListener('mousemove',onMove);document.removeEventListener('mouseup',onUp)}
+
+    box.addEventListener('mousedown',function(e){onDown('move',e);});
+    if(handle) handle.addEventListener('mousedown',function(e){onDown('resize',e);});
+    box.addEventListener('touchstart',function(e){onDown('move',e.touches[0]);},{passive:false});
+    if(handle) handle.addEventListener('touchstart',function(e){onDown('resize',e.touches[0]);},{passive:false});
+    document.addEventListener('touchmove',function(e){if(dragState.active&&e.touches[0])onMove(e.touches[0]);},{passive:false});
+    document.addEventListener('touchend',onUp);
+
+    // 双击开始自动追踪
+    box.addEventListener('dblclick',function(){if(typeof toggleAuto==='function')toggleAuto();});
+
+    // 初始尺寸 + resize 监听
+    preview.addEventListener('loadedmetadata',updateCircleSize);
+    window.__bmUpdateRegionBox = updateCircleSize;
+}
+
+// ========== 分析逻辑 (HTTP API，与 index 一致) ==========
+async function analyzeOnce(){
+    var data=TC.imageData;
+    if(!data&&TC.mode==='screen'){
+        data=TC.captureScreenImg();
+    }
+    if(!data){TC.log('\u8bf7\u5148\u9009\u62e9\u56fe\u7246\u6216\u5f00\u542f\u5c4f\u5e55\u6355\u83b7');return}
+    TC.log('\u6b63\u5728\u5206\u6790...');
+    try{await TC.sendAndDisplay(data);}catch(err){TC.log('\u9519\u8bef: '+err.message);}
+}
+
+// ========== 自动追踪 ==========
+function toggleAuto(){
+    autoRun=!autoRun;
+    var btn=$('autoBtn');
+    if(autoRun){btn.textContent='\u6682\u505c\u8ffd\u8e2a';btn.className='ba';TC.log('\u81ea\u52a8\u8ffd\u8e2a\u5df2\u542f\u52a8');loopAuto();}
+    else{btn.textContent='\u81ea\u52a8\u8ffd\u8e2a';btn.className='bs';TC.log('\u5df2\u6682\u505c');if(autoT){clearTimeout(autoT);autoT=null}}
+}
+function loopAuto(){
+    if(!autoRun)return;
+    captureAndSend();
+    autoT=setTimeout(function(){requestAnimationFrame(loopAuto);},50);}
+async function captureAndSend(){
+    if(TC.mode!=='screen'||sending||!TC.isScreenActive)return;
+    sending=true;
+    try{var d=TC.captureScreenImg();if(d)await TC.sendAndDisplay(d);}catch(e){console.error(e)}finally{sending=false}
+}
+
+// ========== 屏幕捕获 (包装 TC) ==========
+async function startSC(){
+    var ok = await TC.startScreenCapture({
+        previewVideo:'scrPrev',
+        offscreenVidId:'osVid',
+        onMeta:function(vw,vh){ if(window.__bmUpdateRegionBox)window.__bmUpdateRegionBox(); }
+    });
+    if(!ok)return;
+    setIM('screen');
+    $('minimapCanvas').style.display='none';
+    $('scrArea').style.display='';
+    $('stpBtn').style.display='';
+    $('regionInfo').style.display='';
+}
+function stopSC(){
+    if(autoT){clearTimeout(autoT);autoT=null}autoRun=false;$('autoBtn').textContent='\u81ea\u52a8\u8ffd\u8e2a';$('autoBtn').className='bs';
+    TC.stopScreenCapture();
+    $('scrArea').style.display='none';$('stpBtn').style.display='none';
+    $('regionInfo').style.display='none';
+    $('minimapCanvas').style.display='';
+    setIM('file');
+}
+
+function setIM(m){
+    TC.mode=m;
+    var btns=document.querySelectorAll('#floatBody .mode-btn');
+    btns.forEach(function(b){b.classList.remove('active');});
+    $(m==='file'?'mf':'ms').classList.add('active');
+}
+
+// ========== 启动 ==========
+init();
+</script>
+</body>
+</html>

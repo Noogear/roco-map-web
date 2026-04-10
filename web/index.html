@@ -279,6 +279,15 @@
             width: 100%;
         }
 
+        /* 原生PiP专用画布与视频 */
+        #pipCanvas, #pipVideo {
+            position: fixed;
+            opacity: 0;
+            pointer-events: none;
+            width: 1px;
+            height: 1px;
+        }
+
         @media (max-width: 900px) {
             #resultImg { width: 350px; height: 350px; }
         }
@@ -366,7 +375,7 @@
                 <label for="fileInput" class="file-label">📂 上传图片</label>
                 <input type="file" id="fileInput" accept="image/*">
                 <button class="btn-primary" onclick="processImage()">▶️ 分析定位</button>
-                <button class="btn-pip" id="pipBtn" onclick="togglePiP()" title="画中画悬浮窗">🖼️ 悬浮窗</button>
+                <button class="btn-pip" id="pipBtn" onclick="toggleNativePiP()">🎠 浏览器画中画</button>
                 <button class="btn-danger" onclick="stopScreenCapture()" id="stopScreenBtn" style="display:none;">⏹ 停止捕获</button>
             </div>
 
@@ -380,36 +389,69 @@
 
     <!-- 离屏视频：始终渲染帧供截图用，不受面板收起影响 -->
     <video id="screenOffscreen" autoplay playsinline muted style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;"></video>
+    <!-- 原生PiP专用元素 -->
+    <canvas id="pipCanvas"></canvas>
+    <video id="pipVideo" autoplay playsinline muted></video>
 
-    <!-- 画中画 Video PiP fallback 用（隐藏） -->
-    <video id="pipVideo" muted style="display:none;" autoplay playsinline></video>
-    <canvas id="pipCanvas" style="display:none;" width="400" height="400"></canvas>
-
+<script src="js/tracker-core.js"></script>
 <script>
-let currentMode = 'file';
-let currentAlgo = 'sift';
-let currentImageData = null;
+// ========== 初始化 ==========
+TC.init({
+    logEl: 'logArea',
+    onAnalyzeResult: function(result) {
+        if (result.image) {
+            var ri = document.getElementById('resultImg');
+            ri.src = 'data:image/png;base64,' + result.image;
+            // 自动同步到画中画
+            updatePiPCanvas();
+        }
+        if (result.status) {
+            TC.updateStatusDOM(result.status);
+        }
+    },
+    onScreenStart: function() {
+        document.querySelectorAll('.mode-btn').forEach(function(b) { b.classList.remove('active'); });
+        document.getElementById('modeScreen').classList.add('active');
 
-// ========== 日志工具 ==========
-function log(msg) {
-    const el = document.getElementById('logArea');
-    if (!el) return;
-    const time = new Date().toLocaleTimeString();
-    el.textContent += `[${time}] ${msg}\n`;
-    if (el.textContent.length > 5000) el.textContent = el.textContent.slice(el.textContent.length - 4000);
-    el.scrollTop = el.scrollHeight;
-}
+        var canvas = document.getElementById('minimapCanvas');
+        canvas.style.display = 'none';
+        document.getElementById('testImagesArea').classList.remove('show');
+        if (typeof screenAutoRunning !== 'undefined' && screenAutoRunning) screenAutoRunning = false;
 
-// ========== 屏幕捕获状态 ==========
-let screenStream = null;
-let screenVideoEl = null;
-let offscreenVideoEl = null;
-let screenAutoId = null;
-let screenRunning = false;
-let cachedVideoW = 0;
-let cachedVideoH = 0;
-let selCircle = { cx: (1189+62.5)/1362, cy: (66+63.5)/806, r: Math.max(62.5/1362, 63.5/806) };
-let dragState = { active: false, type: '', startX: 0, startY: 0, startCircle: null };
+        document.getElementById('screenVideoContainer').style.display = '';
+        document.getElementById('stopScreenBtn').style.display = '';
+        document.getElementById('regionInfo').style.display = '';
+    },
+    onScreenStop: function() {
+        if (screenAutoId) { cancelAnimationFrame(screenAutoId); screenAutoId = null; }
+        screenRunning = false;
+        document.getElementById('screenVideoContainer').style.display = 'none';
+        document.getElementById('stopScreenBtn').style.display = 'none';
+        document.getElementById('regionInfo').style.display = 'none';
+        setMode('file');
+    },
+});
+
+TC.log('系统就绪，请选择小地图输入方式');
+
+// ========== 文件 & 测试图片 ==========
+TC.bindFileInput(document.getElementById('fileInput'), document.getElementById('minimapCanvas'));
+
+document.addEventListener('testimage:selected', function(e) {
+    var img = e.detail.imgEl, src = e.detail.src;
+    var cvs = document.getElementById('minimapCanvas'), ctx = cvs.getContext('2d');
+    ctx.clearRect(0, 0, 300, 300);
+    var s = Math.min(300 / img.naturalWidth, 300 / img.naturalHeight);
+    var w = img.naturalWidth * s, h = img.naturalHeight * s;
+    ctx.drawImage(img, (300 - w) / 2, (300 - h) / 2, w, h);
+    TC.imageData = cvs.toDataURL('image/png');
+    TC.log('已选择测试图: ' + src);
+});
+
+TC.loadTestImages('testGrid').then(function(imgs) {
+    if (imgs.length > 0) document.getElementById('testImagesArea').classList.add('show');
+});
+TC.checkEngines();
 
 // ========== 悬浮面板 ==========
 function toggleFloatPanel() {
@@ -417,444 +459,202 @@ function toggleFloatPanel() {
     document.getElementById('floatToggle').classList.toggle('expanded');
 }
 
-// ========== 屏幕捕获 ==========
+// ========== 屏幕捕获（包装 TC，加 UI） ==========
 
 async function startScreenCapture() {
-    try {
-        screenStream = await navigator.mediaDevices.getDisplayMedia({
-            video: { cursor: 'always', displaySurface: 'monitor' },
-            audio: false,
-        });
-    } catch(e) { log('屏幕捕获失败/已取消: ' + e.message); return; }
-
-    currentMode = 'screen';
-    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-    document.getElementById('modeScreen').classList.add('active');
-
-    const canvas = document.getElementById('minimapCanvas');
-    const container = document.getElementById('screenVideoContainer');
-    const screenVid = document.getElementById('screenPreview');
-    const stopBtn = document.getElementById('stopScreenBtn');
-    const regionInfo = document.getElementById('regionInfo');
-
-    canvas.style.display = 'none';
-    document.getElementById('testImagesArea').classList.remove('show');
-    if (typeof screenAutoRunning !== 'undefined' && screenAutoRunning) screenAutoRunning = false;
-
-    container.style.display = '';
-    stopBtn.style.display = '';
-    regionInfo.style.display = '';
-
-    screenVideoEl = screenVid;
-    screenVid.srcObject = screenStream;
-
-    offscreenVideoEl = document.getElementById('screenOffscreen');
-    offscreenVideoEl.srcObject = screenStream;
-    offscreenVideoEl.onloadedmetadata = () => {
-        cachedVideoW = offscreenVideoEl.videoWidth;
-        cachedVideoH = offscreenVideoEl.videoHeight;
-        initRegionBox(screenVid);
-        setupRegionDrag(screenVid);
-    };
-
-    screenStream.getVideoTracks()[0].onended = () => stopScreenCapture();
-    log('🖥️ 屏幕捕获已开始 — 请拖动蓝色选框框选小地图区域');
+    var ok = await TC.startScreenCapture({
+        previewVideo: 'screenPreview',
+        offscreenVidId: 'screenOffscreen',
+        onMeta: function(vw, vh) { initRegionBox(document.getElementById('screenPreview')); setupRegionDrag(document.getElementById('screenPreview')); }
+    });
+    if (!ok) return;
 }
-
-function stopScreenCapture() {
-    if (screenAutoId) { cancelAnimationFrame(screenAutoId); screenAutoId = null; }
-    screenRunning = false;
-    if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
-    if (screenVideoEl) screenVideoEl.srcObject = null;
-    if (offscreenVideoEl) { offscreenVideoEl.srcObject = null; offscreenVideoEl = null; }
-    document.getElementById('screenVideoContainer').style.display = 'none';
-    document.getElementById('stopScreenBtn').style.display = 'none';
-    document.getElementById('regionInfo').style.display = 'none';
-    setMode('file');
-    log('⏹ 屏幕捕获已停止');
-}
+function stopScreenCapture() { TC.stopScreenCapture(); }
 
 function initRegionBox(videoEl) {
-    const overlay = document.getElementById('regionOverlay');
-    const box = document.getElementById('regionBox');
+    var overlay = document.getElementById('regionOverlay'), box = document.getElementById('regionBox');
     function updateCircleSize() {
-        const rect = videoEl.getBoundingClientRect();
+        var rect = videoEl.getBoundingClientRect();
         overlay.style.width = rect.width + 'px'; overlay.style.height = rect.height + 'px';
-        const size = Math.min(rect.width, rect.height);
-        box.style.left  = (selCircle.cx * rect.width - selCircle.r * size) + 'px';
-        box.style.top   = (selCircle.cy * rect.height - selCircle.r * size) + 'px';
-        const diameter = selCircle.r * size * 2;
-        box.style.width = diameter + 'px'; box.style.height = diameter + 'px';
-        const realCX = Math.round(selCircle.cx * videoEl.videoWidth);
-        const realCY = Math.round(selCircle.cy * videoEl.videoHeight);
-        const realR  = Math.round(selCircle.r * Math.min(videoEl.videoWidth, videoEl.videoHeight));
+        var size = Math.min(rect.width, rect.height);
+        box.style.left = (TC.selCircle.cx * rect.width - TC.selCircle.r * size) + 'px';
+        box.style.top = (TC.selCircle.cy * rect.height - TC.selCircle.r * size) + 'px';
+        var d = TC.selCircle.r * size * 2;
+        box.style.width = d + 'px'; box.style.height = d + 'px';
+        var realCX = Math.round(TC.selCircle.cx * videoEl.videoWidth);
+        var realCY = Math.round(TC.selCircle.cy * videoEl.videoHeight);
+        var realR = Math.round(TC.selCircle.r * Math.min(videoEl.videoWidth, videoEl.videoHeight));
         document.getElementById('regionInfo').textContent =
-            `圆形选区: 中心(${realCX}, ${realCY}) 半径${realR}px [${videoEl.videoWidth}x${videoEl.videoHeight}]`;
+            '圆形选区: 中心(' + realCX + ', ' + realCY + ') 半径' + realR + 'px [' + videoEl.videoWidth + 'x' + videoEl.videoHeight + ']';
     }
     updateCircleSize();
     window.__updateRegionBox = updateCircleSize;
 }
 
+var dragState = { active: false, type: '', startX: 0, startY: 0, startCircle: null };
 function setupRegionDrag(videoEl) {
-    const box = document.getElementById('regionBox');
-    const overlay = document.getElementById('regionOverlay');
-    const handle = box.querySelector('.region-handle');
-    function getPos(e) { const rect = overlay.getBoundingClientRect(); return { x: e.clientX - rect.left, y: e.clientY - rect.top }; }
+    var box = document.getElementById('regionBox');
+    var overlay = document.getElementById('regionOverlay');
+    var handle = box.querySelector('.region-handle');
+    function getPos(e) { var rect = overlay.getBoundingClientRect(); return { x: e.clientX - rect.left, y: e.clientY - rect.top }; }
     function onDown(type, e) {
         e.preventDefault(); e.stopPropagation();
-        dragState = { active: true, type, startX: getPos(e).x, startY: getPos(e).y, startCircle: { ...selCircle } };
+        dragState = { active: true, type: type, startX: getPos(e).x, startY: getPos(e).y, startCircle: { cx: TC.selCircle.cx, cy: TC.selCircle.cy, r: TC.selCircle.r } };
         document.addEventListener('mousemove', onMove);
         document.addEventListener('mouseup', onUp);
     }
     function onMove(e) {
         if (!dragState.active) return;
-        const p = getPos(e), rect = overlay.getBoundingClientRect(), base = Math.min(rect.width, rect.height);
-        const dx = (p.x - dragState.startX) / base, dy = (p.y - dragState.startY) / base, sc = dragState.startCircle;
-        if (dragState.type === 'move') { selCircle.cx = clamp(sc.cx+dx,0,1); selCircle.cy = clamp(sc.cy+dy,0,1); }
-        else { const maxR=Math.max(sc.cx,1-sc.cx,sc.cy,1-sc.cy); selCircle.r = clamp(sc.r+dx,0.03,Math.min(0.49,maxR)); }
+        var p = getPos(e), rect = overlay.getBoundingClientRect(), base = Math.min(rect.width, rect.height);
+        var dx = (p.x - dragState.startX) / base, dy = (p.y - dragState.startY) / base, sc = dragState.startCircle;
+        if (dragState.type === 'move') { TC.selCircle.cx = TC.clamp(sc.cx+dx, 0, 1); TC.selCircle.cy = TC.clamp(sc.cy+dy, 0, 1); }
+        else { var maxR = Math.max(sc.cx, 1-sc.cx, sc.cy, 1-sc.cy); TC.selCircle.r = TC.clamp(sc.r+dx, 0.03, Math.min(0.49, maxR)); }
         window.__updateRegionBox && window.__updateRegionBox();
     }
     function onUp() { dragState.active=false; document.removeEventListener('mousemove',onMove); document.removeEventListener('mouseup',onUp); }
-    box.addEventListener('mousedown',(e)=>onDown('move',e));
-    handle&&handle.addEventListener('mousedown',(e)=>onDown('resize',e));
-    box.addEventListener('touchstart',(e)=>onDown('move',e.touches[0]),{passive:false});
-    handle&&handle.addEventListener('touchstart',(e)=>onDown('resize',e.touches[0]),{passive:false});
-    document.addEventListener('touchmove',(e)=>{if(dragState.active&&e.touches[0])onMove(e.touches[0]);},{passive:false});
-    document.addEventListener('touchend',onUp);
-    box.addEventListener('dblclick',()=>{if(typeof toggleScreenAutoTrack==='function')toggleScreenAutoTrack();});
-    videoEl.addEventListener('resize',()=>{setTimeout(()=>window.__updateRegionBox&&window.__updateRegionBox(),100)});
+    box.addEventListener('mousedown', function(e){ onDown('move',e); });
+    if(handle) handle.addEventListener('mousedown', function(e){ onDown('resize',e); });
+    box.addEventListener('touchstart', function(e){ onDown('move', e.touches[0]); }, {passive:false});
+    if(handle) handle.addEventListener('touchstart', function(e){ onDown('resize', e.touches[0]); }, {passive:false});
+    document.addEventListener('touchmove', function(e){ if(dragState.active&&e.touches[0])onMove(e.touches[0]);}, {passive:false});
+    document.addEventListener('touchend', onUp);
+    box.addEventListener('dblclick', function(){ if(typeof toggleScreenAutoTrack==='function')toggleScreenAutoTrack(); });
+    videoEl.addEventListener('resize', function(){ setTimeout(function(){window.__updateRegionBox&&window.__updateRegionBox();}, 10); });
 }
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-let screenSending = false;
-
+// ========== 自动追踪（屏幕捕获模式） ==========
+var screenSending = false;
 async function captureAndSendScreenFrame() {
-    if (!screenStream || screenSending) return;
+    if (!TC.isScreenActive || screenSending) return;
     screenSending = true;
-    const vid = (offscreenVideoEl && offscreenVideoEl.videoWidth) ? offscreenVideoEl : screenVideoEl;
-    if (!vid) { screenSending=false; return; }
-    const vw = vid.videoWidth||cachedVideoW, vh = vid.videoHeight||cachedVideoH;
-    if (!vw || !vh) { screenSending=false; return; }
-    const baseSize=Math.min(vw,vh), cx=selCircle.cx*vw, cy=selCircle.cy*vh, r=selCircle.r*baseSize;
-    const size=Math.max(10,Math.round(r*2)), rx=Math.round(cx-r), ry=Math.round(cy-r);
-    const tmpC=document.createElement('canvas'); tmpC.width=size; tmpC.height=size;
-    const ctx=tmpC.getContext('2d');
-    ctx.beginPath(); ctx.arc(size/2,size/2,size/2,0,Math.PI*2); ctx.closePath(); ctx.clip();
-    ctx.drawImage(vid,rx,ry,size,size,0,0,size,size);
-    currentImageData = tmpC.toDataURL('image/jpeg',0.80);
-    try { await sendAndDisplay(currentImageData); } catch(e) { console.error('识别出错:',e); }
-    finally { screenSending=false; }
+    try {
+        var data = TC.captureScreenImg();
+        if (data) { TC.imageData = data; await TC.sendAndDisplay(data); }
+    } catch(e) { console.error('识别出错:', e); }
+    finally { screenSending = false; }
 }
-
-let screenAutoRunning = false;
+var screenAutoRunning = false, screenAutoId = null;
 function toggleScreenAutoTrack() {
-    screenAutoRunning=!screenAutoRunning;
-    const btn=document.getElementById('stopScreenBtn');
-    if(screenAutoRunning){ btn.textContent='⏸ 暂停追踪'; log(`🔄 屏幕自动追踪已开启 (${currentAlgo==='sift'?'~20fps':'~5fps'})`); runScreenAutoLoop(); }
-    else{ btn.textContent='⏹ 停止捕获'; log('⏸ 屏幕自动追踪已暂停'); screenSending=false; }
+    screenAutoRunning = !screenAutoRunning;
+    var btn = document.getElementById('stopScreenBtn');
+    if (screenAutoRunning) { btn.textContent='⏸ 暂停追踪'; TC.log('📍 屏幕自动追踪已开启 (~20fps)'); runScreenAutoLoop(); }
+    else { btn.textContent='⏹ 停止捕获'; TC.log('⏸ 屏幕自动追踪已暂停'); screenSending = false; }
 }
-function runScreenAutoLoop(){
-    if(!screenAutoRunning||currentMode!=='screen')return;
+function runScreenAutoLoop() {
+    if (!screenAutoRunning || TC.mode !== 'screen') return;
     captureAndSendScreenFrame();
-    const interval=currentAlgo==='sift'?50:200;
-    screenAutoId=setTimeout(()=>requestAnimationFrame(runScreenAutoLoop),interval);
+    screenAutoId = setTimeout(function() { requestAnimationFrame(runScreenAutoLoop); }, 50);
 }
 
-// ========== 文件模式 ==========
-
-async function setMode(mode) {
-    currentMode=mode;
-    document.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));
+// ========== 文件模式切换 ==========
+function setMode(mode) {
+    TC.mode = mode;
+    document.querySelectorAll('.mode-btn').forEach(function(b) { b.classList.remove('active'); });
     document.getElementById('modeFile').classList.add('active');
-    document.getElementById('screenVideoContainer').style.display='none';
-    document.getElementById('stopScreenBtn').style.display='none';
-    document.getElementById('regionInfo').style.display='none';
-    if(typeof screenAutoRunning!=='undefined'&&screenAutoRunning&&currentMode!=='screen')screenAutoRunning=false;
-    document.getElementById('minimapCanvas').style.display='block';
+    document.getElementById('screenVideoContainer').style.display = 'none';
+    document.getElementById('stopScreenBtn').style.display = 'none';
+    document.getElementById('regionInfo').style.display = 'none';
+    if (typeof screenAutoRunning !== 'undefined' && screenAutoRunning && mode !== 'screen') screenAutoRunning = false;
+    document.getElementById('minimapCanvas').style.display = 'block';
     document.getElementById('testImagesArea').classList.add('show');
 }
 
-document.getElementById('fileInput').addEventListener('change', function(e){
-    const file=e.target.files[0]; if(!file)return;
-    const reader=new FileReader();
-    reader.onload=function(ev){
-        const img=new Image();
-        img.onload=()=>{
-            const cvs=document.getElementById('minimapCanvas'),ctx=cvs.getContext('2d');
-            ctx.clearRect(0,0,300,300);
-            const s=Math.min(300/img.width,300/img.height),w=img.width*s,h=img.height*s;
-            ctx.drawImage(img,(300-w)/2,(300-h)/2,w,h);
-            currentImageData=cvs.toDataURL('image/png');
-            log(`已加载图片: ${img.width}x${img.height}`);
-        }; img.src=ev.target.result;
-    };
-    reader.readAsDataURL(file);
-});
-
-async function sendAndDisplay(imageData) {
-    const response = await fetch('/api/upload_minimap', {
-        method:'POST',
-        body: JSON.stringify({ image:imageData }),
-        headers:{'Content-Type':'application/json'}
-    });
-    let result;
-    if(!response.ok){
-        const blob=await(await fetch(imageData)).blob();
-        const fd=new FormData(); fd.append('image',blob,'minimap.png');
-        result=await(await fetch('/api/upload_minimap',{method:'POST',body:fd})).json();
-    } else result=await response.json();
-
-    if(result.image){
-        const ri=document.getElementById('resultImg');
-        ri.src='data:image/png;base64,'+result.image;
-        if(pipActive) syncPiPNow();
-    }
-    if(result.status){
-        updateStatus(result.status);
-        log(`分析完成 | ${result.status.found?'✅ 找到位置':'❌ 未找到'} (${result.status.matches} 匹配点)`);
-    } else log('分析完成，但未返回状态信息');
-}
-
+// ========== 分析按钮 ==========
 async function processImage() {
-    if(currentMode==='screen'){toggleScreenAutoTrack();return;}
-    let dataToSend=currentImageData;
-    if(!dataToSend){
-        const cvs=document.getElementById('minimapCanvas');
-        if(cvs&&cvs.style.display!=='none') dataToSend=cvs.toDataURL('image/png');
+    if (TC.mode === 'screen') { toggleScreenAutoTrack(); return; }
+    var data = TC.imageData;
+    if (!data) {
+        var cvs = document.getElementById('minimapCanvas');
+        if (cvs && cvs.style.display !== 'none') data = cvs.toDataURL('image/png');
     }
-    if(!dataToSend){log('请先上传或选择小地图！');return;}
-    log(`正在 ${currentAlgo==='sift'?'SIFT':'LoFTR AI'} 分析...`);
-    try{await sendAndDisplay(dataToSend);}catch(err){log('错误: '+err.message);console.error(err);}
+    if (!data) { TC.log('请先上传或选择小地图！'); return; }
+    TC.log('正在 SIFT 分析...');
+    try { await TC.sendAndDisplay(data); } catch(err) { TC.log('错误: ' + err.message); console.error(err); }
 }
 
-// ========== 测试图片 ==========
-let testImages=[], selectedTestImg=null;
-async function loadTestImages(){
-    try{
-        testImages=await(await fetch('/api/test_images')).json();
-        const grid=document.getElementById('testGrid');grid.innerHTML='';
-        testImages.forEach(src=>{
-            const img=document.createElement('img');img.src=src;img.className='test-item';img.title=src;
-            img.onclick=()=>selectTestImage(img,src);grid.appendChild(img);
-        });
-        if(testImages.length>0){document.getElementById('testImagesArea').classList.add('show');log(`已加载 ${testImages.length} 张测试图片`);}
-    }catch(e){console.log('无测试图片或加载失败:',e.message);}
-}
-function selectTestImage(el,src){
-    document.querySelectorAll('.test-item').forEach(i=>i.classList.remove('selected'));el.classList.add('selected');
-    const img=new Image();
-    img.onload=()=>{
-        const cvs=document.getElementById('minimapCanvas'),ctx=cvs.getContext('2d');
-        ctx.clearRect(0,0,300,300);
-        const s=Math.min(300/img.width,300/img.height),w=img.width*s,h=img.height*s;
-        ctx.drawImage(img,(300-w)/2,(300-h)/2,w,h);
-        currentImageData=cvs.toDataURL('image/png');selectedTestImg=src;
-        log(`已选择测试图: ${src} (${img.width}x${img.height})`);
-    };img.src=src;}
-loadTestImages();
+// ========== 纯原生浏览器画中画 ==========
+const pipCanvas = document.getElementById('pipCanvas');
+const pipVideo = document.getElementById('pipVideo');
+const pipBtn = document.getElementById('pipBtn');
+const resultImg = document.getElementById('resultImg');
+let pipTimer = null;
 
-function updateStatus(status){
-    const stateEl=document.getElementById('statusState'),foundEl=document.getElementById('statusFound');
-    const modeEl=document.getElementById('statusMode');
-    if(status.mode){modeEl.textContent=status.mode.toUpperCase();modeEl.style.color=status.mode==='sift'?'#ffa726':'#00d4ff';}
-    let stateText='--';
-    if(status.mode==='sift'){
-        if(status.state==='INERTIAL')stateText='惯性导航';
-        else if(status.state==='FOUND')stateText='SIFT 追踪';
-        else stateText='SIFT 搜索';
-    }else{stateText=status.state==='GLOBAL_SCAN'?'全局扫描':'局部追踪';}
-    stateEl.textContent=stateText;
-    stateEl.className='status-value '+(status.mode==='sift'?'state-local':(status.state==='GLOBAL_SCAN'?'state-global':'state-local'));
-    document.getElementById('statusX').textContent=status.position.x;
-    document.getElementById('statusY').textContent=status.position.y;
-    foundEl.textContent=status.found?'✅ 是':'❌ 否';
-    foundEl.className='status-value '+(status.found?'found-yes':'found-no');
-    document.getElementById('statusMatches').textContent=status.matches;
+// 初始化画布尺寸
+pipCanvas.width = 400;
+pipCanvas.height = 400;
+
+// 更新画中画画面（双缓冲防闪黑）
+var _pipBackBuf = null;
+function _getPipBackBuffer() {
+    if (!_pipBackBuf) { _pipBackBuf = document.createElement('canvas'); _pipBackBuf.width = 400; _pipBackBuf.height = 400; }
+    return _pipBackBuf;
+}
+function updatePiPCanvas() {
+    if (!resultImg.src || !resultImg.naturalWidth || !resultImg.naturalHeight) return;
+    const back = _getPipBackBuffer();
+    const bctx = back.getContext('2d');
+    const scale = Math.min(400 / resultImg.naturalWidth, 400 / resultImg.naturalHeight);
+    const w = resultImg.naturalWidth * scale;
+    const h = resultImg.naturalHeight * scale;
+    bctx.drawImage(resultImg, (400 - w) / 2, (400 - h) / 2, w, h);
+
+    // 原子式一次性复制到前台画布，避免 captureStream 抓到中间态
+    const ctx = pipCanvas.getContext('2d');
+    ctx.drawImage(back, 0, 0);
 }
 
-log('系统就绪，请选择小地图输入方式');
-checkAvailableEngines();
-
-async function checkAvailableEngines(){
-    try{
-        const tr=await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'loftr'})});
-        const tResult=await tr.json();
-        if(!tResult.success){document.getElementById('algoLoftr').style.display='none';log('⚠ SIFT-only 模式：LoFTR 不可用');}
-        else{await fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'sift'})});}
-    }catch(e){console.log('引擎检测跳过:',e.message);}
-}
-
-// ========== 画中画 (Document PiP 定制 UI) ==========
-let pipActive = false;
-let pipUpdateTimer = null;
-let pipWindow = null;       // Document PiP 窗口引用
-let pipMode = '';           // 'document' | 'video'
-
-async function togglePiP() {
-    if (pipActive) { await exitPiP(); } else { await enterPiP(); }
-}
-
-async function enterPiP() {
-    const ri = document.getElementById('resultImg');
-    const btn = document.getElementById('pipBtn');
-
-    const hasDocPIP = !!window.documentPictureInPictureEnabled;
-    const hasVidPIP = !!document.pictureInPictureEnabled;
-
-    if (!hasDocPIP && !hasVidPIP) {
-        alert('您的浏览器不支持画中画，请使用 Chrome/Edge 116+'); return;
+// 切换原生画中画
+async function toggleNativePiP() {
+    // 检查浏览器支持
+    if (!document.pictureInPictureEnabled) {
+        alert('您的浏览器不支持原生画中画，请使用 Chrome/Edge 最新版');
+        return;
     }
-    if (!ri.src || (!ri.src.startsWith('data:') && !ri.src.startsWith('http'))) {
-        log('请先分析一张图片再开启悬浮窗！'); return;
+
+    // 没有图片则无法开启
+    if (!resultImg.src) {
+        TC.log('请先分析一张图片再开启画中画！');
+        return;
     }
 
     try {
-        if (hasDocPIP) { await enterDocumentPiP(); pipMode = 'document'; }
-        else { await enterVideoPiP(); pipMode = 'video'; }
-        pipActive = true;
-        btn.classList.add('active');
-        btn.textContent = '✅ 关闭悬浮窗';
-        startPiPRefresh();
-        log(`🖼️ 悬浮窗已开启 (${pipMode === 'document' ? '定制 UI' : '视频模式'})`);
-    } catch(e) { console.error('PiP 失败:', e); alert('画中画失败: ' + e.message); }
-}
-
-// ---- Document PiP：自定义 HTML UI（Chrome/Edge 116+）----
-async function enterDocumentPiP() {
-    pipWindow = await window.documentPictureInPicture.requestWindow({ width: 420, height: 560 });
-
-    pipWindow.document.write(`<html><head><style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#1a1a2e;color:#eee;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;width:420px;display:flex;flex-direction:column;overflow:hidden}
-.header{background:linear-gradient(135deg,#16213e,#0f3460);padding:10px 14px;display:flex;align-items:center;gap:8px;border-bottom:1px solid rgba(0,212,255,.2)}
-.icon{font-size:18px}.title{font-size:13px;font-weight:700;color:#00d4ff}
-.map-wrap{position:relative;padding:12px;display:flex;justify-content:center;background:#111}
-#pipMapImg{width:396px;height:396px;object-fit:contain;border-radius:8px}
-.status-bar{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;padding:10px 14px;background:#0d1117}
-.stat-item{text-align:center;background:#161b22;border-radius:6px;padding:6px 4px}
-.stat-label{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
-.stat-value{font-size:14px;font-weight:bold;margin-top:2px;font-family:monospace}
-.coord-x{color:#f97316}.coord-y{color:#3b82f6}
-.state-ok{color:#22c55e}.state-warn{color:#eab308}.state-err{color:#ef4444}
-.footer{padding:8px 14px;background:#0d1117;border-top:1px solid #21262d;font-size:10px;color:#6e7681;text-align:center}
-.opacity-bar{padding:8px 14px;background:#0d1117;border-top:1px solid #21262d;display:flex;align-items:center;gap:8px;font-size:11px;color:#8b949e}
-.opacity-bar label{white-space:nowrap;min-width:52px}
-.opacity-bar input[type=range]{flex:1;accent-color:#00d4ff;height:4px;cursor:pointer}
-.opacity-val{min-width:28px;text-align:right;font-family:monospace;color:#00d4ff}
-</style></head><body>
-<div class="header"><span class="icon">⚓</span><span class="title">地图实时追踪</span></div>
-<div class="map-wrap"><img id="pipMapImg"/></div>
-<div class="status-bar">
-<div class="stat-item"><div class="stat-label">X</div><div class="stat-value coord-x" id="pipX">--</div></div>
-<div class="stat-item"><div class="stat-label">Y</div><div class="stat-value coord-y" id="pipY">--</div></div>
-<div class="stat-item"><div class="stat-label">状态</div><div class="stat-value state-ok" id="pipState">--</div></div>
-</div>
-<div class="opacity-bar"><label>🎚️ 透明度</label><input type="range" id="pipOpacity" min="20" max="100" value="95"><span class="opacity-val" id="pipOpacityVal">95%</span></div>
-<div class="footer">Document Picture-in-Picture · 实时跟随主页面</div>
-</body></html>`);
-    pipWindow.document.close();
-
-    // 绑定透明度滑块
-    const opSlider = pipWindow.document.getElementById('pipOpacity');
-    const opVal = pipWindow.document.getElementById('pipOpacityVal');
-    if (opSlider) {
-        opSlider.addEventListener('input', () => {
-            const v = opSlider.value;
-            opVal.textContent = v + '%';
-            pipWindow.document.body.style.opacity = v / 100;
-        });
+        if (document.pictureInPictureElement) {
+            // 关闭画中画
+            await document.exitPictureInPicture();
+            pipBtn.classList.remove('active');
+            pipBtn.textContent = '🎠 浏览器画中画';
+            if (pipTimer) clearInterval(pipTimer);
+            pipTimer = null;
+            TC.log('✅ 原生画中画已关闭');
+        } else {
+            // 开启画中画
+            updatePiPCanvas();
+            pipVideo.srcObject = pipCanvas.captureStream(15);
+            await pipVideo.play();
+            await pipVideo.requestPictureInPicture();
+            
+            // 按钮状态
+            pipBtn.classList.add('active');
+            pipBtn.textContent = '✅ 关闭画中画';
+            
+            // 自动刷新画面
+            pipTimer = setInterval(updatePiPCanvas, 200);
+            
+            // 监听关闭事件
+            pipVideo.addEventListener('leavepictureinpicture', () => {
+                pipBtn.classList.remove('active');
+                pipBtn.textContent = '🎠 浏览器画中画';
+                if (pipTimer) clearInterval(pipTimer);
+                pipTimer = null;
+                TC.log('✅ 原生画中画已关闭');
+            }, { once: true });
+            
+            TC.log('✅ 原生浏览器画中画已开启');
+        }
+    } catch (err) {
+        console.error('画中画失败：', err);
+        TC.log('❌ 画中画启动失败：' + err.message);
     }
-    pipWindow.document.body.style.opacity = 0.95;
-
-    syncToDocPiP();
-    pipWindow.addEventListener('pagehide', onPiPLEave);
-}
-
-// 同步数据 → Document PiP 窗口
-function syncToDocPiP() {
-    if (pipMode !== 'document' || !pipWindow || pipWindow.closed) return;
-    const imgEl = pipWindow.document.getElementById('pipMapImg');
-    if (imgEl) imgEl.src = document.getElementById('resultImg').src;
-    const xEl = pipWindow.document.getElementById('pipX');
-    const yEl = pipWindow.document.getElementById('pipY');
-    const sEl = pipWindow.document.getElementById('pipState');
-    if (xEl) xEl.textContent = document.getElementById('statusX').textContent;
-    if (yEl) yEl.textContent = document.getElementById('statusY').textContent;
-    if (sEl) {
-        const st = document.getElementById('statusState')?.textContent?.trim();
-        sEl.textContent = st || '--';
-        sEl.className = 'stat-value ' + (
-            !st ? 'state-ok' :
-            st.includes('追踪') || st.includes('定位') || st.includes('惯性') ? 'state-ok' :
-            st.includes('搜索') || st.includes('扫描') ? 'state-warn' : 'state-err'
-        );
-    }
-}
-
-// ---- Video PiP fallback（旧浏览器）----
-const _pv = document.getElementById('pipVideo'), _pc = document.getElementById('pipCanvas');
-let _vidInitDone = false;
-
-async function enterVideoPiP() {
-    if (!_vidInitDone) { _pc.width = 400; _pc.height = 400; _vidInitDone = true; }
-    const ri = document.getElementById('resultImg'), ctx = _pc.getContext('2d');
-    if (ri.naturalWidth && ri.naturalHeight) {
-        const sc = Math.min(400/ri.naturalWidth, 400/ri.naturalHeight);
-        ctx.drawImage(ri, (400-ri.naturalWidth*sc)/2, (400-ri.naturalHeight*sc)/2, ri.naturalWidth*sc, ri.naturalHeight*sc);
-    }
-    _pv.srcObject = _pc.captureStream(10);
-    await _pv.play();
-    await _pv.requestPictureInPicture();
-    _pv.addEventListener('leavepictureinpicture', onPiPLEave, { once: true });
-}
-
-// 统一刷新入口（根据当前模式选择同步方式）
-function syncPiPNow() {
-    if (pipMode === 'document') syncToDocPiP();
-    else drawVideoPiPCanvas();
-}
-
-function drawVideoPiPCanvas() {
-    const ri = document.getElementById('resultImg'), ctx = _pc.getContext('2d');
-    if (ri.naturalWidth && ri.naturalHeight) {
-        const sc = Math.min(400/ri.naturalWidth, 400/ri.naturalHeight);
-        ctx.drawImage(ri, (400-ri.naturalWidth*sc)/2, (400-ri.naturalHeight*sc)/2, ri.naturalWidth*sc, ri.naturalHeight*sc);
-    }
-}
-
-function startPiPRefresh() {
-    stopPiPRefresh();
-    pipUpdateTimer = setInterval(() => {
-        if (!pipActive) return;
-        syncPiPNow();
-    }, 500);
-}
-
-function stopPiPRefresh() {
-    if (pipUpdateTimer) { clearInterval(pipUpdateTimer); pipUpdateTimer = null; }
-}
-
-async function exitPiP() {
-    const btn = document.getElementById('pipBtn');
-    stopPiPRefresh();
-    if (pipMode === 'document') {
-        // Document PiP 窗口由用户手动关闭，无需额外操作
-    } else if (_pv && document.pictureInPictureElement === _pv) {
-        try { await document.exitPictureInPicture(); } catch(e) {}
-    }
-    pipActive = false;
-    pipWindow = null;
-    pipMode = '';
-    btn.classList.remove('active');
-    btn.textContent = '🖼️ 悬浮窗';
-}
-
-function onPiPLEave() {
-    pipActive = false;
-    stopPiPRefresh();
-    const btn = document.getElementById('pipBtn');
-    if (btn) { btn.classList.remove('active'); btn.textContent = '🖼️ 悬浮窗'; }
-    log('🖼️ 悬浮窗已关闭');
 }
 </script>
 </body>

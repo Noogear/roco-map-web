@@ -508,6 +508,22 @@ def get_status():
     return jsonify(tracker.latest_status)
 
 
+@app.route('/api/map_info')
+def get_map_info():
+    """大地图模式：返回地图尺寸和图片路径"""
+    return jsonify({
+        'map_width': tracker.map_width,
+        'map_height': tracker.map_height,
+        'display_map_url': '/big_map-1.png',
+    })
+
+
+@app.route('/bigmap')
+def bigmap_page():
+    """大地图独立页面"""
+    return send_file(os.path.join(WEB_DIR, 'bigmap.html'))
+
+
 @app.route('/api/mode', methods=['POST'])
 def set_mode():
     """切换识别模式: sift 或 loftr"""
@@ -590,6 +606,33 @@ def ws_receive_frame(raw_bytes):
         # 发送: [4字节大端长度][JSON状态][JPEG图片]
         emit('result',
              struct.pack('>I', len(status_json)) + status_json + jpeg_result,
+             binary=True)
+    else:
+        err = b'{"error":"decode_fail"}'
+        emit('error', struct.pack('>I', len(err)) + err, binary=True)
+
+
+@socketio.on('frame_coords')
+def ws_frame_coords(raw_bytes):
+    """大地图模式：接收帧但只返回坐标（不返回裁剪图片），大幅减少带宽"""
+    nparr = np.frombuffer(raw_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is not None:
+        tracker.set_minimap(img)
+        tracker.process_frame()  # 处理，但不需要图片输出
+
+        status_json = json.dumps({
+            'm': tracker.current_mode,
+            's': tracker.latest_status['state'],
+            'x': tracker.latest_status['position']['x'],
+            'y': tracker.latest_status['position']['y'],
+            'f': int(tracker.latest_status['found']),
+            'c': tracker.latest_status['matches'],
+        }, separators=(',', ':')).encode('utf-8')
+
+        emit('coords',
+             struct.pack('>I', len(status_json)) + status_json,
              binary=True)
     else:
         err = b'{"error":"decode_fail"}'
