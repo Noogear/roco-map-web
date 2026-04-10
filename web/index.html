@@ -105,6 +105,9 @@
         .btn-secondary:hover { background: #444; }
         .btn-danger { background: #e53935; color: #fff; }
         .btn-danger:hover { background: #c62828; }
+        .btn-pip { background: #7c4dff; color: #fff; border: 1px solid #b388ff; }
+        .btn-pip:hover { background: #651fff; transform: translateY(-1px); }
+        .btn-pip.active { background: #00e676; color: #000; border-color: #00e676; }
 
         input[type="file"] { display: none; }
         label.file-label {
@@ -363,6 +366,7 @@
                 <label for="fileInput" class="file-label">📂 上传图片</label>
                 <input type="file" id="fileInput" accept="image/*">
                 <button class="btn-primary" onclick="processImage()">▶️ 分析定位</button>
+                <button class="btn-pip" id="pipBtn" onclick="togglePiP()" title="画中画悬浮窗">🖼️ 悬浮窗</button>
                 <button class="btn-danger" onclick="stopScreenCapture()" id="stopScreenBtn" style="display:none;">⏹ 停止捕获</button>
             </div>
 
@@ -376,6 +380,10 @@
 
     <!-- 离屏视频：始终渲染帧供截图用，不受面板收起影响 -->
     <video id="screenOffscreen" autoplay playsinline muted style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;"></video>
+
+    <!-- 画中画视频（隐藏，仅用于 PiP） -->
+    <video id="pipVideo" muted style="display:none;" autoplay playsinline></video>
+    <canvas id="pipCanvas" style="display:none;" width="400" height="400"></canvas>
 
 <script>
 let currentMode = 'file';
@@ -723,7 +731,13 @@ async function sendAndDisplay(imageData) {
     }
 
     if (result.image) {
-        document.getElementById('resultImg').src = 'data:image/png;base64,' + result.image;
+        const resultImg = document.getElementById('resultImg');
+        resultImg.src = 'data:image/png;base64,' + result.image;
+        // 画中画模式时同步刷新
+        if (pipActive) {
+            resultImg.onload = () => { drawCurrentToPiPCanvas(); };
+            drawCurrentToPiPCanvas();
+        }
     }
 
     if (result.status) {
@@ -883,6 +897,119 @@ async function checkAvailableEngines() {
     } catch(e) {
         console.log('引擎检测跳过:', e.message);
     }
+}
+
+// ========== 画中画 (Picture-in-Picture) 悬浮窗 ==========
+let pipActive = false;
+let pipUpdateTimer = null;
+let pipInitialized = false;  // 首次初始化后不再重置 canvas 尺寸（防止闪黑）
+
+async function togglePiP() {
+    const btn = document.getElementById('pipBtn');
+    if (pipActive) {
+        await exitPiP();
+    } else {
+        await enterPiP();
+    }
+}
+
+async function enterPiP() {
+    const resultImg = document.getElementById('resultImg');
+    const pipVideo = document.getElementById('pipVideo');
+    const pipCanvas = document.getElementById('pipCanvas');
+    const btn = document.getElementById('pipBtn');
+
+    // 检查浏览器是否支持
+    if (!document.pictureInPictureEnabled || !pipVideo.requestPictureInPicture) {
+        alert('您的浏览器不支持画中画 (PiP)，请使用 Chrome/Edge 最新版。');
+        return;
+    }
+
+    // 如果还没有图片，提示用户
+    if (!resultImg.src || (!resultImg.src.startsWith('data:') && !resultImg.src.startsWith('http'))) {
+        log('请先分析一张图片再开启悬浮窗！');
+        return;
+    }
+
+    // 首次：设置 canvas 尺寸（仅一次，后续不再重置，避免闪黑）
+    if (!pipInitialized) {
+        pipCanvas.width = 400;
+        pipCanvas.height = 400;
+        pipInitialized = true;
+    }
+
+    await drawCurrentToPiPCanvas();
+    
+    const stream = pipCanvas.captureStream(10); // 10fps 刷新率
+    pipVideo.srcObject = stream;
+    
+    try {
+        await pipVideo.play();
+        await pipVideo.requestPictureInPicture();
+        pipActive = true;
+        btn.classList.add('active');
+        btn.textContent = '✅ 关闭悬浮窗';
+        log('🖼️ 画中画悬浮窗已开启');
+
+        // 定时刷新 canvas 内容，让悬浮窗实时跟随结果图更新
+        startPiPRefresh();
+        
+        // 监听 PiP 退出事件
+        pipVideo.addEventListener('leavepictureinpicture', onPiPLEave, { once: true });
+    } catch(e) {
+        console.error('PiP 启动失败:', e);
+        if (e.name === 'NotAllowedError') {
+            alert('请在浏览器地址栏左侧允许画中画权限后再试。');
+        } else {
+            alert('画中画启动失败: ' + e.message);
+        }
+    }}
+function drawCurrentToPiPCanvas() {
+    const resultImg = document.getElementById('resultImg');
+    const pipCanvas = document.getElementById('pipCanvas');
+    const ctx = pipCanvas.getContext('2d');
+
+    // 直接画图覆盖旧内容，不清空（避免 captureStream 截到中间帧）
+    if (resultImg.naturalWidth && resultImg.naturalHeight) {
+        const scale = Math.min(400 / resultImg.naturalWidth, 400 / resultImg.naturalHeight);
+        const w = resultImg.naturalWidth * scale;
+        const h = resultImg.naturalHeight * scale;
+        ctx.drawImage(resultImg, (400 - w) / 2, (400 - h) / 2, w, h);
+    }}
+
+function startPiPRefresh() {
+    stopPiPRefresh();
+    pipUpdateTimer = setInterval(() => {
+        if (!pipActive) return;
+        drawCurrentToPiPCanvas();
+    }, 500); // 每 500ms 同步一次
+}
+function stopPiPRefresh() {
+    if (pipUpdateTimer) {
+        clearInterval(pipUpdateTimer);
+        pipUpdateTimer = null;
+    }}
+async function exitPiP() {
+    const pipVideo = document.getElementById('pipVideo');
+    const btn = document.getElementById('pipBtn');
+    stopPiPRefresh();
+    if (document.pictureInPictureElement === pipVideo) {
+        await document.exitPictureInPicture();
+    }
+    pipActive = false;
+    pipInitialized = false;  // 重新允许初始化
+    btn.classList.remove('active');
+    btn.textContent = '🖼️ 悬浮窗';
+}
+function onPiPLEave() {
+    pipActive = false;
+    stopPiPRefresh();
+    const btn = document.getElementById('pipBtn');
+    if (btn) {
+        btn.classList.remove('active');
+        btn.textContent = '🖼️ 悬浮窗';
+    }
+    log('🖼️ 画中画已关闭');
 }
 </script>
 </body>
