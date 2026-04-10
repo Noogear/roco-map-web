@@ -17,7 +17,7 @@ $:
         - name: vscode
           options:
             onlyPreview: true
-            launch: pip install -r requirements.txt && main_web.py cpu
+            launch: uv run main_web.py cpu
             keepAliveTimeout: 3600000
             daemon: true
         - docker

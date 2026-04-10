@@ -1,0 +1,6 @@
+branch:
+- reg: "^main"
+  buttons:
+    - name: 开发环境
+      description: 开发环境
+      event: web_trigger_vscode
