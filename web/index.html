@@ -565,7 +565,7 @@ async function toggleScreenAutoTrack() {
 function runScreenAutoLoop() {
     if (!screenAutoRunning || TC.mode !== 'screen') return;
     captureAndSendScreenFrame();
-    screenAutoId = setTimeout(function() { requestAnimationFrame(runScreenAutoLoop); }, 50);
+    screenAutoId = setTimeout(function() { requestAnimationFrame(runScreenAutoLoop); }, 100);
 }
 
 // ========== 文件模式切换 ==========

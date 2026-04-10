@@ -7,6 +7,7 @@ import os
 from io import BytesIO
 import json
 import struct
+import time
 import config
 from flask import Flask, render_template, Response, jsonify, request, send_file, send_from_directory, copy_current_request_context
 from threading import Lock
@@ -29,11 +30,15 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 
 class SIFTMapTracker:
-    """SIFT 传统特征匹配引擎（从 main_sift.py 移植）"""
+    """SIFT 传统特征匹配引擎"""
+
     def __init__(self):
         print("正在初始化 SIFT 引擎...")
         self.clahe = cv2.createCLAHE(clipLimit=config.SIFT_CLAHE_LIMIT, tileGridSize=(8, 8))
         self.sift = cv2.SIFT_create()
+        
+        # 线程锁（防止 WebSocket 并发请求导致 kp_local / flann 竞态）
+        self._lock = Lock()
 
         logic_map_bgr = cv2.imread(config.LOGIC_MAP_PATH)
         if logic_map_bgr is None:
@@ -43,64 +48,201 @@ class SIFTMapTracker:
         logic_map_gray = cv2.cvtColor(logic_map_bgr, cv2.COLOR_BGR2GRAY)
         logic_map_gray = self.clahe.apply(logic_map_gray)
         print("正在提取大地图 SIFT 特征点...")
-        self.kp_big, self.des_big = self.sift.detectAndCompute(logic_map_gray, None)
-        print(f"SIFT 初始化完成！共 {len(self.kp_big)} 个锚点。")
+        self.kp_big_all, self.des_big_all = self.sift.detectAndCompute(logic_map_gray, None)
+        print(f"✅ 全局特征点: {len(self.kp_big_all)} 个")
 
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
-        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
+        # 预存全局特征点坐标（用于快速局部筛选）
+        self.kp_coords = np.array([kp.pt for kp in self.kp_big_all], dtype=np.float32)
 
+        # === 全局 FLANN 索引（常驻不销毁）===
+        print("正在构建全局 FLANN 索引...")
+        self.flann_global = self._create_flann(self.des_big_all)
+
+        # === 局部 FLANN（动态重建，初始=全局）===
+        self.kp_local = list(self.kp_big_all)
+        self.des_local = self.des_big_all.copy()
+        self.flann_local = self.flann_global
+        self.using_local = False
+        self.local_fail_count = 0
+
+        # === 局部搜索参数 ===
+        self.SEARCH_RADIUS = getattr(config, 'SEARCH_RADIUS', 400)
+        self.LOCAL_FAIL_LIMIT = getattr(config, 'LOCAL_FAIL_LIMIT', 5)
+        self.JUMP_THRESHOLD = getattr(config, 'SIFT_JUMP_THRESHOLD', 500)
+
+        # 惯性导航状态
         self.last_x = None
         self.last_y = None
         self.lost_frames = 0
 
+        # 性能监控（与 main123 对齐）
+        import time as _time
+        self._perf_time = _time
+        self._frame_times = []
+
+    # ------------------------------------------
+    # 构建/重建 FLANN 索引
+    # ------------------------------------------
+    @staticmethod
+    def _create_flann(descriptors):
+        index_params = dict(algorithm=1, trees=5)
+        search_params = dict(checks=50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
+        flann.add([descriptors])
+        flann.train()
+        return flann
+
+    # ------------------------------------------
+    # 切换到局部搜索模式
+    # ------------------------------------------
+    def _switch_to_local(self, cx, cy):
+        """以 (cx, cy) 为中心，提取半径内的特征点，重建局部 FLANN"""
+        r = self.SEARCH_RADIUS
+        dx = np.abs(self.kp_coords[:, 0] - cx)
+        dy = np.abs(self.kp_coords[:, 1] - cy)
+        mask = (dx < r) & (dy < r)
+        indices = np.where(mask)[0]
+
+        if len(indices) < 20:   # 特征点太少不值得切局部
+            return
+
+        self.kp_local = [self.kp_big_all[i] for i in indices]
+        self.des_local = self.des_big_all[indices]
+        self.flann_local = self._create_flann(self.des_local)
+        self.using_local = True
+        self.local_fail_count = 0
+
+    # ------------------------------------------
+    # 回退到全局搜索模式
+    # ------------------------------------------
+    def _switch_to_global(self):
+        """回退全局（全局 FLANN 常驻，无需重建）"""
+        self.using_local = False
+        self.local_fail_count = 0
+        print(f"🌍 已切换到 全局 搜索模式 | 特征点: {len(self.kp_big_all)} | lost: {self.lost_frames}")
+
+    # ------------------------------------------
+    # 核心匹配（两轮搜索 + 跳变过滤）
+    # ------------------------------------------
     def match(self, minimap_bgr):
+        with self._lock:  # 线程安全：防止并发修改 kp_local / flann 导致 IndexError
+            return self._match_impl(minimap_bgr)
+
+    def _match_impl(self, minimap_bgr):
+        t_start = self._perf_time.perf_counter()
         found = False
         center_x, center_y = None, None
         is_inertial = False
 
         minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
         minimap_gray = self.clahe.apply(minimap_gray)
-
         kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, None)
 
         if des_mini is not None and len(kp_mini) >= 2:
-            matches = self.flann.knnMatch(des_mini, self.des_big, k=2)
-            good_matches = []
-            for m_n in matches:
-                if len(m_n) == 2:
-                    m, n = m_n
-                    if m.distance < config.SIFT_MATCH_RATIO * n.distance:
-                        good_matches.append(m)
 
-            if len(good_matches) >= config.SIFT_MIN_MATCH_COUNT:
-                src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-                dst_pts = np.float32([self.kp_big[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+            for search_round in range(2):
 
-                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
-                if M is not None:
-                    h, w = minimap_gray.shape
-                    center_pt = np.float32([[[w / 2, h / 2]]])
-                    dst_center = cv2.perspectiveTransform(center_pt, M)
-                    temp_x = int(dst_center[0][0][0])
-                    temp_y = int(dst_center[0][0][1])
+                # --- 选择当前轮次的 FLANN 和特征点 ---
+                if search_round == 0 and self.using_local:
+                    current_kp = self.kp_local
+                    current_flann = self.flann_local
+                elif search_round == 0 and not self.using_local:
+                    current_kp = list(self.kp_big_all)
+                    current_flann = self.flann_global
+                else:
+                    # 第2轮：局部失败或跳变过大 → 回退全局
+                    if not self.using_local:
+                        break
+                    current_kp = list(self.kp_big_all)
+                    current_flann = self.flann_global
 
-                    if 0 <= temp_x < self.map_width and 0 <= temp_y < self.map_height:
-                        found = True
-                        center_x = temp_x
-                        center_y = temp_y
-                        self.last_x = center_x
-                        self.last_y = center_y
-                        self.lost_frames = 0
+                try:
+                    matches = current_flann.knnMatch(des_mini, k=2)
+                except cv2.error:
+                    matches = []
 
-        if not found and self.last_x is not None:
+                good = []
+                for m_n in matches:
+                    if len(m_n) == 2:
+                        m, n = m_n
+                        if m.distance < config.SIFT_MATCH_RATIO * n.distance:
+                            good.append(m)
+
+                if len(good) >= config.SIFT_MIN_MATCH_COUNT:
+                    src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([current_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
+
+                    if M is not None:
+                        # 验证 RANSAC 内点数量（防假匹配）
+                        inlier_count = int(mask.sum()) if mask is not None else 0
+                        if inlier_count < config.SIFT_MIN_MATCH_COUNT:
+                            continue
+
+                        h, w = minimap_gray.shape
+                        center_pt = np.float32([[[w / 2, h / 2]]])
+                        dst_center = cv2.perspectiveTransform(center_pt, M)
+                        tx = int(dst_center[0][0][0])
+                        ty = int(dst_center[0][0][1])
+
+                        if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
+                            # 跳变过滤：只要有历史坐标就检查（与 main123 对齐）
+                            if search_round == 0 and self.last_x is not None:
+                                jump = abs(tx - self.last_x) + abs(ty - self.last_y)
+                                if jump < 500:
+                                    found = True
+                                    center_x, center_y = tx, ty
+                                    break
+                                else:
+                                    continue  # 跳变过大，去第2轮用全局重搜
+                            else:
+                                # 首次定位 / 丢失后重新找到(last_x已被清除) → 直接接受
+                                found = True
+                                center_x, center_y = tx, ty
+                                break
+
+        # --- 状态更新 ---
+        if found:
+            self.last_x = center_x
+            self.last_y = center_y
+            self.lost_frames = 0
+            self.local_fail_count = 0
+            self._switch_to_local(center_x, center_y)
+
+        else:
             self.lost_frames += 1
-            if self.lost_frames <= config.MAX_LOST_FRAMES:
+
+            # 局部连续失败 → 及时回退全局
+            if self.using_local:
+                self.local_fail_count += 1
+                if self.local_fail_count >= self.LOCAL_FAIL_LIMIT:
+                    self._switch_to_global()
+
+            # 惯性兜底
+            if self.last_x is not None and self.lost_frames <= config.MAX_LOST_FRAMES:
                 found = True
                 center_x = self.last_x
                 center_y = self.last_y
                 is_inertial = True
+            elif self.lost_frames > config.MAX_LOST_FRAMES:
+                # 超时清除旧坐标，避免下次全局定位被跳变过滤误杀
+                self.last_x = None
+                self.last_y = None
+                if self.using_local:
+                    self._switch_to_global()
+
+        # === 性能统计（与 main123 对齐，每60帧输出一次）===
+        t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000
+        self._frame_times.append(t_elapsed)
+        if len(self._frame_times) >= 60:
+            avg = sum(self._frame_times) / len(self._frame_times)
+            mode = "局部" if self.using_local else "全局"
+            feat = len(self.kp_local) if self.using_local else len(self.kp_big_all)
+            print(f"[{mode}模式] 平均耗时: {avg:.1f}ms | "
+                  f"特征点: {feat} | lost: {self.lost_frames} | "
+                  f"fps: {1000/avg:.1f}")
+            self._frame_times.clear()
 
         return {
             'found': found,
@@ -172,6 +314,11 @@ class LoFTRMapTracker:
         return tensor.to(self.device)
 
     def match(self, minimap_bgr):
+        with self._lock:  # 线程安全：防止并发修改 kp_local / flann 导致 IndexError
+            return self._match_impl(minimap_bgr)
+
+    def _match_impl(self, minimap_bgr):
+        t_start = self._perf_time.perf_counter()
         found = False
         display_crop = None
         half_view = config.VIEW_SIZE // 2
@@ -308,6 +455,17 @@ class AIMapTrackerWeb:
         # 坐标历史（用于异常值过滤）
         self.pos_history = deque(maxlen=POS_HISTORY_SIZE)
 
+        # 坐标平滑缓冲池（60帧滑动窗口 + 中位数滤波，消除 SIFT 抖动）
+        self.SMOOTH_BUFFER_SIZE = 60
+        self.smooth_buffer_x = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
+        self.smooth_buffer_y = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
+        self._smooth_median_window = 15  # 取最近15帧的中位数作为输出（抗抖动）
+
+        # 持久化文件路径（与 main_web.py 同级）
+        import os as _os
+        self._smooth_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '.smooth_coords.json')
+        self._load_smooth_buffer()  # 启动时恢复历史坐标
+
         self.latest_status = {
             'mode': 'sift',
             'state': '--',
@@ -315,6 +473,67 @@ class AIMapTrackerWeb:
             'found': False,
             'matches': 0,
         }
+
+    def _smooth_coord(self, raw_x, raw_y):
+        """
+        坐标平滑：60帧滑动窗口 + 最近 N 帧中位数滤波。
+        返回 (smooth_x, smooth_y)，消除 SIFT 单帧随机抖动。
+        每60帧自动持久化到本地文件。
+        """
+        if raw_x is not None and raw_y is not None:
+            self.smooth_buffer_x.append(raw_x)
+            self.smooth_buffer_y.append(raw_y)
+            # 缓冲区满时自动保存
+            if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
+                self._save_smooth_buffer()
+
+        n = min(len(self.smooth_buffer_x), self._smooth_median_window)
+        if n < 3:
+            return raw_x or 0, raw_y or 0
+
+        # 取最近 N 帧的中位数（抗极端抖动）
+        recent_x = list(self.smooth_buffer_x)[-n:]
+        recent_y = list(self.smooth_buffer_y)[-n:]
+        recent_x.sort()
+        recent_y.sort()
+        mid = n // 2
+        if n % 2 == 0:
+            sx = (recent_x[mid - 1] + recent_x[mid]) // 2
+            sy = (recent_y[mid - 1] + recent_y[mid]) // 2
+        else:
+            sx = recent_x[mid]
+            sy = recent_y[mid]
+        return int(sx), int(sy)
+
+    def _load_smooth_buffer(self):
+        """启动时从本地文件恢复最近60个坐标点"""
+        import os as _os
+        if not _os.path.isfile(self._smooth_file):
+            return
+        try:
+            with open(self._smooth_file, 'r') as f:
+                data = json.load(f)
+            xs = data.get('x', [])
+            ys = data.get('y', [])
+            if len(xs) == len(ys) and len(xs) > 0:
+                self.smooth_buffer_x.extend(xs[-self.SMOOTH_BUFFER_SIZE:])
+                self.smooth_buffer_y.extend(ys[-self.SMOOTH_BUFFER_SIZE:])
+                print(f"📍 已从本地恢复 {len(xs)} 个历史坐标点 (最新: {xs[-1]}, {ys[-1]})")
+        except Exception as e:
+            print(f"[警告] 加载坐标历史失败: {e}")
+
+    def _save_smooth_buffer(self):
+        """将当前缓冲池的坐标写入本地 JSON 文件"""
+        try:
+            data = {
+                'x': list(self.smooth_buffer_x),
+                'y': list(self.smooth_buffer_y),
+                'ts': time.time(),
+            }
+            with open(self._smooth_file, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            pass  # 静默失败，不影响主流程
 
     def set_minimap(self, minimap_bgr):
         with self.lock:
@@ -329,6 +548,8 @@ class AIMapTrackerWeb:
             return False
         self.current_mode = mode
         # 切换模式时重置状态，避免残留
+        self.smooth_buffer_x.clear()
+        self.smooth_buffer_y.clear()
         if mode == 'loftr':
             self.loftr_engine.state = "GLOBAL_SCAN"
             self.loftr_engine.scan_x = 0
@@ -349,14 +570,18 @@ class AIMapTrackerWeb:
             cx, cy = result['center_x'], result['center_y']
             is_inertial = result.get('is_inertial', False)
 
+            # 坐标平滑：原始坐标用于状态机，平滑坐标用于渲染
+            smooth_x, smooth_y = self._smooth_coord(cx, cy)
+
             if found and cx is not None:
-                y1 = max(0, cy - half_view)
-                y2 = min(self.map_height, cy + half_view)
-                x1 = max(0, cx - half_view)
-                x2 = min(self.map_width, cx + half_view)
+                # 用平滑后的坐标裁剪和画点
+                y1 = max(0, smooth_y - half_view)
+                y2 = min(self.map_height, smooth_y + half_view)
+                x1 = max(0, smooth_x - half_view)
+                x2 = min(self.map_width, smooth_x + half_view)
                 display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
-                local_x = cx - x1
-                local_y = cy - y1
+                local_x = smooth_x - x1
+                local_y = smooth_y - y1
                 if not is_inertial:
                     cv2.circle(display_crop, (local_x, local_y), radius=5, color=(0, 0, 255), thickness=-1)
                     cv2.circle(display_crop, (local_x, local_y), radius=7, color=(255, 255, 255), thickness=1)
@@ -369,8 +594,9 @@ class AIMapTrackerWeb:
 
             status_state = 'INERTIAL' if is_inertial else ('FOUND' if found else 'SEARCHING')
             match_count = 0
-            last_x = cx if cx else 0
-            last_y = cy if cy else 0
+            # 状态上报用平滑后坐标（前端显示更稳定）
+            last_x = smooth_x
+            last_y = smooth_y
 
         else:  # loftr
             if self.loftr_engine is None:
