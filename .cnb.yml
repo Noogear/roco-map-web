@@ -1,0 +1,26 @@
+$:
+  web_trigger_vscode:
+    - docker:
+        image: docker.cnb.cool/wss/ai/mlsharp:latest
+      services:
+        - vscode
+        - docker
+      stages:
+        - name: ls
+          script: ls -al
+  vscode:
+    - docker:
+        image: docker.cnb.cool/wss/ai/mlsharp:latest
+      runner:
+       cpus: 4
+      services:
+        - name: vscode
+          options:
+            onlyPreview: true
+            launch: pip install -r requirements.txt && main_web.py cpu
+            keepAliveTimeout: 3600000
+            daemon: true
+        - docker
+      stages:
+        - name: ls
+          script: ls -al
