@@ -12,7 +12,7 @@ $:
     - docker:
         image: docker.cnb.cool/wss/ai/mlsharp:latest
       runner:
-       cpus: 4
+       cpus: 9
       services:
         - name: vscode
           options:
