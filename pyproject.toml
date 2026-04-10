@@ -1,0 +1,28 @@
+[project]
+name = "map-tracker"
+version = "0.1.0"
+description = "游戏地图跟点助手"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "mss",
+    "Pillow",
+    "requests",
+    "flask>=2.0",
+    "flask-socketio>=5.3",
+    "python-socketio[asyncio_client]>=5.11",
+]
+
+[project.optional-dependencies]
+ai = [
+    "torch",
+    "kornia",
+]
+
+[project.scripts]
+map-tracker-web = "main_web:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
