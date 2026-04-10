@@ -1,4 +1,5 @@
 import sys
+import math
 import cv2
 import numpy as np
 from PIL import Image as PILImage
@@ -122,6 +123,182 @@ class SIFTMapTracker:
         print(f"🌍 已切换到 全局 搜索模式 | 特征点: {len(self.kp_big_all)} | lost: {self.lost_frames}")
 
     # ------------------------------------------
+    # 箭头检测：从圆形小地图中提取玩家箭头中心坐标
+    # 箭头颜色: 左侧 #FEB630(黄) / 右侧 #E78B1A(橙) → BGR 格式
+    # ------------------------------------------
+    @staticmethod
+    def _detect_arrow_center(minimap_bgr):
+        """
+        在小地图图像中检测黄色/橙色箭头，返回 (cx, cy, arrow_patch) 或 None。
+        使用 HSV 颜色范围 + 形态学过滤。
+        arrow_patch: 箭头的RGBA图像块(BGRA格式)，可直接贴到目标图上
+        """
+        h, w = minimap_bgr.shape[:2]
+        if h < 10 or w < 10:
+            return None
+
+        hsv = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+
+        # 黄-橙 HSV 范围（覆盖 #FEB630 ~ #E78B1A）
+        lower = np.array([15, 120, 180])   # H:黄-橙区间, S:高饱和度, V:明亮
+        upper = np.array([35, 255, 255])
+        mask = cv2.inRange(hsv, lower, upper)
+
+        # 形态学去噪：先开运算去小噪点，再闭运算填空洞
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        # 计算轮廓和质心
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        # 取最大连通区域（箭头主体），计算质心
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        if area < 20:   # 太小不可信
+            return None
+
+        M = cv2.moments(largest)
+        if M['m00'] < 1e-6:
+            return None
+
+        cx = M['m10'] / M['m00']
+        cy = M['m01'] / M['m00']
+
+        # === 提取箭头图像块（含白色描边，用于直接贴图）===
+        try:
+            # 检测白色/浅色描边
+            hsv_full = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+            white_lower = np.array([0, 0, 200])
+            white_upper = np.array([180, 80, 255])
+            white_mask = cv2.inRange(hsv_full, white_lower, white_upper)
+
+            # 膨胀黄色mask，找其外围的白色像素作为"描边"
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            yellow_dilated = cv2.dilate(mask, kernel_dilate, iterations=2)
+            white_border = white_mask & yellow_dilated & ~mask
+
+            # 合并黄色 + 白色描边 = 完整箭头形状作为alpha通道
+            combined_alpha = cv2.bitwise_or(mask, white_border)
+
+            # 形态学清理
+            kernel_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            combined_alpha = cv2.morphologyEx(combined_alpha, cv2.MORPH_CLOSE, kernel_clean, iterations=1)
+
+            # 裁剪包围矩形区域
+            x, y, bw, bh = cv2.boundingRect(combined_alpha)
+            pad = 2  # 边缘留几像素余量
+            x1_crop = max(0, x - pad)
+            y1_crop = max(0, y - pad)
+            x2_crop = min(w, x + bw + pad)
+            y2_crop = min(h, y + bh + pad)
+
+            # 提取BGR + Alpha
+            bgr_crop = minimap_bgr[y1_crop:y2_crop, x1_crop:x2_crop].copy()
+            alpha_crop = combined_alpha[y1_crop:y2_crop, x1_crop:x2_crop]
+
+            # 合成BGRA图像块
+            arrow_patch = cv2.merge([bgr_crop[:, :, 0], bgr_crop[:, :, 1],
+                                     bgr_crop[:, :, 2], alpha_crop])
+
+            # 记录patch左上角相对于质心的偏移（用于贴图定位）
+            patch_offset_x = int(cx) - x1_crop
+            patch_offset_y = int(cy) - y1_crop
+        except Exception:
+            arrow_patch = None
+            patch_offset_x = 0
+            patch_offset_y = 0
+
+        return (float(cx), float(cy), arrow_patch, patch_offset_x, patch_offset_y)
+
+    @staticmethod
+    def _draw_arrow_marker(img_bgr, cx, cy, size=None, angle=0):
+        """
+        在地图上绘制玩家方向箭头标记。
+        模仿游戏小地图的箭头样式：三角形 + 渐变填充。
+        angle: 旋转角度（度），0=朝上，顺时针增加
+        """
+        if size is None:
+            size = 12
+
+        # 定义三角形顶点（箭头尖朝上）
+        pts = np.array([
+            [cx, cy - size],           # 顶点（朝上/前进方向）
+            [cx - size * 0.6, cy + size * 0.7],  # 左下
+            [cx + size * 0.6, cy + size * 0.7],  # 右下
+        ], dtype=np.float64)
+
+        # 绕中心 (cx, cy) 旋转
+        if angle != 0:
+            rad = math.radians(-angle)  # OpenCV角度转弧度（负号：顺时针为正）
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
+            centered = pts - np.array([cx, cy])
+            rot_mat = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+            rotated = (rot_mat @ centered.T).T + np.array([cx, cy])
+            pts = rotated.astype(np.int32)
+        else:
+            pts = pts.astype(np.int32)
+
+        # 填充渐变色（左亮右暗，模仿原版箭头）
+        overlay = img_bgr.copy()
+        cv2.fillPoly(overlay, [pts], (48, 182, 254))  # #FEB630 BGR
+        cv2.polylines(overlay, [pts], True, (255, 255, 255), 1)  # 白色描边
+        cv2.addWeighted(overlay, 0.85, img_bgr, 0.15, 0, img_bgr)
+
+    @staticmethod
+    def _paste_arrow_patch(img_bgr, cx, cy, arrow_patch, offset_x, offset_y, scale=1.0):
+        """
+        将从小地图抠出的箭头图像块(BGRA)贴到目标图像上。
+        cx, cy: 目标图上的贴图位置（箭头质心对齐点）
+        offset_x, offset_y: patch内质心相对于patch左上角的偏移
+        scale: 缩放倍数（1.0=原始大小）
+        """
+        if arrow_patch is None or arrow_patch.size == 0:
+            return
+
+        ph, pw = arrow_patch.shape[:2]
+
+        if scale != 1.0:
+            new_w = max(1, int(pw * scale))
+            new_h = max(1, int(ph * scale))
+            arrow_patch = cv2.resize(arrow_patch, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            offset_x = int(offset_x * scale)
+            offset_y = int(offset_y * scale)
+            ph, pw = new_w, new_h
+
+        # 计算patch在目标图上的放置区域
+        paste_x = cx - offset_x
+        paste_y = cy - offset_y
+
+        dh, dw = img_bgr.shape[:2]
+
+        # 裁剪到目标图边界
+        sx1 = max(0, -paste_x)
+        sy1 = max(0, -paste_y)
+        dx1 = max(0, paste_x)
+        dy1 = max(0, paste_y)
+        dx2 = min(dw, paste_x + pw)
+        dy2 = min(dh, paste_y + ph)
+        sx2 = sx1 + (dx2 - dx1)
+        sy2 = sy1 + (dy2 - dy1)
+
+        if dx2 <= dx1 or dy2 <= dy1 or sx2 <= sx1 or sy2 <= sy1:
+            return
+
+        roi = img_bgr[dy1:dy2, dx1:dx2]
+        patch_region = arrow_patch[sy1:sy2, sx1:sx2]
+
+        bgr_part = patch_region[:, :, :3]
+        alpha_part = patch_region[:, :, 3:4].astype(np.float32) / 255.0
+
+        blended = (bgr_part.astype(np.float32) * alpha_part +
+                   roi.astype(np.float32) * (1.0 - alpha_part))
+        img_bgr[dy1:dy2, dx1:dx2] = blended.astype(np.uint8)
+
+    # ------------------------------------------
     # 核心匹配（两轮搜索 + 跳变过滤）
     # ------------------------------------------
     def match(self, minimap_bgr):
@@ -132,6 +309,9 @@ class SIFTMapTracker:
         t_start = self._perf_time.perf_counter()
         found = False
         center_x, center_y = None, None
+        arrow_patch = None
+        patch_offset_x = 0
+        patch_offset_y = 0
         is_inertial = False
 
         minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
@@ -181,7 +361,16 @@ class SIFTMapTracker:
                             continue
 
                         h, w = minimap_gray.shape
-                        center_pt = np.float32([[[w / 2, h / 2]]])
+
+                        # === 箭头中心检测（替代几何中心）===
+                        arrow_center = self._detect_arrow_center(minimap_bgr)
+                        if arrow_center is not None:
+                            ref_x, ref_y, arrow_patch, patch_offset_x, patch_offset_y = arrow_center
+                        else:
+                            # 回退：使用图像几何中心
+                            ref_x, ref_y = w / 2, h / 2
+
+                        center_pt = np.float32([[[ref_x, ref_y]]])
                         dst_center = cv2.perspectiveTransform(center_pt, M)
                         tx = int(dst_center[0][0][0])
                         ty = int(dst_center[0][0][1])
@@ -248,6 +437,9 @@ class SIFTMapTracker:
             'found': found,
             'center_x': center_x,
             'center_y': center_y,
+            'arrow_patch': arrow_patch,
+            'patch_offset_x': patch_offset_x,
+            'patch_offset_y': patch_offset_y,
             'is_inertial': is_inertial,
             'match_count': 0,
             'map_width': self.map_width,
@@ -568,26 +760,53 @@ class AIMapTrackerWeb:
             result = self.sift_engine.match(minimap_bgr)
             found = result['found']
             cx, cy = result['center_x'], result['center_y']
+            arrow_patch = result.get('arrow_patch')
+            patch_ox = result.get('patch_offset_x', 0)
+            patch_oy = result.get('patch_offset_y', 0)
             is_inertial = result.get('is_inertial', False)
 
             # 坐标平滑：原始坐标用于状态机，平滑坐标用于渲染
             smooth_x, smooth_y = self._smooth_coord(cx, cy)
 
             if found and cx is not None:
-                # 用平滑后的坐标裁剪和画点
-                y1 = max(0, smooth_y - half_view)
-                y2 = min(self.map_height, smooth_y + half_view)
-                x1 = max(0, smooth_x - half_view)
-                x2 = min(self.map_width, smooth_x + half_view)
+                # 应用渲染偏移校正（微调定位点）
+                ox = getattr(config, 'RENDER_OFFSET_X', 0)
+                oy = getattr(config, 'RENDER_OFFSET_Y', 0)
+
+                # 用平滑后坐标 + 偏移 裁剪和画点
+                y1 = max(0, smooth_y + oy - half_view)
+                y2 = min(self.map_height, smooth_y + oy + half_view)
+                x1 = max(0, smooth_x + ox - half_view)
+                x2 = min(self.map_width, smooth_x + ox + half_view)
                 display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
-                local_x = smooth_x - x1
-                local_y = smooth_y - y1
+                local_x = (smooth_x + ox) - x1
+                local_y = (smooth_y + oy) - y1
                 if not is_inertial:
-                    cv2.circle(display_crop, (local_x, local_y), radius=5, color=(0, 0, 255), thickness=-1)
-                    cv2.circle(display_crop, (local_x, local_y), radius=7, color=(255, 255, 255), thickness=1)
+                    if arrow_patch is not None:
+                        # 直接贴小地图抠出的箭头（天然方向+颜色+描边）
+                        self.sift_engine._paste_arrow_patch(display_crop, int(local_x), int(local_y),
+                                                            arrow_patch, patch_ox, patch_oy, scale=1.5)
+                    else:
+                        # fallback：画三角形箭头
+                        self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y)
+                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=3, color=(255, 255, 255), thickness=-1)
                 else:
-                    cv2.circle(display_crop, (local_x, local_y), radius=5, color=(0, 255, 255), thickness=-1)
-                    cv2.circle(display_crop, (local_x, local_y), radius=7, color=(0, 150, 150), thickness=1)
+                    # 惯性模式
+                    if arrow_patch is not None:
+                        self.sift_engine._paste_arrow_patch(display_crop, int(local_x), int(local_y),
+                                                            arrow_patch, patch_ox, patch_oy, scale=1.5)
+                        overlay = display_crop.copy()
+                        overlay[:] = (0, 180, 180)
+                        mask_arr = np.zeros_like(display_crop)
+                        cv2.circle(mask_arr, (local_x, int(local_y + 4)), 10, (255, 255, 255), -1)
+                        cv2.addWeighted(overlay, 0.4, display_crop, 0.6, 0, display_crop)
+                    else:
+                        self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y)
+                        overlay = display_crop.copy()
+                        overlay[:] = (0, 180, 180)  # 青色蒙版
+                        mask_arr = np.zeros_like(display_crop)
+                        cv2.circle(mask_arr, (local_x, int(local_y + 4)), 10, (255, 255, 255), -1)
+                        cv2.addWeighted(overlay, 0.4, display_crop, 0.6, 0, display_crop)
             else:
                 display_crop = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
                 cv2.putText(display_crop, "SIFT Searching...", (70, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
