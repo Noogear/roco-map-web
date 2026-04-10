@@ -393,6 +393,7 @@
     <canvas id="pipCanvas"></canvas>
     <video id="pipVideo" autoplay playsinline muted></video>
 
+<script src="js/socket.io.min.js"></script>
 <script src="js/tracker-core.js"></script>
 <script>
 // ========== 初始化 ==========
@@ -522,22 +523,43 @@ function setupRegionDrag(videoEl) {
     videoEl.addEventListener('resize', function(){ setTimeout(function(){window.__updateRegionBox&&window.__updateRegionBox();}, 10); });
 }
 
-// ========== 自动追踪（屏幕捕获模式） ==========
+// ========== 自动追踪（屏幕捕获模式 - WebSocket 二进制 PNG） ==========
 var screenSending = false;
+var useWSMode = true;  // 是否使用 WS 二进制通道
 async function captureAndSendScreenFrame() {
     if (!TC.isScreenActive || screenSending) return;
     screenSending = true;
     try {
-        var data = TC.captureScreenImg();
-        if (data) { TC.imageData = data; await TC.sendAndDisplay(data); }
+        if (useWSMode && TC.wsConnected) {
+            // WS 二进制模式: PNG 无损 + 零 base64 开销
+            var blob = await TC.captureScreenImgBlob();
+            if (blob) { await TC.sendViaWS(blob); }
+        } else {
+            // HTTP fallback: JPEG 有损 + base64
+            var data = TC.captureScreenImg();
+            if (data) { TC.imageData = data; await TC.sendAndDisplay(data); }
+        }
     } catch(e) { console.error('识别出错:', e); }
     finally { screenSending = false; }
 }
 var screenAutoRunning = false, screenAutoId = null;
-function toggleScreenAutoTrack() {
+async function toggleScreenAutoTrack() {
     screenAutoRunning = !screenAutoRunning;
     var btn = document.getElementById('stopScreenBtn');
-    if (screenAutoRunning) { btn.textContent='⏸ 暂停追踪'; TC.log('📍 屏幕自动追踪已开启 (~20fps)'); runScreenAutoLoop(); }
+    if (screenAutoRunning) {
+        // 尝试连接 WebSocket
+        if (useWSMode && !TC.wsConnected) {
+            try {
+                await TC.connectWS();
+                useWSMode = TC.wsConnected;
+            } catch(e) {
+                TC.log('\u26a0\ufe0f WS 连接失败，回退到 HTTP 模式');
+                useWSMode = false;
+            }
+        }
+        var modeLabel = useWSMode ? 'WS\u4e8c\u8fdb\u5236(~20fps)' : 'HTTP(~20fps)';
+        btn.textContent='⏸ 暂停追踪'; TC.log('📍 屏幕自动追踪已开启 (' + modeLabel + ')'); runScreenAutoLoop();
+    }
     else { btn.textContent='⏹ 停止捕获'; TC.log('⏸ 屏幕自动追踪已暂停'); screenSending = false; }
 }
 function runScreenAutoLoop() {

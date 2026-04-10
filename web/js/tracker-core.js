@@ -7,10 +7,14 @@
  *   TC.init(opts)                   初始化配置
  *   TC.startScreenCapture(o)        启动屏幕捕获
  *   TC.stopScreenCapture()          停止屏幕捕获
- *   TC.captureScreenImg()           圆形区域截图 -> dataURL
+ *   TC.captureScreenImg()           圆形区域截图 -> dataURL (JPEG, 文件/HTTP模式)
+ *   TC.captureScreenImgBlob()       圆形区域截图 -> Promise<Blob> (PNG, WS二进制模式)
  *   TC.bindFileInput(input, canvas) 绑定文件选择器
  *   TC.loadFile(file, canvas)      手动加载文件 -> Promise<dataURL>
  *   TC.sendAndDisplay(dataURL)      发送到后端 HTTP API 分析
+ *   TC.sendViaWS(blob)             通过 Socket.IO 发送二进制帧分析
+ *   TC.connectWS()                  建立 Socket.IO 连接
+ *   TC.disconnectWS()               断开 Socket.IO
  *   TC.formatStatus(status)         格式化状态文本
  *   TC.updateStatusDOM(status, ids) 更新标准状态栏 DOM
  *   TC.checkEngines()               检测可用引擎
@@ -22,6 +26,7 @@
  *   TC.imageData     当前图片 dataURL
  *   TC.isScreenActive  是否正在捕获
  *   TC.selCircle     {cx, cy, r} 归一化圆形选区
+ *   TC.wsConnected    Socket.IO 是否已连接
  */
 const TrackerCore = (() => {
     'use strict';
@@ -35,6 +40,8 @@ const TrackerCore = (() => {
         videoW: 0,
         videoH: 0,
         selCircle: { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) },
+        wsSocket: null,
+        wsConnected: false,
     };
 
     let opts = {
@@ -59,6 +66,7 @@ const TrackerCore = (() => {
         get selCircle() { return S.selCircle; },
         set selCircle(v) { Object.assign(S.selCircle, v); },
         get isScreenActive() { return !!S.screenStream; },
+        get wsConnected() { return S.wsConnected; },
 
         // ========== 日志 ==========
         log(msg) {
@@ -228,7 +236,7 @@ const TrackerCore = (() => {
         },
 
         /**
-         * 从屏幕流截取圆形选区图片
+         * 从屏幕流截取圆形选区图片 (JPEG dataURL，用于 HTTP 模式)
          * @returns {string|null} dataURL 或 null
          */
         captureScreenImg() {
@@ -253,13 +261,37 @@ const TrackerCore = (() => {
             return c.toDataURL('image/jpeg', 0.80);
         },
 
+        /**
+         * 从屏幕流截取圆形选区图片 (PNG Blob，用于 Socket.IO 二进制模式)
+         * @returns {Promise<Blob|null>}
+         */
+        captureScreenImgBlob() {
+            var vid = S.offscreenVid;
+            if (!vid || !vid.videoWidth) return Promise.resolve(null);
+
+            var vw = vid.videoWidth || S.videoW;
+            var vh = vid.videoHeight || S.videoH;
+            if (!vw || !vh) return Promise.resolve(null);
+
+            var sc = S.selCircle;
+            var bs = Math.min(vw, vh);
+            var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
+            var sz = Math.max(10, Math.round(r * 2));
+            var rx = Math.round(cx - r), ry = Math.round(cy - r);
+
+            var c = document.createElement('canvas');
+            c.width = sz; c.height = sz;
+            var ctx = c.getContext('2d');
+            ctx.beginPath(); ctx.arc(sz / 2, sz / 2, sz / 2, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+            ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
+
+            return new Promise(function(resolve) {
+                c.toBlob(function(blob) { resolve(blob); }, 'image/png');
+            });
+        },
+
 
         // ========== HTTP API 分析 ==========
-        /**
-         * 发送图片到后端分析（和原 index.html 的 sendAndDisplay 一致）
-         * @param {string} imageDataURL 
-         * @returns {Promise<Object>} {success, image, status}
-         */
         sendAndDisplay(imageDataURL) {
             var self = this;
             return fetch('/api/upload_minimap', {
@@ -287,6 +319,106 @@ const TrackerCore = (() => {
         },
 
 
+        // ========== Socket.IO 二进制通道 ==========
+        /**
+         * 建立 Socket.IO 连接（使用 socket.io client 库）
+         * @returns {Promise<boolean>}
+         */
+        connectWS() {
+            var self = this;
+            if (S.wsSocket && S.wsConnected) return Promise.resolve(true);
+            return new Promise(function(resolve, reject) {
+                try {
+                    var sock = io({
+                        transports: ['websocket'],
+                        forceNew: true,
+                    });
+                    S.wsSocket = sock;
+
+                    sock.on('connect', function() {
+                        S.wsConnected = true;
+                        self.log('\ud83d\udcf6 Socket.IO 已连接（二进制模式）');
+                        resolve(true);
+                    });
+
+                    sock.on('disconnect', function() {
+                        S.wsConnected = false;
+                        self.log('\ud83d\udcf5 Socket.IO 已断开');
+                    });
+
+                    sock.on('connect_error', function(err) {
+                        S.wsConnected = false;
+                        console.error('SIO error:', err);
+                        self.log('\u274c Socket.IO 连接失败: ' + err.message);
+                        reject(err);
+                    });
+
+                    // 接收后端二进制响应: [4字节大端JSON长度][JSON][JPEG图片]
+                    sock.on('result', function(data) {
+                        if (!(data instanceof ArrayBuffer)) return;
+                        var view = new DataView(data);
+                        if (view.byteLength < 4) return;
+                        var jsonLen = view.getUint32(0, false);
+                        if (view.byteLength < 4 + jsonLen) return;
+                        var jsonBytes = new Uint8Array(data, 4, jsonLen);
+                        var jsonStr = new TextDecoder().decode(jsonBytes);
+                        var status;
+                        try { status = JSON.parse(jsonStr); } catch(e) { return; }
+
+                        if (status.error) {
+                            self.log('\u274c 解码失败');
+                            return;
+                        }
+
+                        var jpegStart = 4 + jsonLen;
+                        var jpegBytes = data.slice(jpegStart);
+                        if (jpegBytes.byteLength > 2) {
+                            var b64 = _arrayBufferToBase64(jpegBytes);
+                            var result = {
+                                success: true,
+                                image: b64,
+                                status: {
+                                    mode: status.m,
+                                    state: status.s,
+                                    position: { x: status.x, y: status.y },
+                                    found: !!status.f,
+                                    matches: status.c,
+                                }
+                            };
+                            if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                        }
+                    });
+
+                } catch(e) {
+                    reject(e);
+                }
+            });
+        },
+
+        disconnectWS() {
+            if (S.wsSocket && typeof S.wsSocket.disconnect === 'function') {
+                try { S.wsSocket.disconnect(); } catch(e) {}
+            }
+            S.wsSocket = null;
+            S.wsConnected = false;
+            this.log('Socket.IO 已手动断开');
+        },
+
+        /**
+         * 通过 Socket.IO emit 发送二进制帧
+         * 事件名 'frame' 匹配后端 @socketio.on('frame')
+         */
+        sendViaWS(blob) {
+            if (!S.wsSocket || !S.wsConnected) {
+                this.log('Socket.IO 未连接，请先连接！');
+                return Promise.reject(new Error('WS not connected'));
+            }
+            S.wsSocket.emit('frame', blob);
+            this.log('\u5df2发送二进制帧 (' + Math.round(blob.size / 1024) + ' KB)');
+            return Promise.resolve();
+        },
+
+
         // ========== 引擎检测 ==========
         checkEngines() {
             var self = this;
@@ -296,7 +428,7 @@ const TrackerCore = (() => {
                 body: JSON.stringify({ mode: 'loftr' })
             }).then(function(tr) { return tr.json(); }).then(function(tResult) {
                 if (!tResult.success) {
-                    self.log('\u26a0\ufe0f SIFT-only \u6a21\u5f0f\uff1aLoFTR \u4e0d\u53ef\u7528');
+                    self.log('\u26a0\ufe0f SIFT-only 模式：LoFTR 不可用');
                     return { loftr: false };
                 }
                 // 恢复为 sift
@@ -306,7 +438,7 @@ const TrackerCore = (() => {
                     body: JSON.stringify({ mode: 'sift' })
                 }).then(function() { return { loftr: true }; });
             }).catch(function(e) {
-                console.log('\u5f15\u64ce\u68c0\u6d4b\u8df3\u8fc7:', e.message);
+                console.log('引擎检测跳过:', e.message);
                 return { loftr: false };
             });
         },
@@ -326,16 +458,15 @@ const TrackerCore = (() => {
                     img.onclick = function() {
                         grid.querySelectorAll('.test-item').forEach(function(i) { i.classList.remove('selected'); });
                         img.classList.add('selected');
-                        // 触发加载
                         var evt = new CustomEvent('testimage:selected', { detail: { src: src, imgEl: img } });
                         document.dispatchEvent(evt);
                     };
                     grid.appendChild(img);
                 });
-                self.log('\u5df2\u52a0\u8f7d ' + images.length + ' \u5f20\u6d4b\u8bd5\u56fe\u7247');
+                self.log('已加载 ' + images.length + ' 张测试图片');
                 return images;
             }).catch(function(e) {
-                console.log('\u65e0\u6d4b\u8bd5\u56fe\u7247\u6216\u52a0\u8f7d\u5931\u8d25:', e.message);
+                console.log('无测试图片或加载失败:', e.message);
                 return [];
             });
         }
@@ -345,3 +476,15 @@ const TrackerCore = (() => {
 
 // 兼容短别名
 var TC = TrackerCore;
+
+/**
+ * ArrayBuffer 转 Base64 (用于 Socket.IO 二进制响应的 JPEG 图片)
+ */
+function _arrayBufferToBase64(buffer) {
+    var bytes = new Uint8Array(buffer);
+    var binary = '';
+    for (var i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
