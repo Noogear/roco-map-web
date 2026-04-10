@@ -603,7 +603,7 @@ if __name__ == "__main__":
     if _SIFT_ONLY:
         print("  用法: python main_ai_web.py cpu   → 仅 SIFT (无需 torch)")
         print("       python main_ai_web.py ai    → SIFT + LoFTR AI")
-    print("  打开浏览器访问: http://0.0.0.0:8686")
-    print("  WebSocket: ws://0.0.0.0:8686/socket.io/?transport=websocket")
+    print("  打开浏览器访问: http://0.0.0.0:" + str(config.PORT))
+    print("  WebSocket: ws://0.0.0.0:" + str(config.PORT) + "/socket.io/?transport=websocket")
     print("=" * 50)
-    socketio.run(app, host='0.0.0.0', port=8686, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=config.PORT, debug=False, allow_unsafe_werkzeug=True)
