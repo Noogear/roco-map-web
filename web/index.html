@@ -108,6 +108,28 @@
         .btn-pip { background: #7c4dff; color: #fff; border: 1px solid #b388ff; }
         .btn-pip:hover { background: #651fff; transform: translateY(-1px); }
         .btn-pip.active { background: #00e676; color: #000; border-color: #00e676; }
+        .btn-watch { background: #e91e63; color: #fff; border: 1px solid #f48fb1; }
+        .btn-watch:hover { background: #c2185b; }
+        .btn-watch.active { background: #00e676; color: #000; border-color: #00e676; }
+
+        /* 观看模式 */
+        .watch-mode .float-body > .mode-toggle:first-of-type,
+        .watch-mode .float-body > .preview-area,
+        .watch-mode .float-body > .region-info,
+        .watch-mode .float-body > .btn-row,
+        .watch-mode .float-body > .test-images { display: none !important; }
+        .watch-badge {
+            display: none;
+            text-align: center;
+            padding: 12px;
+            margin-bottom: 8px;
+            background: rgba(233, 30, 99, 0.15);
+            border: 1px solid #e91e63;
+            border-radius: 8px;
+            font-size: 0.85em;
+            color: #f48fb1;
+        }
+        .watch-badge.show { display: block; }
 
         input[type="file"] { display: none; }
         label.file-label {
@@ -350,10 +372,14 @@
             📍 <span class="arrow">▼</span>
         </div>
         <div class="float-body" id="floatBody">
+            <!-- 观看模式徽章 -->
+            <div class="watch-badge" id="watchBadge">👁️ 观看模式 — 实时接收他人追踪画面</div>
+
             <!-- 模式切换 -->
             <div class="mode-toggle" style="margin-bottom:12px;">
                 <button class="mode-btn active" id="modeFile" onclick="setMode('file')">📁 文件上传</button>
                 <button class="mode-btn" id="modeScreen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
+                <button class="mode-btn" id="modeWatch" onclick="enterWatchMode()">👁️ 观看模式</button>
             </div>
 
             <!-- 预览区 -->
@@ -435,7 +461,37 @@ TC.init({
 
 TC.log('系统就绪，请选择小地图输入方式');
 
-// ========== 文件 & 测试图片 ==========
+// ========== 观看模式 ==========
+var isWatchMode = false;
+async function enterWatchMode() {
+    var panel = document.getElementById('floatPanel');
+    var badge = document.getElementById('watchBadge');
+    var btn = document.getElementById('modeWatch');
+
+    if (isWatchMode) {
+        // 退出观看模式
+        isWatchMode = false;
+        panel.classList.remove('watch-mode');
+        badge.classList.remove('show');
+        btn.classList.remove('active');
+        setMode('file');
+        TC.log('已退出观看模式');
+        return;
+    }
+
+    // 进入观看模式
+    isWatchMode = true;
+    panel.classList.add('watch-mode');
+    badge.classList.add('show');
+    btn.classList.add('active');
+
+    // 确保WS连接（接收广播画面需要）
+    if (!TC.wsConnected) {
+        try { await TC.connectWS(); } catch(e) { TC.log('WS连接失败: ' + e.message); return; }
+    }
+
+    TC.log('已进入观看模式，正在接收实时追踪画面...');
+}
 TC.bindFileInput(document.getElementById('fileInput'), document.getElementById('minimapCanvas'));
 
 document.addEventListener('testimage:selected', function(e) {

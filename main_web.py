@@ -468,6 +468,13 @@ class LoFTRMapTracker:
         self.lost_frames = 0
         self.max_lost_frames = 3
 
+        # 线程锁（防止并发调用导致竞态条件）
+        self._lock = Lock()
+
+        # 性能监控
+        import time as _time
+        self._perf_time = _time
+
     def preprocess_image(self, img_bgr):
         img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         h, w = img_gray.shape
@@ -961,7 +968,8 @@ def process():
 @socketio.on('connect')
 def ws_connect():
     """客户端建立 WS 连接"""
-    print(f"WebSocket 客户端已连接: {request.sid}")
+    print(f"WebSocket 客户端已连接: {request.sid} | 当前在线: {len(socketio.server.manager.rooms.get('/', {}) or [])}")
+    # 发送当前状态 + 标识是否为纯观看者（无frame发送能力）
     emit('status', tracker.latest_status)
 
 
@@ -1002,10 +1010,10 @@ def ws_receive_frame(raw_bytes):
             'c': tracker.latest_status['matches'],
         }, separators=(',', ':')).encode('utf-8')
 
-        # 发送: [4字节大端长度][JSON状态][JPEG图片]
+        # 发送: [4字节大端长度][JSON状态][JPEG图片] → 广播给所有人
         emit('result',
              struct.pack('>I', len(status_json)) + status_json + jpeg_result,
-             binary=True)
+             binary=True, broadcast=True)
     else:
         err = b'{"error":"decode_fail"}'
         emit('error', struct.pack('>I', len(err)) + err, binary=True)
@@ -1032,7 +1040,7 @@ def ws_frame_coords(raw_bytes):
 
         emit('coords',
              struct.pack('>I', len(status_json)) + status_json,
-             binary=True)
+             binary=True, broadcast=True)
     else:
         err = b'{"error":"decode_fail"}'
         emit('error', struct.pack('>I', len(err)) + err, binary=True)
