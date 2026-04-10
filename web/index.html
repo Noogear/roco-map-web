@@ -26,7 +26,6 @@
             gap: 24px;
             flex-wrap: wrap;
             justify-content: center;
-            max-width: 1200px;
             width: 100%;
         }
         .panel {
@@ -34,6 +33,8 @@
             border-radius: 12px;
             padding: 20px;
             box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            width: 100%;
+            max-width: min(80vmin, 760px);
         }
         .panel-title {
             font-size: 1em;
@@ -57,8 +58,10 @@
             object-fit: contain;
         }
         #resultImg {
-            width: 500px;
-            height: 500px;
+            width: 100%;
+            height: auto;
+            max-width: min(80vmin, 700px);
+            aspect-ratio: 1 / 1;
             object-fit: contain;
         }
         .status-bar {
@@ -300,11 +303,11 @@
                 <img id="resultImg" src="" alt="等待分析...">
             </div>
             <div class="status-bar">
-                <div class="status-item">
+                <div class="status-item" style="display:none;">
                     <div class="status-label">引擎</div>
                     <div class="status-value" id="statusMode" style="color:#00d4ff;">SIFT</div>
                 </div>
-                <div class="status-item">
+                <div class="status-item" style="display:none;">
                     <div class="status-label">状态</div>
                     <div class="status-value state-global" id="statusState">--</div>
                 </div>
@@ -316,11 +319,11 @@
                     <div class="status-label">坐标 Y</div>
                     <div class="status-value" id="statusY">--</div>
                 </div>
-                <div class="status-item">
+                <div class="status-item" style="display:none;">
                     <div class="status-label">是否找到</div>
                     <div class="status-value found-no" id="statusFound">--</div>
                 </div>
-                <div class="status-item">
+                <div class="status-item" style="display:none;">
                     <div class="status-label">匹配点数</div>
                     <div class="status-value" id="statusMatches">--</div>
                 </div>
@@ -533,12 +536,13 @@ function setupRegionDrag(videoEl) {
         const sc = dragState.startCircle;
 
         if (dragState.type === 'move') {
-            // 限制圆心在圆内
-            selCircle.cx = clamp(sc.cx + dx, sc.r, 1 - sc.r);
-            selCircle.cy = clamp(sc.cy + dy, sc.r, 1 - sc.r);
+            // 允许圆贴边甚至略微出界（截图时会自动 clip 到视频范围）
+            selCircle.cx = clamp(sc.cx + dx, 0, 1);
+            selCircle.cy = clamp(sc.cy + dy, 0, 1);
         } else {
-            // resize: 拖拽右侧手柄改变半径
-            selCircle.r = clamp(sc.r + dx, 0.03, Math.min(0.45, 1 - sc.cx, sc.cx, 1 - sc.cy, sc.cy));
+            // resize: 允许更大半径
+            const maxR = Math.max(sc.cx, 1 - sc.cx, sc.cy, 1 - sc.cy);
+            selCircle.r = clamp(sc.r + dx, 0.03, Math.min(0.49, maxR));
         }
         window.__updateRegionBox && window.__updateRegionBox();
     }
@@ -603,7 +607,7 @@ async function captureAndSendScreenFrame() {
     currentImageData = tmpCanvas.toDataURL('image/jpeg', 0.80);
 
     try {
-        await processImage();  // 等待服务端响应
+        await sendAndDisplay(currentImageData);  // 直接发后端，不走 processImage
     } catch(e) {
         console.error('识别出错:', e);
     } finally {
@@ -680,13 +684,49 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     reader.readAsDataURL(file);
 });
 
-// 发送到后端处理
+// 发送图片到后端并更新显示（公共方法，供 processImage 和自动循环复用）
+async function sendAndDisplay(imageData) {
+    const response = await fetch('/api/upload_minimap', {
+        method: 'POST',
+        body: JSON.stringify({ image: imageData }),
+        headers: { 'Content-Type': 'application/json' }
+    });
+
+    let result;
+    if (!response.ok) {
+        // 备选：FormData 方式
+        const blob = await (await fetch(imageData)).blob();
+        const formData = new FormData();
+        formData.append('image', blob, 'minimap.png');
+        result = await (await fetch('/api/upload_minimap', { method: 'POST', body: formData })).json();
+    } else {
+        result = await response.json();
+    }
+
+    if (result.image) {
+        document.getElementById('resultImg').src = 'data:image/png;base64,' + result.image;
+    }
+
+    if (result.status) {
+        updateStatus(result.status);
+        log(`分析完成 | ${result.status.found ? '✅ 找到位置' : '❌ 未找到'} (${result.status.matches} 匹配点)`);
+    } else {
+        log('分析完成，但未返回状态信息');
+    }
+}
+
+// 发送到后端处理（按钮入口）
 async function processImage() {
+    // 屏幕捕获模式：点击"分析定位"等同于双击选框 → 开启/暂停自动追踪
+    if (currentMode === 'screen') {
+        toggleScreenAutoTrack();
+        return;
+    }
+
     let dataToSend = currentImageData;
 
-    // 屏幕模式：直接用 currentImageData（已在 captureAndSendScreenFrame 中设置）
+    // 文件/摄像头模式：从 canvas 取
     if (!dataToSend) {
-        // 文件/摄像头模式：从 canvas 取
         const cvs = document.getElementById('minimapCanvas');
         if (cvs && cvs.style.display !== 'none') {
             dataToSend = cvs.toDataURL('image/png');
@@ -694,40 +734,14 @@ async function processImage() {
     }
 
     if (!dataToSend) {
-        log('请先上传、截取或捕获小地图！');
+        log('请先上传或选择小地图！');
         return;
     }
 
     log(`正在 ${currentAlgo === 'sift' ? 'SIFT' : 'LoFTR AI'} 分析...`);
 
     try {
-        const response = await fetch('/api/upload_minimap', {
-            method: 'POST',
-            body: JSON.stringify({ image: dataToSend }),
-            headers: { 'Content-Type': 'application/json' }
-        });
-
-        let result;
-        if (!response.ok) {
-            // 备选：FormData 方式
-            const blob = await (await fetch(dataToSend)).blob();
-            const formData = new FormData();
-            formData.append('image', blob, 'minimap.png');
-            result = await (await fetch('/api/upload_minimap', { method: 'POST', body: formData })).json();
-        } else {
-            result = await response.json();
-        }
-
-        if (result.image) {
-            document.getElementById('resultImg').src = 'data:image/png;base64,' + result.image;
-        }
-
-        if (result.status) {
-            updateStatus(result.status);
-            log(`分析完成 | ${result.status.found ? '✅ 找到位置' : '❌ 未找到'} (${result.status.matches} 匹配点)`);
-        } else {
-            log('分析完成，但未返回状态信息');
-        }
+        await sendAndDisplay(dataToSend);
     } catch(err) {
         log('错误: ' + err.message);
         console.error(err);
