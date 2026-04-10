@@ -20,7 +20,6 @@ $:
             launch: uv run main_web.py cpu
             keepAliveTimeout: 3600000
 
-        - docker
       stages:
         - name: ls
           script: ls -al
