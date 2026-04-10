@@ -374,6 +374,9 @@
         </div>
     </div>
 
+    <!-- 离屏视频：始终渲染帧供截图用，不受面板收起影响 -->
+    <video id="screenOffscreen" autoplay playsinline muted style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;"></video>
+
 <script>
 let currentMode = 'file';
 let currentAlgo = 'sift';
@@ -394,9 +397,13 @@ function log(msg) {
 
 // ========== 屏幕捕获状态 ==========
 let screenStream = null;
-let screenVideoEl = null;
+let screenVideoEl = null;        // 面板内预览用（可能被 display:none 隐藏）
+let offscreenVideoEl = null;     // 离屏渲染专用（始终有帧，不受面板影响）
 let screenAutoId = null;
 let screenRunning = false;
+// 缓存视频原始分辨率，避免收起面板时 videoWidth=0 导致截图失败
+let cachedVideoW = 0;
+let cachedVideoH = 0;
 // 选框区域 (圆形: cx,cy 归一化中心 0~1, r 归一化半径)
 // 原矩形 (1189,66)→125x127 @1362x806 → 中心 (1251,130), 半径≈63
 let selCircle = { cx: (1189+62.5)/1362, cy: (66+63.5)/806, r: Math.max(62.5/1362, 63.5/806) };
@@ -447,7 +454,13 @@ async function startScreenCapture() {
 
     screenVideoEl = screenVid;
     screenVid.srcObject = screenStream;
-    screenVid.onloadedmetadata = () => {
+
+    // 同时绑定到离屏视频（确保面板收起时仍有帧可截）
+    offscreenVideoEl = document.getElementById('screenOffscreen');
+    offscreenVideoEl.srcObject = screenStream;
+    offscreenVideoEl.onloadedmetadata = () => {
+        cachedVideoW = offscreenVideoEl.videoWidth;
+        cachedVideoH = offscreenVideoEl.videoHeight;
         initRegionBox(screenVid);
         setupRegionDrag(screenVid);
     };
@@ -466,6 +479,7 @@ function stopScreenCapture() {
         screenStream = null;
     }
     if (screenVideoEl) { screenVideoEl.srcObject = null; }
+    if (offscreenVideoEl) { offscreenVideoEl.srcObject = null; offscreenVideoEl = null; }
 
     document.getElementById('screenVideoContainer').style.display = 'none';
     document.getElementById('stopScreenBtn').style.display = 'none';
@@ -576,12 +590,17 @@ let screenSending = false;
 
 // 从视频中截取选区并发送识别（async，会等待完成）
 async function captureAndSendScreenFrame() {
-    if (!screenVideoEl || !screenVideoEl.videoWidth) return;
+    if (!screenStream) return;
     if (screenSending) return;
     screenSending = true;
 
-    const vw = screenVideoEl.videoWidth;
-    const vh = screenVideoEl.videoHeight;
+    // 优先使用离屏视频（始终有帧），fallback 到面板内视频
+    const vid = (offscreenVideoEl && offscreenVideoEl.videoWidth) ? offscreenVideoEl : screenVideoEl;
+    if (!vid) { screenSending = false; return; }
+
+    const vw = vid.videoWidth || cachedVideoW;
+    const vh = vid.videoHeight || cachedVideoH;
+    if (!vw || !vh) { screenSending = false; return; }
     const baseSize = Math.min(vw, vh);
     // 圆形选区 → 外接正方形（canvas 只能截矩形）
     const cx = selCircle.cx * vw;
@@ -601,7 +620,7 @@ async function captureAndSendScreenFrame() {
     ctx.arc(size/2, size/2, size/2, 0, Math.PI*2);
     ctx.closePath();
     ctx.clip();
-    ctx.drawImage(screenVideoEl, rx, ry, size, size, 0, 0, size, size);
+    ctx.drawImage(vid, rx, ry, size, size, 0, 0, size, size);
 
     // JPEG 压缩发送（更快更小）
     currentImageData = tmpCanvas.toDataURL('image/jpeg', 0.80);
