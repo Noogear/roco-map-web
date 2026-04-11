@@ -63,6 +63,8 @@ class _ArrowCache:
         rx2 = min(w, x2 + pad)
         ry2 = min(h, y2 + pad)
 
+        if rx2 <= rx1 or ry2 <= ry1:
+            return None
         roi = cv2.cvtColor(minimap_bgr[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2GRAY)
         th, tw = self.template_gray.shape[:2]
         if roi.shape[0] < th or roi.shape[1] < tw:
@@ -177,9 +179,9 @@ class SIFTMapTracker:
 
         logic_map_gray = cv2.cvtColor(logic_map_bgr, cv2.COLOR_BGR2GRAY)
         self._logic_map_gray = logic_map_gray  # 留存灰度大地图（ORB 局部匹配用）
-        logic_map_gray = self.clahe.apply(logic_map_gray)
+        logic_map_enhanced = self._adaptive_clahe_map(logic_map_gray)
         print("正在提取大地图 SIFT 特征点...")
-        self.kp_big_all, self.des_big_all = self.sift.detectAndCompute(logic_map_gray, None)
+        self.kp_big_all, self.des_big_all = self.sift.detectAndCompute(logic_map_enhanced, None)
         print(f"✅ 全局特征点: {len(self.kp_big_all)} 个")
 
         # 预存全局特征点坐标（用于快速局部筛选）
@@ -219,6 +221,7 @@ class SIFTMapTracker:
         self.last_y = None
         self.lost_frames = 0
         self._sift_confused = False  # scale 异常时标记，供混合引擎快速升级
+        self._arrow_offset = (0.0, 0.0)  # 箭头中心相对 minimap 中心的偏移（降级复用）
 
         # === 状态冻结（BLOCK 期间保持局部索引 + 坐标，恢复时直接复用）===
         self._frozen = False
@@ -320,6 +323,23 @@ class SIFTMapTracker:
         elif std > self._clahe_high_thresh:
             return self._clahe_high.apply(gray)
         return self._clahe_mid.apply(gray)
+
+    def _adaptive_clahe_map(self, gray):
+        """对大地图进行区域自适应 CLAHE 增强（与小地图一致，避免描述符不匹配）"""
+        h, w = gray.shape[:2]
+        tile = 256
+        result = np.empty_like(gray)
+        for y in range(0, h, tile):
+            for x in range(0, w, tile):
+                patch = gray[y:y+tile, x:x+tile]
+                std = np.std(patch)
+                if std < self._clahe_low_thresh:
+                    result[y:y+tile, x:x+tile] = self._clahe_low.apply(patch)
+                elif std > self._clahe_high_thresh:
+                    result[y:y+tile, x:x+tile] = self._clahe_high.apply(patch)
+                else:
+                    result[y:y+tile, x:x+tile] = self._clahe_mid.apply(patch)
+        return result
 
     # ------------------------------------------
     # 构建/重建 FLANN 索引
@@ -525,8 +545,8 @@ class SIFTMapTracker:
         在小地图图像中检测黄色/橙色箭头，返回 (cx, cy, angle) 或 None。
         两阶段检测：
           1. 快速路径: 模板匹配（cached patch + 小 ROI）→ ~0.3ms
-          2. 完整路径: HSV + 形态学 + 凸包方向 → ~1.5ms
-        成功检测后更新缓存（模板/HSV范围/角度EMA），逐步提升成功率。
+          2. 完整路径: HSV + 形态学 → ~1.5ms
+        角度由白色泛光(wake)方向计算，不再依赖凸包尖端。
         """
         h, w = minimap_bgr.shape[:2]
         if h < 10 or w < 10:
@@ -538,8 +558,9 @@ class SIFTMapTracker:
         tmpl_hit = cache.try_template_match(minimap_bgr)
         if tmpl_hit is not None:
             cx, cy = tmpl_hit
-            # 快速路径只得到位置，角度用小 ROI 凸包计算
-            angle = self._compute_angle_from_region(minimap_bgr, cx, cy, cache)
+            angle = self._compute_wake_angle(minimap_bgr)
+            if angle is None:
+                angle = cache._ema_angle if cache._ema_angle is not None else 0.0
             angle = cache.smooth_angle(angle)
             return (float(cx), float(cy), float(angle))
 
@@ -547,6 +568,10 @@ class SIFTMapTracker:
         hsv = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
         lower, upper = cache.get_hsv_bounds()
         mask = cv2.inRange(hsv, lower, upper)
+
+        # 圆形掩码：排除小地图四角以外区域（防止误检建筑物橙色）
+        circ_mask = self._get_circular_mask(h, w)
+        mask = mask & circ_mask
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -557,25 +582,39 @@ class SIFTMapTracker:
             cache.record_miss()
             return None
 
-        largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) < 20:
+        # 选取最靠近小地图中心的轮廓（箭头总在中心，最大轮廓可能是边缘建筑）
+        mcx, mcy = w / 2.0, h / 2.0
+        best_cnt = None
+        best_dist = float('inf')
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 20:
+                continue
+            M_c = cv2.moments(cnt)
+            if M_c['m00'] < 1e-6:
+                continue
+            ccx = M_c['m10'] / M_c['m00']
+            ccy = M_c['m01'] / M_c['m00']
+            dist = (ccx - mcx) ** 2 + (ccy - mcy) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best_cnt = cnt
+
+        if best_cnt is None:
             cache.record_miss()
             return None
 
-        M_moments = cv2.moments(largest)
-        if M_moments['m00'] < 1e-6:
-            cache.record_miss()
-            return None
-
+        M_moments = cv2.moments(best_cnt)
         cx = M_moments['m10'] / M_moments['m00']
         cy = M_moments['m01'] / M_moments['m00']
 
-        # 角度计算：白色描边 + 凸包方向
-        angle = self._compute_angle_full(minimap_bgr, mask, cx, cy)
+        # 角度计算：白色泛光(wake)方向
+        angle = self._compute_wake_angle(minimap_bgr)
+        if angle is None:
+            angle = cache._ema_angle if cache._ema_angle is not None else 0.0
         angle = cache.smooth_angle(angle)
 
         # 更新缓存
-        bx, by, bw, bh = cv2.boundingRect(largest)
+        bx, by, bw, bh = cv2.boundingRect(best_cnt)
         cache.update_template(minimap_bgr, mask, (bx, by, bx + bw, by + bh))
         cache.learn_hsv(hsv, mask)
         cache.miss_streak = 0
@@ -583,47 +622,53 @@ class SIFTMapTracker:
         return (float(cx), float(cy), float(angle))
 
     @staticmethod
-    def _compute_angle_full(minimap_bgr, mask, cx, cy):
-        """完整角度计算：白色描边 + 凸包尖端方向"""
-        try:
-            hsv_full = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
-            white_mask = cv2.inRange(hsv_full, np.array([0, 0, 200]), np.array([180, 80, 255]))
-            kd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            white_border = white_mask & cv2.dilate(mask, kd, iterations=2) & ~mask
-            combined = cv2.morphologyEx(
-                cv2.bitwise_or(mask, white_border),
-                cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
-
-            cc, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cc and cv2.contourArea(max(cc, key=cv2.contourArea)) > 30:
-                hull = cv2.convexHull(max(cc, key=cv2.contourArea)).reshape(-1, 2).astype(np.float64)
-                centroid = np.array([cx, cy])
-                tip_idx = np.argmax(np.sum((hull - centroid) ** 2, axis=1))
-                dx, dy = hull[tip_idx] - centroid
-                return -(math.degrees(math.atan2(dy, dx)) - 90) % 360
-        except Exception:
-            pass
-        return 0.0
-
-    def _compute_angle_from_region(self, minimap_bgr, cx, cy, cache):
-        """快速路径角度：在箭头附近小区域做凸包方向分析"""
+    def _compute_wake_angle(minimap_bgr):
+        """
+        通过白色泛光(wake)方向计算箭头朝向。
+        箭头在朝向方向会发出类似手电筒的白色/亮色光晕，
+        这些低饱和度高亮度像素的质心偏移方向即为箭头朝向。
+        在亮色地形（雪地/沙漠等）中像素计数过高时返回 None，交由 EMA 平滑。
+        返回角度(0=北/上, 顺时针增加)或 None。
+        """
         h, w = minimap_bgr.shape[:2]
-        pad = getattr(config, 'ARROW_ROI_PADDING', 15) + 5
-        x1, y1 = max(0, int(cx) - pad), max(0, int(cy) - pad)
-        x2, y2 = min(w, int(cx) + pad), min(h, int(cy) + pad)
-        roi = minimap_bgr[y1:y2, x1:x2]
-        if roi.size < 100:
-            return cache._ema_angle if cache._ema_angle is not None else 0.0
+        mcx, mcy = w // 2, h // 2
 
-        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        lower, upper = cache.get_hsv_bounds()
-        mask_roi = cv2.inRange(hsv_roi, lower, upper)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, kernel, iterations=1)
+        hsv = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
 
-        local_cx = cx - x1
-        local_cy = cy - y1
-        return self._compute_angle_full(roi, mask_roi, local_cx, local_cy)
+        # 距离中心的距离平方映射
+        yy, xx = np.ogrid[:h, :w]
+        dist_sq = (xx - mcx) ** 2 + (yy - mcy) ** 2
+
+        # 内环（跳过箭头图标本身）和外环上限（圆形小地图边界内）
+        inner_r = max(5, min(h, w) // 12)
+        outer_r = min(h, w) // 2 - 3
+
+        # 泛光像素：低饱和 + 高亮度 + 在环形区域内
+        wake = ((sat < 60) & (val > 180)
+                & (dist_sq > inner_r * inner_r)
+                & (dist_sq < outer_r * outer_r))
+
+        wy, wx = np.where(wake)
+        count = len(wx)
+
+        # 太少说明无泛光信号；太多说明地形整体偏亮（雪地等），信噪比太低
+        if count < 15 or count > 3000:
+            return None
+
+        # 亮度加权质心
+        weights = val[wake].astype(np.float64)
+        w_dx = np.average(wx.astype(np.float64), weights=weights) - mcx  # East
+        w_dy = np.average(wy.astype(np.float64), weights=weights) - mcy  # South
+
+        # 偏移量太小说明泛光均匀分布，无法判断方向
+        if math.sqrt(w_dx * w_dx + w_dy * w_dy) < 3.0:
+            return None
+
+        # 图像坐标 → 导航角度 (0=北/上, 90=东/右, 180=南/下, 270=西/左)
+        angle = math.degrees(math.atan2(w_dx, -w_dy)) % 360
+        return angle
 
     @staticmethod
     def _draw_arrow_marker(img_bgr, cx, cy, size=None, angle=0):
@@ -639,9 +684,6 @@ class SIFTMapTracker:
             [cx - size * 0.6, cy + size * 0.7],
             [cx + size * 0.6, cy + size * 0.7],
         ], dtype=np.float64)
-
-        # 额外增加180度翻转箭头
-        angle = (angle + 180) % 360
 
         if angle != 0:
             rad = math.radians(-angle)
@@ -773,9 +815,9 @@ class SIFTMapTracker:
             ty = int(dst_center[0][0][1]) + y1
 
             if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
-                # 跳变检查
+                # 跳变检查（使用与主匹配相同的阈值）
                 jump = abs(tx - lx) + abs(ty - ly)
-                if jump < 500:
+                if jump < self.JUMP_THRESHOLD:
                     print(f"[ORB备份] ✅ 匹配成功 ({tx},{ty}) inliers={inlier_count}")
                     return tx, ty
         except Exception as e:
@@ -877,18 +919,21 @@ class SIFTMapTracker:
 
                         h, w = minimap_gray.shape
 
-                        # 箭头检测与位置匹配解耦：箭头失败时降级用 Homography 中心
+                        # 箭头检测：获取精确中心+泛光方向
                         arrow_center = self._detect_arrow_center(minimap_bgr)
                         if arrow_center is not None:
                             ref_x, ref_y, ref_angle = arrow_center
                             arrow_angle = ref_angle
                             self._last_arrow_angle = ref_angle
-                            quality_bonus = 1.0  # 有箭头 = 精确
+                            # 缓存箭头中心偏移量（相对 minimap 中心），降级时复用
+                            self._arrow_offset = (ref_x - w / 2.0, ref_y - h / 2.0)
+                            quality_bonus = 1.0
                         else:
-                            # 降级：使用 minimap 中心点
-                            ref_x, ref_y = w / 2.0, h / 2.0
-                            arrow_angle = self._last_arrow_angle  # 沿用上一帧方向
-                            quality_bonus = 0.6  # 无箭头 = 估计
+                            # 降级：使用上次箭头偏移量估算（保持参考点稳定，避免震荡）
+                            ox, oy = getattr(self, '_arrow_offset', (0.0, 0.0))
+                            ref_x, ref_y = w / 2.0 + ox, h / 2.0 + oy
+                            arrow_angle = self._last_arrow_angle
+                            quality_bonus = 0.6
 
                         center_pt = np.float32([[[ref_x, ref_y]]])
                         dst_center = cv2.perspectiveTransform(center_pt, M)
@@ -900,9 +945,11 @@ class SIFTMapTracker:
                         match_quality = min(1.0, inlier_ratio * quality_bonus)
 
                         if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
-                            if search_round == 0 and self.last_x is not None:
+                            if self.last_x is not None:
                                 jump = abs(tx - self.last_x) + abs(ty - self.last_y)
-                                if jump < 500:
+                                # 局部搜索用更紧的阈值，全局回退放宽但仍然有限
+                                max_jump = self.JUMP_THRESHOLD if search_round == 0 else self.JUMP_THRESHOLD * 2
+                                if jump < max_jump:
                                     found = True
                                     center_x, center_y = tx, ty
                                     break

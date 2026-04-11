@@ -137,12 +137,17 @@ class AIMapTrackerWeb:
         self.map_width = self.sift_engine.map_width
 
         # 线程安全锁
-        self.lock = Lock()
+        self.lock = Lock()          # 保护 current_frame_bgr 的读写
+        self._process_lock = Lock() # 防止后台线程与 HTTP 路由并发跑 SIFT
 
         # 当前帧数据
         self.current_frame_bgr = None
         self.latest_result_image = None
         self.latest_result_jpeg = None
+        self.latest_result_frame = None
+        self._render_revision = 0
+        self._latest_result_image_revision = -1
+        self._latest_result_jpeg_revision = -1
 
         # 坐标历史（用于异常值过滤）
         self.pos_history = deque(maxlen=POS_HISTORY_SIZE)
@@ -192,6 +197,19 @@ class AIMapTrackerWeb:
 
         if self._hybrid_enabled:
             print("  🔀 混合引擎已启用 (SIFT 主引擎 + LoFTR 后台重定位)")
+
+        # ========== 后台帧处理线程（解耦 SIFT 与 WebSocket 热路径）==========
+        # SIFT 匹配运行在独立线程，WebSocket handler 可立即返回上一帧缓存结果。
+        # 自动跳帧：若处理跟不上帧率，Event 被多次 set() 后只唤醒一次，
+        # 每次 wait() 后取到的是最新的 current_frame_bgr（旧帧自动丢弃）。
+        self._new_frame_event = Event()
+        self._worker_thread = Thread(
+            target=self._background_processor,
+            daemon=True,
+            name='sift-worker',
+        )
+        self._worker_thread.start()
+        print("  ⚡ SIFT 后台处理线程已启动")
 
     # ========== 坐标平滑 ==========
 
@@ -405,6 +423,22 @@ class AIMapTrackerWeb:
     def set_minimap(self, minimap_bgr):
         with self.lock:
             self.current_frame_bgr = minimap_bgr.copy()
+        self._new_frame_event.set()  # 唤醒后台 SIFT 工作线程
+
+    def _background_processor(self):
+        """
+        后台 SIFT 工作线程：持续处理最新帧，不阻塞 WebSocket 接收。
+
+        Event 语义保证自动跳帧：多帧对应同一个 Event.set()，
+        clear() 后 current_frame_bgr 始终是最新帧（旧帧自动丢弃）。
+        """
+        while True:
+            self._new_frame_event.wait()
+            self._new_frame_event.clear()
+            try:
+                self.process_frame(need_base64=False, need_jpeg=True)
+            except Exception as e:
+                print(f"[sift-worker] 处理异常: {e}")
 
     def set_mode(self, mode):
         """切换识别模式: 'sift' 或 'loftr'"""
@@ -422,8 +456,22 @@ class AIMapTrackerWeb:
             self.loftr_engine.scan_y = 0
         return True
 
-    def process_frame(self):
-        """处理当前帧，返回 (img_base64, jpeg_bytes) 或 None"""
+    def process_frame(self, need_base64=True, need_jpeg=True):
+        """
+        处理当前帧，返回 (img_base64, jpeg_bytes) 或 None。
+
+        need_base64:
+            是否立即生成 base64 图片（HTTP JSON 返回使用）
+        need_jpeg:
+            是否立即生成 JPEG 字节（WebSocket / 最新帧接口使用）
+        """
+        # 防止后台线程与 HTTP 同步路由（upload_minimap / /api/process）并发跑 SIFT。
+        # 后来的调用者等前一次完成后才进入，避免双重处理和结果互相覆盖。
+        with self._process_lock:
+            return self._process_frame_locked(need_base64, need_jpeg)
+
+    def _process_frame_locked(self, need_base64, need_jpeg):
+        """process_frame 的实际实现，调用前必须持有 _process_lock。"""
         with self.lock:
             if self.current_frame_bgr is None:
                 return None
@@ -438,14 +486,15 @@ class AIMapTrackerWeb:
 
         found, display_crop, status_state, match_count, last_x, last_y = result
 
-        # ====== 坐标异常值过滤 ======
+        # ====== 坐标异常值过滤（欧氏距离，避免对角线方向失衡） ======
         if found and (last_x or last_y):
             is_outlier = False
             if len(self.pos_history) >= 3:
                 hist = list(self.pos_history)
                 ref_x = sorted(h[0] for h in hist)[len(hist)//2]
                 ref_y = sorted(h[1] for h in hist)[len(hist)//2]
-                if abs(last_x - ref_x) > POS_OUTLIER_THRESHOLD or abs(last_y - ref_y) > POS_OUTLIER_THRESHOLD:
+                dist = math.sqrt((last_x - ref_x) ** 2 + (last_y - ref_y) ** 2)
+                if dist > POS_OUTLIER_THRESHOLD:
                     is_outlier = True
             if not is_outlier:
                 self.pos_history.append((last_x, last_y))
@@ -455,8 +504,16 @@ class AIMapTrackerWeb:
         elif found:
             self.pos_history.append((last_x, last_y))
 
-        # 渲染最终输出
-        img_base64, jpeg_bytes = self._render_output(display_crop, half_view)
+        final_bgr = self._compose_output_frame(display_crop, half_view)
+
+        img_base64 = None
+        jpeg_bytes = None
+        if need_base64 or need_jpeg:
+            img_base64, jpeg_bytes = self._encode_output_frame(
+                final_bgr,
+                need_base64=need_base64,
+                need_jpeg=True,
+            )
 
         self.latest_status = {
             'mode': self.current_mode,
@@ -470,8 +527,23 @@ class AIMapTrackerWeb:
             'hybrid': self._hybrid_enabled,
             'hybrid_busy': self._hybrid_busy,
         }
-        self.latest_result_image = img_base64
-        self.latest_result_jpeg = jpeg_bytes
+
+        self.latest_result_frame = final_bgr
+        self._render_revision += 1
+        self._latest_result_image_revision = -1
+        self._latest_result_jpeg_revision = -1
+
+        if jpeg_bytes is not None:
+            self.latest_result_jpeg = jpeg_bytes
+            self._latest_result_jpeg_revision = self._render_revision
+        else:
+            self.latest_result_jpeg = None
+
+        if img_base64 is not None:
+            self.latest_result_image = img_base64
+            self._latest_result_image_revision = self._render_revision
+        else:
+            self.latest_result_image = None
 
         return img_base64, jpeg_bytes
 
@@ -607,11 +679,16 @@ class AIMapTrackerWeb:
                 cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=4, color=(0, 255, 255), thickness=-1)
                 cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=7, color=(255, 255, 255), thickness=1)
         else:
-            y1 = max(0, self.sift_engine.last_y - half_view)
-            y2 = min(self.map_height, self.sift_engine.last_y + half_view)
-            x1 = max(0, self.sift_engine.last_x - half_view)
-            x2 = min(self.map_width, self.sift_engine.last_x + half_view)
-            if x2 > x1 and y2 > y1:
+            if self.sift_engine.last_x is not None and self.sift_engine.last_y is not None:
+                y1 = max(0, self.sift_engine.last_y - half_view)
+                y2 = min(self.map_height, self.sift_engine.last_y + half_view)
+                x1 = max(0, self.sift_engine.last_x - half_view)
+                x2 = min(self.map_width, self.sift_engine.last_x + half_view)
+            else:
+                x1 = x2 = y1 = y2 = 0
+
+            if (self.sift_engine.last_x is not None and self.sift_engine.last_y is not None and
+                    x2 > x1 and y2 > y1):
                 display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
                 local_x = self.sift_engine.last_x - x1
                 local_y = self.sift_engine.last_y - y1
@@ -657,8 +734,8 @@ class AIMapTrackerWeb:
         last_y = result.get('last_y', 0)
         return found, display_crop, status_state, match_count, last_x, last_y
 
-    def _render_output(self, display_crop, half_view):
-        """最终渲染: OpenCV 直接 JPEG 编码（替代 PIL，减少 RGB 转换和内存拷贝）"""
+    def _compose_output_frame(self, display_crop, half_view):
+        """将裁剪地图贴到固定大小画布上，返回最终 BGR 帧。"""
         view_size = config.VIEW_SIZE
         # 创建 BGR 画布并居中粘贴
         final_bgr = np.full((view_size, view_size, 3), 43, dtype=np.uint8)
@@ -669,13 +746,57 @@ class AIMapTrackerWeb:
         paste_w = min(w, view_size - x_off)
         final_bgr[y_off:y_off + paste_h, x_off:x_off + paste_w] = display_crop[:paste_h, :paste_w]
 
+        return final_bgr
+
+    def _encode_output_frame(self, final_bgr, need_base64=True, need_jpeg=True):
+        """
+        按需编码最终帧。
+
+        注意：base64 本质上也是 JPEG 的文本包装，因此一旦请求 base64，
+        会复用同一次 JPEG 编码结果，避免重复压缩。
+        """
+        if not need_base64 and not need_jpeg:
+            return None, None
+
         # 直接 JPEG 编码（跳过 BGR→RGB→PIL→JPEG 的多次拷贝）
         _, jpeg_buf = cv2.imencode('.jpg', final_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
         jpeg_bytes = jpeg_buf.tobytes()
 
-        img_base64 = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes).decode('utf-8')
+        img_base64 = None
+        if need_base64:
+            img_base64 = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes).decode('utf-8')
 
         return img_base64, jpeg_bytes
+
+    def get_latest_result_jpeg(self):
+        """返回最新 JPEG；若当前帧尚未编码则按需懒生成。"""
+        if self.latest_result_frame is None:
+            return None
+        if (self._latest_result_jpeg_revision == self._render_revision and
+                self.latest_result_jpeg is not None):
+            return self.latest_result_jpeg
+
+        _, jpeg_bytes = self._encode_output_frame(self.latest_result_frame, need_base64=False, need_jpeg=True)
+        self.latest_result_jpeg = jpeg_bytes
+        self._latest_result_jpeg_revision = self._render_revision
+        return jpeg_bytes
+
+    def get_latest_result_base64(self):
+        """返回最新 base64；若当前帧尚未编码则按需懒生成。"""
+        if self.latest_result_frame is None:
+            return None
+        if (self._latest_result_image_revision == self._render_revision and
+                self.latest_result_image is not None):
+            return self.latest_result_image
+
+        jpeg_bytes = self.get_latest_result_jpeg()
+        if not jpeg_bytes:
+            return None
+
+        img_base64 = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_bytes).decode('utf-8')
+        self.latest_result_image = img_base64
+        self._latest_result_image_revision = self._render_revision
+        return img_base64
 
     # ========== 混合引擎：后台 LoFTR 重定位 ==========
 

@@ -37,7 +37,7 @@ SIFT_RANSAC_THRESHOLD = 8.0           # 允许的空间误差阈值
 # === 局部优先搜索设置 (main123 优化) ===
 SEARCH_RADIUS = 400                  # 局部搜索半径（像素）
 LOCAL_FAIL_LIMIT = 3                 # 局部搜索连续失败 N 帧后回退全局
-SIFT_JUMP_THRESHOLD = 500            # 局部模式下坐标最大允许跳变距离（像素）
+SIFT_JUMP_THRESHOLD = 500            # 局部模式下坐标最大允许跳变距离（像素，全局回退用2x）
 SIFT_MAX_HOMOGRAPHY_SCALE = 8.0      # Homography 最大允许缩放 (防UI误匹配，正常≈1-3)
 
 # === 自适应 CLAHE（按纹理复杂度切换增强档位）===

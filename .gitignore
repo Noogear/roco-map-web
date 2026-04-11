@@ -3,11 +3,22 @@ __pycache__/
 *.py[cod]
 
 # 忽略虚拟环境
+.venv/
 venv/
 env/
 
+# 构建产物
+*.egg-info/
+
 # 忽略调试生成的图片
 debug_minimap.png
+_debug_*.png
+_debug_*.py
+_test_batch.py
+_test_angle.py
+
+# 临时环境/实验目录
+.tmp_prebuilt_env/
 
 # 忽略 IDE 配置文件
 .idea/
@@ -15,3 +26,7 @@ debug_minimap.png
 
 # 坐标平滑缓存（运行时自动生成）
 .smooth_coords.json
+.circle_state.json
+
+# 临时截图样本（保留 picture/ 目录本身，忽略临时 QQ 截图）
+picture/

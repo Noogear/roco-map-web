@@ -58,13 +58,34 @@ def _load_route_data(filename):
         return None
 
 
-# 解析启动参数: python main_web.py [cpu|sift|ai|loftr]
-_START_MODE = (sys.argv[1].lower() if len(sys.argv) > 1 else 'ai')
+# 解析启动模式：
+#   直接脚本运行: python main_web.py [cpu|sift|ai|loftr]
+#   gunicorn / console script 导入: 使用环境变量 MAP_TRACKER_MODE
+def _resolve_start_mode():
+    env_mode = os.environ.get('MAP_TRACKER_MODE')
+    if env_mode:
+        return env_mode.lower()
+    if __name__ == '__main__' and len(sys.argv) > 1:
+        return sys.argv[1].lower()
+    return 'ai'
+
+
+_START_MODE = _resolve_start_mode()
 _SIFT_ONLY = _START_MODE in ('cpu', 'sift')
 
+# OpenCV 内部线程数配置：
+#   单进程部署（python main_web.py）→ 让 OpenCV 使用全部核心做 SIFT 内部并行（默认行为）
+#   多进程部署（gunicorn -w N）→ 每个 worker 设为 cpu_count//N，避免线程过多竞争
+#   可通过环境变量 CV2_NUM_THREADS 覆盖，例如: CV2_NUM_THREADS=4 python main_web.py cpu
+_cv2_threads = int(os.environ.get('CV2_NUM_THREADS', 0))  # 0 = OpenCV 自动选择
+if _cv2_threads > 0:
+    cv2.setNumThreads(_cv2_threads)
+    print(f"[cv2] 已设置 OpenCV 线程数: {_cv2_threads}")
+
 # Flask + SocketIO
+_SOCKETIO_ASYNC_MODE = os.environ.get('SOCKETIO_ASYNC_MODE', 'threading').lower()
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_SOCKETIO_ASYNC_MODE)
 
 # 全局追踪器实例
 tracker = AIMapTrackerWeb(sift_only=_SIFT_ONLY)
@@ -156,8 +177,8 @@ def upload_minimap():
 
     if img is not None:
         tracker.set_minimap(img)
-        result = tracker.process_frame()
-        if result:
+        result = tracker.process_frame(need_base64=True, need_jpeg=False)
+        if result and result[0]:
             return jsonify({
                 'success': True,
                 'image': result[0],
@@ -280,9 +301,10 @@ def api_circle_state():
 @app.route('/api/result')
 def get_result():
     """获取最新的结果图片"""
-    if tracker.latest_result_image:
+    image = tracker.get_latest_result_base64()
+    if image:
         return jsonify({
-            'image': tracker.latest_result_image,
+            'image': image,
             'status': tracker.latest_status,
         })
     return jsonify({'error': 'No result yet'}), 404
@@ -291,33 +313,20 @@ def get_result():
 @app.route('/api/latest_frame')
 def get_latest_frame():
     """获取最新渲染的地图帧（JPEG 二进制）- 供外部悬浮窗使用"""
-    # 优先返回缓存的 JPEG 字节
-    if tracker.latest_result_jpeg:
+    jpeg_bytes = tracker.get_latest_result_jpeg()
+    if jpeg_bytes:
         return send_file(
-            BytesIO(tracker.latest_result_jpeg),
+            BytesIO(jpeg_bytes),
             mimetype='image/jpeg',
         )
-    # 如果有 base64 结果，尝试解码
-    if tracker.latest_result_image:
-        try:
-            b64 = tracker.latest_result_image
-            if ',' in b64:
-                b64 = b64.split(',', 1)[1]
-            jpeg_bytes = base64.b64decode(b64)
-            return send_file(
-                BytesIO(jpeg_bytes),
-                mimetype='image/jpeg',
-            )
-        except Exception:
-            pass
     return jsonify({'error': 'No frame available yet'}), 404
 
 
 @app.route('/api/process')
 def process():
     """手动触发一次处理（用于文件模式）"""
-    result = tracker.process_frame()
-    if result:
+    result = tracker.process_frame(need_base64=True, need_jpeg=False)
+    if result and result[0]:
         return jsonify({
             'image': result[0],
             'status': tracker.latest_status,
@@ -429,27 +438,33 @@ def ws_reset_history():
 @socketio.on('frame')
 def ws_receive_frame(raw_bytes):
     """
-    接收二进制 JPEG 帧，处理并返回结果。
+    接收二进制 JPEG 帧，存帧并立即返回上一帧缓存结果（非阻塞）。
+    SIFT 匹配运行在后台线程，WebSocket 接收延迟降至解码耗时（1-2ms）。
     协议: 客户端发送原始 JPEG bytes → 服务端返回 [JSON头(4字节长度) + JPEG图片]
     """
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
-        tracker.set_minimap(img)
-        _, jpeg_result = tracker.process_frame()
+        tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程，立即返回
 
+        # 返回上一帧缓存的 JPEG 结果（后台线程异步处理当前帧）
+        jpeg_result = tracker.latest_result_jpeg
+        if jpeg_result is None:
+            return  # 启动后第一帧尚无缓存，静默等待
+
+        status = tracker.latest_status
         status_json = json.dumps({
             'm': tracker.current_mode,
-            's': tracker.latest_status['state'],
-            'x': tracker.latest_status['position']['x'],
-            'y': tracker.latest_status['position']['y'],
-            'f': int(tracker.latest_status['found']),
-            'c': tracker.latest_status['matches'],
-            'q': round(tracker.latest_status.get('match_quality', 0), 2),
-            'a': round(tracker.latest_status.get('arrow_angle', 0), 1),
+            's': status['state'],
+            'x': status['position']['x'],
+            'y': status['position']['y'],
+            'f': int(status['found']),
+            'c': status['matches'],
+            'q': round(status.get('match_quality', 0), 2),
+            'a': round(status.get('arrow_angle', 0), 1),
             'l': int(tracker.sift_engine.coord_lock_enabled),
-            'h': int(tracker.latest_status.get('hybrid_busy', False)),
+            'h': int(status.get('hybrid_busy', False)),
         }, separators=(',', ':')).encode('utf-8')
 
         emit('result',
@@ -462,25 +477,28 @@ def ws_receive_frame(raw_bytes):
 
 @socketio.on('frame_coords')
 def ws_frame_coords(raw_bytes):
-    """接收帧但只返回坐标（不返回裁剪图片），大幅减少带宽"""
+    """接收帧并存帧（后台处理），立即返回上一帧缓存坐标。大幅减少带宽。"""
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
-        tracker.set_minimap(img)
-        tracker.process_frame()
+        tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程
 
+        if tracker.latest_result_jpeg is None:
+            return  # 首帧尚无缓存，静默等待
+
+        status = tracker.latest_status
         status_json = json.dumps({
             'm': tracker.current_mode,
-            's': tracker.latest_status['state'],
-            'x': tracker.latest_status['position']['x'],
-            'y': tracker.latest_status['position']['y'],
-            'f': int(tracker.latest_status['found']),
-            'c': tracker.latest_status['matches'],
-            'q': round(tracker.latest_status.get('match_quality', 0), 2),
-            'a': round(tracker.latest_status.get('arrow_angle', 0), 1),
+            's': status['state'],
+            'x': status['position']['x'],
+            'y': status['position']['y'],
+            'f': int(status['found']),
+            'c': status['matches'],
+            'q': round(status.get('match_quality', 0), 2),
+            'a': round(status.get('arrow_angle', 0), 1),
             'l': int(tracker.sift_engine.coord_lock_enabled),
-            'h': int(tracker.latest_status.get('hybrid_busy', False)),
+            'h': int(status.get('hybrid_busy', False)),
         }, separators=(',', ':')).encode('utf-8')
 
         emit('coords',
@@ -493,14 +511,32 @@ def ws_frame_coords(raw_bytes):
 
 # ==================== 启动入口 ====================
 
-if __name__ == "__main__":
+# ---- 多用户/生产部署（gunicorn）说明 ----
+# 单用户直接: python main_web.py cpu
+# 多用户 6 核: MAP_TRACKER_MODE=sift SOCKETIO_ASYNC_MODE=gevent \
+#              gunicorn -w 4 --threads 2 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
+#              --preload "main_web:app"
+# 多用户 16 核: MAP_TRACKER_MODE=sift SOCKETIO_ASYNC_MODE=gevent \
+#               gunicorn -w 12 --threads 2 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
+#              --preload "main_web:app"
+# --preload 保证 SIFT 特征点/FLANN 索引只构建一次，fork 后各 worker 共享只读内存（Linux CoW）
+# SocketIO 需要 geventwebsocket: pip install gevent gevent-websocket
+# 多进程时建议通过环境变量限制每进程 cv2 线程数: CV2_NUM_THREADS=2 gunicorn ...
+
+
+def main():
+    """控制台入口：与 pyproject.toml 的 console_scripts 对齐。"""
     print("=" * 50)
     mode_label = "SIFT-only (快速模式)" if _SIFT_ONLY else "双引擎 (SIFT + LoFTR AI)"
     print(f"  地图跟点 - 网页版 [{mode_label}]")
     if _SIFT_ONLY:
         print("  用法: python main_web.py cpu   → 仅 SIFT (无需 torch)")
-        print("       python main_web.py ai    → SIFT + LoFTR AI")
+        print("       MAP_TRACKER_MODE=sift map-tracker-web  → console script / gunicorn")
+    print(f"  SocketIO async_mode: {_SOCKETIO_ASYNC_MODE}")
     print("  打开浏览器访问: http://0.0.0.0:" + str(config.PORT))
     print("  WebSocket: ws://0.0.0.0:" + str(config.PORT) + "/socket.io/?transport=websocket")
     print("=" * 50)
     socketio.run(app, host='0.0.0.0', port=config.PORT, debug=False, allow_unsafe_werkzeug=True)
+
+if __name__ == "__main__":
+    main()
