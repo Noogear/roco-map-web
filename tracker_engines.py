@@ -49,6 +49,9 @@ class _ArrowCache:
         self._ema_angle = None
         self._angle_alpha = getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.4)
 
+        # wake 检测状态（本帧是否成功从白色区域推算了方向）
+        self.last_wake_success = False
+
     # ---------- 模板快速路径 ----------
     def try_template_match(self, minimap_bgr):
         """在上次位置附近用模板匹配快速检测箭头，返回 (cx, cy) 或 None"""
@@ -248,6 +251,12 @@ class SIFTMapTracker:
         self._lock_search_radius = getattr(config, 'COORD_LOCK_SEARCH_RADIUS', 400)
         self._lock_max_retries = getattr(config, 'COORD_LOCK_MAX_RETRIES', 5)
         self._lock_min_to_activate = getattr(config, 'COORD_LOCK_MIN_HISTORY_TO_ACTIVATE', 15)
+
+        # 移动预测与静止检测（用位移历史推算朝向，防止静止时 wake 随镜头漂移）
+        self._prev_frame_x = None   # 上一帧定位坐标（用于计算位移）
+        self._prev_frame_y = None
+        self._last_moving_angle = None   # 最近一次移动状态下的可信朝向角
+        self._stopped_frames = 0         # 连续静止帧计数
 
     # ------------------------------------------
     # 状态冻结 / 恢复（战斗/背包期间保持局部索引+坐标）
@@ -558,9 +567,10 @@ class SIFTMapTracker:
         tmpl_hit = cache.try_template_match(minimap_bgr)
         if tmpl_hit is not None:
             cx, cy = tmpl_hit
-            angle = self._compute_wake_angle(minimap_bgr)
-            if angle is None:
-                angle = cache._ema_angle if cache._ema_angle is not None else 0.0
+            raw_wake = self._compute_wake_angle(minimap_bgr)
+            cache.last_wake_success = raw_wake is not None
+            angle = raw_wake if raw_wake is not None else (
+                cache._ema_angle if cache._ema_angle is not None else 0.0)
             angle = cache.smooth_angle(angle)
             return (float(cx), float(cy), float(angle))
 
@@ -608,9 +618,10 @@ class SIFTMapTracker:
         cy = M_moments['m01'] / M_moments['m00']
 
         # 角度计算：白色泛光(wake)方向
-        angle = self._compute_wake_angle(minimap_bgr)
-        if angle is None:
-            angle = cache._ema_angle if cache._ema_angle is not None else 0.0
+        raw_wake = self._compute_wake_angle(minimap_bgr)
+        cache.last_wake_success = raw_wake is not None
+        angle = raw_wake if raw_wake is not None else (
+            cache._ema_angle if cache._ema_angle is not None else 0.0)
         angle = cache.smooth_angle(angle)
 
         # 更新缓存
@@ -686,7 +697,7 @@ class SIFTMapTracker:
         ], dtype=np.float64)
 
         if angle != 0:
-            rad = math.radians(-angle)
+            rad = math.radians(angle)   # 正角度 = 从北顺时针旋转（修正左右镜像）
             cos_a = math.cos(rad)
             sin_a = math.sin(rad)
             centered = pts - np.array([cx, cy])
@@ -1014,6 +1025,38 @@ class SIFTMapTracker:
                   f"特征点: {feat} | lost: {self.lost_frames} | "
                   f"fps: {1000/avg:.1f}")
             self._frame_times.clear()
+
+        # ===== 移动方向预测 + 静止检测 =====
+        # 目的1: 静止时 wake（白色区域）跟随镜头旋转而非玩家朝向，需冻结角度
+        # 目的2: 移动中 wake 失效时，用位移方向角（地图坐标系推算）作为备选
+        if found and not is_inertial and self._prev_frame_x is not None:
+            dx = center_x - self._prev_frame_x
+            dy = center_y - self._prev_frame_y
+            dist = math.sqrt(dx * dx + dy * dy)
+            _thr = getattr(config, 'ARROW_STOPPED_THRESHOLD', 6)
+            _min_fr = getattr(config, 'ARROW_STOPPED_FRAMES_MIN', 4)
+            if dist > _thr:
+                # 玩家正在移动
+                self._stopped_frames = 0
+                if self._arrow_cache.last_wake_success:
+                    # wake 本帧成功：记录为可信移动角
+                    self._last_moving_angle = arrow_angle
+                else:
+                    # wake 本帧失败：用地图位移方向角补偿
+                    # 地图坐标系: x 右=东, y 下=南 → atan2(dx, -dy) = 导航角(北=0, 顺时针)
+                    move_angle = math.degrees(math.atan2(dx, -dy)) % 360
+                    arrow_angle = move_angle
+                    self._last_moving_angle = move_angle
+            else:
+                # 玩家静止：white area 随镜头旋转，角度不可信
+                self._stopped_frames += 1
+                if (self._stopped_frames >= _min_fr
+                        and self._last_moving_angle is not None):
+                    # 冻结：使用最后一次移动时确认的角度
+                    arrow_angle = self._last_moving_angle
+        if found and not is_inertial:
+            self._prev_frame_x = center_x
+            self._prev_frame_y = center_y
 
         return {
             'found': found,
