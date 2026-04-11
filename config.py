@@ -67,7 +67,7 @@ MINIMAP_CIRCLE_RECALIBRATE_MISS = 30    # 连续多少帧未检测到圆 → 重
 ARROW_ANGLE_SMOOTH_ALPHA = 0.35         # 角度 EMA 平滑系数 (0=强平滑, 1=无平滑)
 ARROW_MOVE_MIN_DISPLACEMENT = 6         # 判定移动的最小累积位移 (像素)
 ARROW_POS_HISTORY_LEN = 4              # 坐标历史帧数 (用于累积位移计算)
-ARROW_STOPPED_DEBOUNCE = 3             # 连续低位移多少帧后判定为静止
+ARROW_STOPPED_DEBOUNCE = 20            # 连续低位移多少帧后判定为静止（20fps ≈ 1秒）
 ARROW_SNAP_THRESHOLD = 90              # 角度差超此值时跳过平滑直接赋值（应付瞬间反向）
 
 # === 坐标锁定模式设置 ===
