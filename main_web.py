@@ -1104,6 +1104,41 @@ class AIMapTrackerWeb:
 # 全局实例
 tracker = AIMapTrackerWeb()
 
+# 圆形选区状态持久化路径
+_CIRCLE_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.circle_state.json')
+
+def _load_circle_state():
+    """启动时从本地文件恢复圆形选区状态"""
+    if not os.path.isfile(_CIRCLE_STATE_FILE):
+        return None
+    try:
+        with open(_CIRCLE_STATE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _save_circle_state(cx, cy, r):
+    """将圆形选区状态写入本地 JSON 文件"""
+    try:
+        data = {
+            'cx': cx,
+            'cy': cy,
+            'r': r,
+            'ts': time.time(),
+        }
+        with open(_CIRCLE_STATE_FILE, 'w') as f:
+            json.dump(data, f)
+        print(f"💾 圆形选区已保存: cx={cx:.4f}, cy={cy:.4f}, r={r:.4f}")
+        return True
+    except Exception as e:
+        print(f"[警告] 保存圆形选区失败: {e}")
+        return False
+
+# 启动时加载已有状态
+_saved_circle = _load_circle_state()
+if _saved_circle:
+    print(f"📍 已恢复圆形选区: cx={_saved_circle.get('cx')}, cy={_saved_circle.get('cy')}, r={_saved_circle.get('r')}")
+
 # 获取 web 目录绝对路径
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
 
@@ -1252,6 +1287,29 @@ def api_reset_history():
         'cleared_count': cleared,
         'was_locked': was_locked,
     })
+
+
+@app.route('/api/circle_state', methods=['GET', 'POST'])
+def api_circle_state():
+    """获取/保存 圆形选区状态 (cx, cy, r) 到服务器本地"""
+    if request.method == 'GET':
+        state = _load_circle_state()
+        if state:
+            return jsonify({'success': True, **state})
+        return jsonify({'success': False, 'error': 'No saved state'})
+
+    # POST: 保存状态
+    data = request.get_json(silent=True) or {}
+    try:
+        cx = float(data.get('cx', 0))
+        cy = float(data.get('cy', 0))
+        r = float(data.get('r', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid parameters'}), 400
+
+    if _save_circle_state(cx, cy, r):
+        return jsonify({'success': True, 'cx': cx, 'cy': cy, 'r': r})
+    return jsonify({'error': 'Save failed'}), 500
 
 
 @app.route('/api/result')

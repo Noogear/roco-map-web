@@ -661,6 +661,8 @@ async function toggleScreenAutoTrack() {
     screenAutoRunning = !screenAutoRunning;
     var btn = document.getElementById('stopScreenBtn');
     if (screenAutoRunning) {
+        // 保存圆形选区状态到服务器
+        await saveCircleState();
         // 尝试连接 WebSocket
         if (useWSMode && !TC.wsConnected) {
             try {
@@ -704,8 +706,29 @@ async function processImage() {
         if (cvs && cvs.style.display !== 'none') data = cvs.toDataURL('image/png');
     }
     if (!data) { TC.log('请先上传或选择小地图！'); return; }
+    // 保存圆形选区状态到服务器
+    await saveCircleState();
     TC.log('正在 SIFT 分析...');
     try { await TC.sendAndDisplay(data); } catch(err) { TC.log('错误: ' + err.message); console.error(err); }
+}
+
+// ========== 保存圆形选区状态 ==========
+async function saveCircleState() {
+    var sc = TC.selCircle;
+    if (!sc) return;
+    try {
+        var resp = await fetch('/api/circle_state', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cx: sc.cx, cy: sc.cy, r: sc.r })
+        });
+        var result = await resp.json();
+        if (result.success) {
+            console.log('圆形选区已保存:', sc.cx.toFixed(4), sc.cy.toFixed(4), sc.r.toFixed(4));
+        }
+    } catch(e) {
+        console.warn('保存圆形选区失败:', e.message);
+    }
 }
 
 // ========== 纯原生浏览器画中画 ==========
