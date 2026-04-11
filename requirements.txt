@@ -2,8 +2,8 @@ opencv-python
 numpy
 mss
 Pillow
-# torch      # 仅 main_ai.py 需要，直接安装会下载CPU版本，需要安装cuda下载GPU版本，不要下错
-# kornia     # 仅 main_ai.py 需要
+torch        # LoFTR AI 引擎依赖；CNB GPU 环境需提前安装 CUDA 版，见 README
+kornia       # LoFTR AI 引擎依赖
 requests
 flask      # main_ai_web.py 网页版需要
 flask-socketio>=5.3    # WebSocket 支持

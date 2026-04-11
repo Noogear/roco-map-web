@@ -12,8 +12,135 @@ import math
 import os
 import cv2
 import numpy as np
+from collections import deque
 from threading import Lock
 import config
+
+
+def _angular_diff(a, b):
+    """最短角度差 (带符号, -180~180)"""
+    d = (a - b) % 360
+    return d - 360 if d > 180 else d
+
+
+class _ArrowCache:
+    """
+    箭头检测运行时缓存：模板快速路径 + HSV 自适应学习 + 角度 EMA 平滑。
+    箭头形状/颜色/大小在游戏中固定，利用这一先验逐步提升检测成功率。
+    """
+
+    def __init__(self):
+        # 模板缓存
+        self.template_gray = None       # 上次成功的灰度箭头 patch
+        self.template_mask = None       # 对应的二值 mask (前景区域)
+        self.last_bbox = None           # (x1, y1, x2, y2) in minimap coords
+        self.hit_count = 0              # 连续模板命中次数
+        self.miss_streak = 0            # 连续检测失败次数
+
+        # HSV 自适应范围
+        self._hsv_lower = np.array([15, 120, 180], dtype=np.uint8)
+        self._hsv_upper = np.array([35, 255, 255], dtype=np.uint8)
+        self._learned_lower = None
+        self._learned_upper = None
+        self._hsv_samples = 0
+        self._hsv_learn_alpha = getattr(config, 'ARROW_HSV_LEARN_ALPHA', 0.1)
+
+        # 角度 EMA
+        self._ema_angle = None
+        self._angle_alpha = getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.4)
+
+    # ---------- 模板快速路径 ----------
+    def try_template_match(self, minimap_bgr):
+        """在上次位置附近用模板匹配快速检测箭头，返回 (cx, cy) 或 None"""
+        if self.template_gray is None or self.last_bbox is None:
+            return None
+
+        h, w = minimap_bgr.shape[:2]
+        pad = getattr(config, 'ARROW_ROI_PADDING', 15)
+        x1, y1, x2, y2 = self.last_bbox
+        rx1 = max(0, x1 - pad)
+        ry1 = max(0, y1 - pad)
+        rx2 = min(w, x2 + pad)
+        ry2 = min(h, y2 + pad)
+
+        roi = cv2.cvtColor(minimap_bgr[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2GRAY)
+        th, tw = self.template_gray.shape[:2]
+        if roi.shape[0] < th or roi.shape[1] < tw:
+            return None
+
+        threshold = getattr(config, 'ARROW_TEMPLATE_MATCH_THRESHOLD', 0.65)
+        res = cv2.matchTemplate(roi, self.template_gray, cv2.TM_CCOEFF_NORMED,
+                                mask=self.template_mask)
+        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+        if max_val >= threshold:
+            # 命中: 模板左上角 → 中心坐标(minimap 坐标系)
+            cx = rx1 + max_loc[0] + tw / 2.0
+            cy = ry1 + max_loc[1] + th / 2.0
+            self.hit_count += 1
+            self.miss_streak = 0
+            return cx, cy
+        return None
+
+    def update_template(self, minimap_bgr, mask, bbox):
+        """成功检测后更新模板缓存"""
+        x1, y1, x2, y2 = bbox
+        h, w = minimap_bgr.shape[:2]
+        pad = 3
+        x1p, y1p = max(0, x1 - pad), max(0, y1 - pad)
+        x2p, y2p = min(w, x2 + pad), min(h, y2 + pad)
+
+        patch = cv2.cvtColor(minimap_bgr[y1p:y2p, x1p:x2p], cv2.COLOR_BGR2GRAY)
+        patch_mask = mask[y1p:y2p, x1p:x2p]
+        if patch.size > 0 and patch_mask.size > 0:
+            self.template_gray = patch.copy()
+            self.template_mask = patch_mask.copy()
+            self.last_bbox = (x1p, y1p, x2p, y2p)
+
+    # ---------- HSV 自适应学习 ----------
+    def get_hsv_bounds(self):
+        """返回当前使用的 HSV 阈值 (lower, upper)"""
+        if self._learned_lower is not None and self._hsv_samples >= 20:
+            return self._learned_lower.copy(), self._learned_upper.copy()
+        return self._hsv_lower.copy(), self._hsv_upper.copy()
+
+    def learn_hsv(self, hsv_img, mask):
+        """从成功检测的像素中学习 HSV 范围"""
+        pixels = hsv_img[mask > 0]
+        if len(pixels) < 10:
+            return
+        h_min, s_min, v_min = pixels.min(axis=0)
+        h_max, s_max, v_max = pixels.max(axis=0)
+        # 留 margin 防止过拟合
+        margin = np.array([3, 15, 15], dtype=np.float32)
+        obs_lower = np.clip(np.array([h_min, s_min, v_min], dtype=np.float32) - margin, 0, 255)
+        obs_upper = np.clip(np.array([h_max, s_max, v_max], dtype=np.float32) + margin, 0, 255)
+
+        alpha = self._hsv_learn_alpha
+        if self._learned_lower is None:
+            self._learned_lower = obs_lower
+            self._learned_upper = obs_upper
+        else:
+            self._learned_lower = (1 - alpha) * self._learned_lower + alpha * obs_lower
+            self._learned_upper = (1 - alpha) * self._learned_upper + alpha * obs_upper
+        self._hsv_samples += 1
+
+    # ---------- 角度 EMA ----------
+    def smooth_angle(self, raw_angle):
+        """圆形 EMA 平滑角度"""
+        if self._ema_angle is None:
+            self._ema_angle = raw_angle
+            return raw_angle
+        diff = _angular_diff(raw_angle, self._ema_angle)
+        self._ema_angle = (self._ema_angle + self._angle_alpha * diff) % 360
+        return self._ema_angle
+
+    def record_miss(self):
+        """检测失败时更新状态"""
+        self.miss_streak += 1
+        self.hit_count = 0
+        if self.miss_streak > 10:
+            self._ema_angle = None  # 过久未检测到 → 重置角度平滑
 
 
 class SIFTMapTracker:
@@ -21,11 +148,24 @@ class SIFTMapTracker:
 
     def __init__(self):
         print("正在初始化 SIFT 引擎...")
-        self.clahe = cv2.createCLAHE(clipLimit=config.SIFT_CLAHE_LIMIT, tileGridSize=(8, 8))
-        self.sift = cv2.SIFT_create()
+        # 自适应 CLAHE：3 档预创建（低/中/高纹理场景）
+        _cl_low = getattr(config, 'CLAHE_LIMIT_LOW_TEXTURE', 5.0)
+        _cl_mid = config.SIFT_CLAHE_LIMIT
+        _cl_high = getattr(config, 'CLAHE_LIMIT_HIGH_TEXTURE', 2.0)
+        self._clahe_low  = cv2.createCLAHE(clipLimit=_cl_low,  tileGridSize=(8, 8))
+        self._clahe_mid  = cv2.createCLAHE(clipLimit=_cl_mid,  tileGridSize=(8, 8))
+        self._clahe_high = cv2.createCLAHE(clipLimit=_cl_high, tileGridSize=(8, 8))
+        self.clahe = self._clahe_mid  # 默认（大地图特征提取用中档）
+        self._clahe_low_thresh  = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
+        self._clahe_high_thresh = getattr(config, 'CLAHE_HIGH_TEXTURE_THRESHOLD', 60)
+        # SIFT 检测器：降低 contrastThreshold 提取更多弱纹理特征
+        _sift_contrast = getattr(config, 'SIFT_CONTRAST_THRESHOLD', 0.02)
+        self.sift = cv2.SIFT_create(contrastThreshold=_sift_contrast)
 
         # 上一帧箭头角度（用于箭头检测失败时降级）
         self._last_arrow_angle = 0.0
+        # 箭头运行时缓存（模板快速路径 + HSV 自适应 + 角度平滑）
+        self._arrow_cache = _ArrowCache()
 
         # 线程锁（防止并发请求导致 kp_local / flann 竞态）
         self._lock = Lock()
@@ -36,6 +176,7 @@ class SIFTMapTracker:
         self.map_height, self.map_width = logic_map_bgr.shape[:2]
 
         logic_map_gray = cv2.cvtColor(logic_map_bgr, cv2.COLOR_BGR2GRAY)
+        self._logic_map_gray = logic_map_gray  # 留存灰度大地图（ORB 局部匹配用）
         logic_map_gray = self.clahe.apply(logic_map_gray)
         print("正在提取大地图 SIFT 特征点...")
         self.kp_big_all, self.des_big_all = self.sift.detectAndCompute(logic_map_gray, None)
@@ -60,11 +201,38 @@ class SIFTMapTracker:
         self.LOCAL_FAIL_LIMIT = getattr(config, 'LOCAL_FAIL_LIMIT', 5)
         self.JUMP_THRESHOLD = getattr(config, 'SIFT_JUMP_THRESHOLD', 500)
 
+        # ORB 快速备份引擎（SIFT 失败时的轻量候补）
+        _orb_enabled = getattr(config, 'ORB_BACKUP_ENABLED', True)
+        if _orb_enabled:
+            _orb_n = getattr(config, 'ORB_NFEATURES', 500)
+            self.orb = cv2.ORB_create(nfeatures=_orb_n)
+            self.orb_bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        else:
+            self.orb = None
+            self.orb_bf = None
+        # ORB 局部描述子（在 _switch_to_local 时一并构建）
+        self.orb_local_kp = None
+        self.orb_local_des = None
+
         # 惯性导航状态
         self.last_x = None
         self.last_y = None
         self.lost_frames = 0
         self._sift_confused = False  # scale 异常时标记，供混合引擎快速升级
+
+        # === 状态冻结（BLOCK 期间保持局部索引 + 坐标，恢复时直接复用）===
+        self._frozen = False
+        self._frozen_last_x = None
+        self._frozen_last_y = None
+        self._frozen_using_local = False
+        self._frozen_kp_local = None
+        self._frozen_des_local = None
+        self._frozen_flann_local = None
+        self._frozen_orb_local_kp = None
+        self._frozen_orb_local_des = None
+        import time as _frozen_time
+        self._frozen_time_mod = _frozen_time
+        self._frozen_at = 0.0
 
         # 性能监控
         import time as _time
@@ -77,6 +245,81 @@ class SIFTMapTracker:
         self._lock_search_radius = getattr(config, 'COORD_LOCK_SEARCH_RADIUS', 400)
         self._lock_max_retries = getattr(config, 'COORD_LOCK_MAX_RETRIES', 5)
         self._lock_min_to_activate = getattr(config, 'COORD_LOCK_MIN_HISTORY_TO_ACTIVATE', 15)
+
+    # ------------------------------------------
+    # 状态冻结 / 恢复（战斗/背包期间保持局部索引+坐标）
+    # ------------------------------------------
+    def _freeze_state(self):
+        """进入 BLOCK 时冻结当前状态，避免局部索引/坐标在丢帧中被破坏"""
+        if self._frozen:
+            return
+        self._frozen = True
+        self._frozen_last_x = self.last_x
+        self._frozen_last_y = self.last_y
+        self._frozen_using_local = self.using_local
+        if self.using_local:
+            self._frozen_kp_local = self.kp_local
+            self._frozen_des_local = self.des_local
+            self._frozen_flann_local = self.flann_local
+            self._frozen_orb_local_kp = self.orb_local_kp
+            self._frozen_orb_local_des = self.orb_local_des
+        self._frozen_at = self._frozen_time_mod.time()
+        if self._frozen_last_x is not None:
+            print(f"❄️ 状态冻结 ({self._frozen_last_x}, {self._frozen_last_y}) "
+                  f"局部={'✓' if self.using_local else '✗'}")
+
+    def _thaw_state(self):
+        """小地图重现时恢复冻结的状态，跳过全局搜索冷启动"""
+        if not self._frozen:
+            return
+        self._frozen = False
+        elapsed = self._frozen_time_mod.time() - self._frozen_at
+        timeout = getattr(config, 'FREEZE_TIMEOUT', 30.0)
+
+        if elapsed > timeout:
+            print(f"🔥 冻结已超时 ({elapsed:.0f}s > {timeout}s)，不恢复旧状态")
+            return
+
+        # 恢复坐标
+        if self._frozen_last_x is not None:
+            self.last_x = self._frozen_last_x
+            self.last_y = self._frozen_last_y
+        # 恢复局部索引
+        if self._frozen_using_local and self._frozen_flann_local is not None:
+            self.kp_local = self._frozen_kp_local
+            self.des_local = self._frozen_des_local
+            self.flann_local = self._frozen_flann_local
+            self.orb_local_kp = self._frozen_orb_local_kp
+            self.orb_local_des = self._frozen_orb_local_des
+            self.using_local = True
+        # 重置失败计数
+        self.lost_frames = 0
+        self.local_fail_count = 0
+        print(f"♻️ 状态恢复 ({self.last_x}, {self.last_y}) "
+              f"局部={'✓' if self.using_local else '✗'} 冻结时长={elapsed:.1f}s")
+
+    @property
+    def frozen(self):
+        return self._frozen
+
+    @property
+    def frozen_position(self):
+        """冻结期间的静态坐标（供 Kalman 暂停时使用）"""
+        if self._frozen and self._frozen_last_x is not None:
+            return self._frozen_last_x, self._frozen_last_y
+        return None
+
+    # ------------------------------------------
+    # 自适应 CLAHE 选择
+    # ------------------------------------------
+    def _adaptive_clahe(self, gray):
+        """根据纹理标准差选择合适的 CLAHE 档位"""
+        std = np.std(gray)
+        if std < self._clahe_low_thresh:
+            return self._clahe_low.apply(gray)
+        elif std > self._clahe_high_thresh:
+            return self._clahe_high.apply(gray)
+        return self._clahe_mid.apply(gray)
 
     # ------------------------------------------
     # 构建/重建 FLANN 索引
@@ -95,6 +338,12 @@ class SIFTMapTracker:
     # ------------------------------------------
     def _switch_to_local(self, cx, cy):
         """以 (cx, cy) 为中心，提取半径内的特征点，重建局部 FLANN"""
+        # 静止优化：中心未显著移动时跳过重建（节省 ~5-15ms/帧）
+        if self.using_local and hasattr(self, '_local_center'):
+            dx = abs(cx - self._local_center[0])
+            dy = abs(cy - self._local_center[1])
+            if dx + dy < self.SEARCH_RADIUS * 0.3:
+                return
         r = self.SEARCH_RADIUS
         dx = np.abs(self.kp_coords[:, 0] - cx)
         dy = np.abs(self.kp_coords[:, 1] - cy)
@@ -109,6 +358,21 @@ class SIFTMapTracker:
         self.flann_local = self._create_flann(self.des_local)
         self.using_local = True
         self.local_fail_count = 0
+        self._local_center = (cx, cy)
+
+        # 一并构建 ORB 局部描述子
+        if self.orb is not None:
+            try:
+                local_gray_kps = [cv2.KeyPoint(x=self.kp_coords[i][0], y=self.kp_coords[i][1], size=31)
+                                  for i in indices]
+                # ORB 在已知位置上 compute 描述子（用大地图灰度图的局部区域）
+                # 但大地图灰度图未持久化，改用 ORB detectAndCompute 在局部区域
+                # 简化方案：用 SIFT 局部关键点位置直接构建 ORB 的搜索空间标记
+                self.orb_local_kp = local_gray_kps
+                self.orb_local_des = None  # 延迟到实际 ORB 匹配时再计算
+            except Exception:
+                self.orb_local_kp = None
+                self.orb_local_des = None
 
     # ------------------------------------------
     # 回退到全局搜索模式
@@ -117,6 +381,7 @@ class SIFTMapTracker:
         """回退全局（全局 FLANN 常驻，无需重建）"""
         self.using_local = False
         self.local_fail_count = 0
+        self._local_center = None
         print(f"🌍 已切换到 全局 搜索模式 | 特征点: {len(self.kp_big_all)} | lost: {self.lost_frames}")
 
     # ------------------------------------------
@@ -153,9 +418,9 @@ class SIFTMapTracker:
         r = self._lock_search_radius
 
         minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
-        minimap_gray = self.clahe.apply(minimap_gray)
+        minimap_gray = self._adaptive_clahe(minimap_gray)
         h_mm, w_mm = minimap_gray.shape[:2]
-        circ_mask = self._make_circular_mask(h_mm, w_mm)
+        circ_mask = self._get_circular_mask(h_mm, w_mm)
         kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, circ_mask)
 
         if des_mini is None or len(kp_mini) < 2:
@@ -255,21 +520,32 @@ class SIFTMapTracker:
     # ------------------------------------------
     # 箭头检测：从圆形小地图中提取玩家箭头中心坐标
     # ------------------------------------------
-    @staticmethod
-    def _detect_arrow_center(minimap_bgr):
+    def _detect_arrow_center(self, minimap_bgr):
         """
         在小地图图像中检测黄色/橙色箭头，返回 (cx, cy, angle) 或 None。
-        使用 HSV 颜色范围 + 形态学过滤 + 白色描边凸包方向分析。
-        angle: 箭头朝向角度（度），0=朝上，顺时针增加
+        两阶段检测：
+          1. 快速路径: 模板匹配（cached patch + 小 ROI）→ ~0.3ms
+          2. 完整路径: HSV + 形态学 + 凸包方向 → ~1.5ms
+        成功检测后更新缓存（模板/HSV范围/角度EMA），逐步提升成功率。
         """
         h, w = minimap_bgr.shape[:2]
         if h < 10 or w < 10:
             return None
 
-        hsv = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+        cache = self._arrow_cache
 
-        lower = np.array([15, 120, 180])
-        upper = np.array([35, 255, 255])
+        # === 快速路径：模板匹配 ===
+        tmpl_hit = cache.try_template_match(minimap_bgr)
+        if tmpl_hit is not None:
+            cx, cy = tmpl_hit
+            # 快速路径只得到位置，角度用小 ROI 凸包计算
+            angle = self._compute_angle_from_region(minimap_bgr, cx, cy, cache)
+            angle = cache.smooth_angle(angle)
+            return (float(cx), float(cy), float(angle))
+
+        # === 完整路径：HSV 颜色检测 ===
+        hsv = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+        lower, upper = cache.get_hsv_bounds()
         mask = cv2.inRange(hsv, lower, upper)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -278,20 +554,37 @@ class SIFTMapTracker:
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
+            cache.record_miss()
             return None
 
         largest = max(contours, key=cv2.contourArea)
         if cv2.contourArea(largest) < 20:
+            cache.record_miss()
             return None
 
-        M = cv2.moments(largest)
-        if M['m00'] < 1e-6:
+        M_moments = cv2.moments(largest)
+        if M_moments['m00'] < 1e-6:
+            cache.record_miss()
             return None
 
-        cx = M['m10'] / M['m00']
-        cy = M['m01'] / M['m00']
+        cx = M_moments['m10'] / M_moments['m00']
+        cy = M_moments['m01'] / M_moments['m00']
 
-        angle = 0.0
+        # 角度计算：白色描边 + 凸包方向
+        angle = self._compute_angle_full(minimap_bgr, mask, cx, cy)
+        angle = cache.smooth_angle(angle)
+
+        # 更新缓存
+        bx, by, bw, bh = cv2.boundingRect(largest)
+        cache.update_template(minimap_bgr, mask, (bx, by, bx + bw, by + bh))
+        cache.learn_hsv(hsv, mask)
+        cache.miss_streak = 0
+
+        return (float(cx), float(cy), float(angle))
+
+    @staticmethod
+    def _compute_angle_full(minimap_bgr, mask, cx, cy):
+        """完整角度计算：白色描边 + 凸包尖端方向"""
         try:
             hsv_full = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
             white_mask = cv2.inRange(hsv_full, np.array([0, 0, 200]), np.array([180, 80, 255]))
@@ -307,11 +600,30 @@ class SIFTMapTracker:
                 centroid = np.array([cx, cy])
                 tip_idx = np.argmax(np.sum((hull - centroid) ** 2, axis=1))
                 dx, dy = hull[tip_idx] - centroid
-                angle = -(math.degrees(math.atan2(dy, dx)) - 90) % 360
+                return -(math.degrees(math.atan2(dy, dx)) - 90) % 360
         except Exception:
             pass
+        return 0.0
 
-        return (float(cx), float(cy), float(angle))
+    def _compute_angle_from_region(self, minimap_bgr, cx, cy, cache):
+        """快速路径角度：在箭头附近小区域做凸包方向分析"""
+        h, w = minimap_bgr.shape[:2]
+        pad = getattr(config, 'ARROW_ROI_PADDING', 15) + 5
+        x1, y1 = max(0, int(cx) - pad), max(0, int(cy) - pad)
+        x2, y2 = min(w, int(cx) + pad), min(h, int(cy) + pad)
+        roi = minimap_bgr[y1:y2, x1:x2]
+        if roi.size < 100:
+            return cache._ema_angle if cache._ema_angle is not None else 0.0
+
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        lower, upper = cache.get_hsv_bounds()
+        mask_roi = cv2.inRange(hsv_roi, lower, upper)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_roi = cv2.morphologyEx(mask_roi, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        local_cx = cx - x1
+        local_cy = cy - y1
+        return self._compute_angle_full(roi, mask_roi, local_cx, local_cy)
 
     @staticmethod
     def _draw_arrow_marker(img_bgr, cx, cy, size=None, angle=0):
@@ -391,6 +703,86 @@ class SIFTMapTracker:
         img_bgr[dy1:dy2, dx1:dx2] = blended.astype(np.uint8)
 
     # ------------------------------------------
+    # ORB 快速备份匹配（局部模式下 SIFT 失败时的候补）
+    # ------------------------------------------
+    def _orb_local_match(self, minimap_bgr, minimap_gray):
+        """
+        ORB 备份：在 SIFT 局部匹配失败后尝试 ORB 匹配。
+        比 SIFT 快 ~3x，精度略低但足以维持跟踪连续性。
+        返回 (tx, ty) 或 None。
+        """
+        if not self.using_local or self.orb is None:
+            return None
+
+        try:
+            h_mm, w_mm = minimap_gray.shape[:2]
+            circ_mask = self._get_circular_mask(h_mm, w_mm)
+            kp_orb_mini, des_orb_mini = self.orb.detectAndCompute(minimap_gray, circ_mask)
+            if des_orb_mini is None or len(kp_orb_mini) < 3:
+                return None
+
+            # 在局部区域的大地图上做 ORB 检测
+            if self.last_x is None or self.last_y is None:
+                return None
+            r = self.SEARCH_RADIUS
+            lx, ly = self.last_x, self.last_y
+            x1 = max(0, lx - r)
+            y1 = max(0, ly - r)
+            x2 = min(self.map_width, lx + r)
+            y2 = min(self.map_height, ly + r)
+
+            # 大地图局部灰度（从预存灰度大地图裁剪）
+            local_gray = self._logic_map_gray[y1:y2, x1:x2]
+            local_gray = self._adaptive_clahe(local_gray)
+
+            kp_orb_map, des_orb_map = self.orb.detectAndCompute(local_gray, None)
+            if des_orb_map is None or len(kp_orb_map) < 5:
+                return None
+
+            matches = self.orb_bf.knnMatch(des_orb_mini, des_orb_map, k=2)
+            good = []
+            for m_n in matches:
+                if len(m_n) == 2:
+                    m, n = m_n
+                    if m.distance < 0.75 * n.distance:
+                        good.append(m)
+
+            if len(good) < 5:
+                return None
+
+            src_pts = np.float32([kp_orb_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp_orb_map[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 10.0)
+            if M is None:
+                return None
+            inlier_count = int(mask.sum()) if mask is not None else 0
+            if inlier_count < 4:
+                return None
+
+            # 缩放合理性
+            sx_h = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
+            sy_h = np.sqrt(M[0, 1] ** 2 + M[1, 1] ** 2)
+            avg_scale = (sx_h + sy_h) / 2
+            if avg_scale > 5.0 or avg_scale < 0.2:
+                return None
+
+            center_pt = np.float32([[[w_mm / 2.0, h_mm / 2.0]]])
+            dst_center = cv2.perspectiveTransform(center_pt, M)
+            tx = int(dst_center[0][0][0]) + x1  # 局部→全局坐标
+            ty = int(dst_center[0][0][1]) + y1
+
+            if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
+                # 跳变检查
+                jump = abs(tx - lx) + abs(ty - ly)
+                if jump < 500:
+                    print(f"[ORB备份] ✅ 匹配成功 ({tx},{ty}) inliers={inlier_count}")
+                    return tx, ty
+        except Exception as e:
+            pass
+        return None
+
+    # ------------------------------------------
     # 核心匹配（两轮搜索 + 跳变过滤）
     # ------------------------------------------
     def match(self, minimap_bgr):
@@ -406,6 +798,18 @@ class SIFTMapTracker:
         cv2.circle(mask, (cx, cy), r, 255, -1)
         return mask
 
+    def _get_circular_mask(self, h, w):
+        """带缓存的圆形掩码（小地图尺寸校准后固定，避免每帧重建）"""
+        key = (h, w)
+        if not hasattr(self, '_circ_mask_cache'):
+            self._circ_mask_cache = {}
+        cached = self._circ_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        mask = self._make_circular_mask(h, w)
+        self._circ_mask_cache[key] = mask
+        return mask
+
     def _match_impl(self, minimap_bgr):
         t_start = self._perf_time.perf_counter()
         found = False
@@ -416,11 +820,11 @@ class SIFTMapTracker:
         self._sift_confused = False  # 每帧重置
 
         minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
-        minimap_gray = self.clahe.apply(minimap_gray)
+        minimap_gray = self._adaptive_clahe(minimap_gray)
 
         # 圆形 mask：过滤圆形小地图四角噪声特征点
         h_mm, w_mm = minimap_gray.shape[:2]
-        circ_mask = self._make_circular_mask(h_mm, w_mm)
+        circ_mask = self._get_circular_mask(h_mm, w_mm)
         kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, circ_mask)
 
         if des_mini is not None and len(kp_mini) >= 2:
@@ -518,23 +922,39 @@ class SIFTMapTracker:
             self._switch_to_local(center_x, center_y)
 
         else:
-            self.lost_frames += 1
+            # === ORB 快速备份：SIFT 失败 + 局部模式 → ORB 尝试挽救 ===
+            if (not found and self.using_local and self.orb is not None
+                    and des_mini is not None and len(kp_mini) >= 2):
+                orb_result = self._orb_local_match(minimap_bgr, minimap_gray)
+                if orb_result is not None:
+                    found = True
+                    center_x, center_y = orb_result
+                    match_quality = 0.5  # ORB 匹配质量标记为中等
+                    arrow_angle = self._last_arrow_angle
+                    self.last_x = center_x
+                    self.last_y = center_y
+                    self.lost_frames = 0
+                    self.local_fail_count = 0
+                    self._switch_to_local(center_x, center_y)
 
-            if self.using_local:
-                self.local_fail_count += 1
-                if self.local_fail_count >= self.LOCAL_FAIL_LIMIT:
-                    self._switch_to_global()
+            if not found:
+                self.lost_frames += 1
 
-            if self.last_x is not None and self.lost_frames <= config.MAX_LOST_FRAMES:
-                found = True
-                center_x = self.last_x
-                center_y = self.last_y
-                is_inertial = True
-            elif self.lost_frames > config.MAX_LOST_FRAMES:
-                self.last_x = None
-                self.last_y = None
                 if self.using_local:
-                    self._switch_to_global()
+                    self.local_fail_count += 1
+                    if self.local_fail_count >= self.LOCAL_FAIL_LIMIT:
+                        self._switch_to_global()
+
+                if self.last_x is not None and self.lost_frames <= config.MAX_LOST_FRAMES:
+                    found = True
+                    center_x = self.last_x
+                    center_y = self.last_y
+                    is_inertial = True
+                elif self.lost_frames > config.MAX_LOST_FRAMES:
+                    self.last_x = None
+                    self.last_y = None
+                    if self.using_local:
+                        self._switch_to_global()
 
         # === 性能统计 ===
         t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000

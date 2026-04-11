@@ -13,14 +13,20 @@ $:
         image: docker.cnb.cool/wss/ai/mlsharp:latest
       runner:
        cpus: 6
+       gpus: 1
       services:
         - name: vscode
           options:
             onlyPreview: true
-            launch: uv run main_web.py cpu
+            launch: uv run main_web.py ai
             keepAliveTimeout: 3600000
             daemon: true
             backup: true
       stages:
+        - name: install-torch-cuda
+          script: |
+            uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 || true
+            uv pip install kornia || true
+            uv sync
         - name: ls
           script: ls -al

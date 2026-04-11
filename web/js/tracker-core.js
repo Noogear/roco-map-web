@@ -263,7 +263,8 @@ const TrackerCore = (() => {
         },
 
         /**
-         * 从屏幕流截取圆形选区图片 (JPEG dataURL，用于 HTTP 模式)
+         * 从屏幕流截取方形选区图片 (JPEG dataURL，用于 HTTP 模式)
+         * 方形截取 + 后端 HoughCircles 圆检测，自动判断小地图是否存在
          * @returns {string|null} dataURL 或 null
          */
         captureScreenImg() {
@@ -277,20 +278,20 @@ const TrackerCore = (() => {
             var sc = S.selCircle;
             var bs = Math.min(vw, vh);
             var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
-            var sz = Math.max(10, Math.round(r * 2));
-            var rx = Math.round(cx - r), ry = Math.round(cy - r);
+            var margin = 1.4;
+            var sz = Math.max(10, Math.round(r * 2 * margin));
+            var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
 
             var c = document.createElement('canvas');
             c.width = sz; c.height = sz;
             var ctx = c.getContext('2d');
-            ctx.beginPath(); ctx.arc(sz / 2, sz / 2, sz / 2, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
             return c.toDataURL('image/jpeg', 0.80);
         },
 
         /**
-         * 从屏幕流截取圆形选区图片 (JPEG Blob，用于 Socket.IO 二进制模式)
-         * 使用 JPEG 代替 PNG，上传体积减少约 90%，识别精度不受影响
+         * 从屏幕流截取方形选区图片 (JPEG Blob，用于 Socket.IO 二进制模式)
+         * 方形截取 + 后端 HoughCircles 圆检测，自动判断小地图是否存在
          * @returns {Promise<Blob|null>}
          */
         captureScreenImgBlob() {
@@ -304,13 +305,13 @@ const TrackerCore = (() => {
             var sc = S.selCircle;
             var bs = Math.min(vw, vh);
             var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
-            var sz = Math.max(10, Math.round(r * 2));
-            var rx = Math.round(cx - r), ry = Math.round(cy - r);
+            var margin = 1.4;
+            var sz = Math.max(10, Math.round(r * 2 * margin));
+            var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
 
             var c = document.createElement('canvas');
             c.width = sz; c.height = sz;
             var ctx = c.getContext('2d');
-            ctx.beginPath(); ctx.arc(sz / 2, sz / 2, sz / 2, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
 
             return new Promise(function(resolve) {
@@ -412,6 +413,7 @@ const TrackerCore = (() => {
                                 found: !!status.f,
                                 matches: status.c,
                                 match_quality: status.q || 0,
+                                arrow_angle: status.a || 0,
                                 coord_lock: !!status.l,
                                 hybrid_busy: !!status.h,
                             }
