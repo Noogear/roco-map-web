@@ -68,6 +68,70 @@
             transition:left .05s linear,top .05s linear,opacity .15s;opacity:.25;
         }
 
+        /* ========== 路线绘制层 ========== */
+        #routeLayer{
+            position:absolute;top:0;left:0;width:100%;height:100%;
+            pointer-events:none;z-index:8;overflow:visible;
+        }
+        #routeLayer .route-line{
+            fill:none;stroke:#FFC448;stroke-width:3;
+            stroke-linecap:round;stroke-linejoin:round;
+            vector-effect:non-scaling-stroke;
+        }
+        #routeLayer .route-point{
+            fill:#FFC448;stroke:#fff;stroke-width:2;
+            vector-effect:non-scaling-stroke;
+        }
+        #routeLayer .route-point.passed{fill:#787878;stroke:#dcdcdc}
+        #routeLayer .route-point.active{fill:#78E650;stroke:#fff}
+        #routeLayer .route-label{
+            font-size:11px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+            fill:#fff;paint-order:stroke;stroke:#000;stroke-width:3;
+            pointer-events:none;text-anchor:start;
+        }
+
+        /* 路线管理面板 */
+        .route-panel{
+            position:fixed;top:52px;left:10px;z-index:100;
+            background:rgba(22,33,62,.95);border:1px solid rgba(0,212,255,.25);
+            border-radius:12px;padding:14px;min-width:240px;max-width:280px;
+            max-height:calc(100vh - 72px);overflow-y:auto;
+            box-shadow:0 8px 32px rgba(0,0,0,.5);
+            transition:transform .25s, opacity .25s;transform-origin:top left;
+        }
+        .route-panel.hidden{transform:translateX(-120%);opacity:0;pointer-events:none}
+        .route-panel h3{font-size:13px;color:#00d4ff;margin:0 0 10px;display:flex;align-items:center;gap:8px;white-space:nowrap}
+        .route-panel h3 .toggle-btn{margin-left:auto;background:none;border:none;color:#888;cursor:pointer;font-size:16px;line-height:1;padding:2px 4px;border-radius:4px}
+        .route-panel h3 .toggle-btn:hover{color:#00d4ff;background:rgba(0,212,255,.15)}
+        .rp-list{list-style:none;margin:0;padding:0}
+        .rp-item{
+            padding:7px 10px;margin-bottom:4px;border-radius:8px;
+            cursor:pointer;transition:all .15s;font-size:12px;
+            border:1px solid transparent;background:rgba(255,255,255,.04);
+            color:#ccc;display:flex;align-items:center;gap:8px;
+        }
+        .rp-item:hover{background:rgba(0,212,255,.12);border-color:rgba(0,212,255,.2);color:#eee}
+        .rp-item.selected{background:rgba(0,212,255,.18);border-color:#00d4ff;color:#fff}
+        .rp-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .rp-meta{font-size:10px;color:#666;white-space:nowrap}
+        .rp-loop{display:inline-block;padding:1px 6px;border-radius:8px;background:#5c6bc0;color:#fff;font-size:9px}
+        .panel-toolbar{display:flex;gap:6px;margin-top:8px}
+        .panel-toolbar button{
+            flex:1;padding:6px 8px;border:none;border-radius:6px;
+            cursor:pointer;font-size:11px;font-weight:600;transition:all .15s;
+        }
+        .pt-open{background:#00d4ff;color:#000}.pt-open:hover{background:#00b8e6}
+        .pt-close{background:#333;color:#aaa;border:1px solid #444}.pt-close:hover{background:#444}
+
+        /* 路线切换按钮 (顶栏) */
+        .route-toggle-btn{
+            background:transparent;border:1px solid rgba(0,212,255,.3);
+            color:#00d4ff;padding:3px 12px;border-radius:14px;cursor:pointer;
+            font-size:11px;font-weight:600;transition:all .2s;display:flex;align-items:center;gap:4px;white-space:nowrap
+        }
+        .route-toggle-btn:hover{background:rgba(0,212,255,.15)}
+        .route-toggle-btn.active{background:rgba(0,212,255,.2);border-color:#00d4ff}
+
         /* 地图容器 */
         .float-panel{
             position:fixed;bottom:16px;right:16px;z-index:100;
@@ -159,13 +223,15 @@
         <h1>&#127963; 大地图实时追踪</h1>
         <a href="/">&#8617; 返回控制台</a>
     </div>
-    <div class="status-inline">
-        <div class="coord-pair">
-            <div class="ci"><span class="lbl">X</span><span class="cx" id="sx">--</span></div>
-            <div class="ci"><span class="lbl">Y</span><span class="cy" id="sy">--</span></div>
-        </div>
-        <div class="sb sb-warn" id="ss">等待分析</div>
-        <!-- 缩放控件 -->
+        <div class="status-inline">
+            <div class="coord-pair">
+                <div class="ci"><span class="lbl">X</span><span class="cx" id="sx">--</span></div>
+                <div class="ci"><span class="lbl">Y</span><span class="cy" id="sy">--</span></div>
+            </div>
+            <div class="sb sb-warn" id="ss">等待分析</div>
+            <!-- 路线按钮 -->
+            <button class="route-toggle-btn" id="routeToggleBtn" onclick="toggleRoutePanel()" title="路线管理">&#8679; 路线</button>
+            <!-- 缩放控件 -->
         <div class="zoom-bar">
             <button class="zb" onclick="doZ(1.4)" title="放大">+</button>
             <div class="zl" id="zl">100%</div>
@@ -179,6 +245,8 @@
 <div id="mc">
     <div id="mw">
         <img id="mi" draggable="false" alt="map">
+        <!-- 路线 SVG 叠加层 -->
+        <svg id="routeLayer" xmlns="http://www.w3.org/2000/svg"></svg>
         <svg id="ch" width="44" height="44" viewBox="0 0 44 44">
             <line x1="22" y1="0" x2="22" y2="16" stroke="#00d4ff" stroke-width="1"/>
             <line x1="22" y1="28" x2="22" y2="44" stroke="#00d4ff" stroke-width="1"/>
@@ -228,6 +296,19 @@
     </div>
 </div>
 
+<!-- 路线管理面板 -->
+<div class="route-panel hidden" id="routePanel">
+    <h3>&#8679; 路线管理 <button class="toggle-btn" onclick="toggleRoutePanel()">&#10005;</button></h3>
+    <ul class="rp-list" id="routeList">
+        <li style="color:#666;font-size:12px;padding:8px 0">加载中...</li>
+    </ul>
+    <div class="panel-toolbar" style="display:none" id="routeToolbar">
+        <button class="pt-close" onclick="clearRoute()">清除路线</button>
+        <label class="fl" style="padding:5px 10px;font-size:11px" for="routeFileImport">导入JSON</label>
+        <input type="file" id="routeFileImport" accept=".json" style="display:none" onchange="importRouteFile(this)">
+    </div>
+</div>
+
 <video id="osVid" autoplay playsinline muted style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;"></video>
 
 <script src="js/tracker-core.js"></script>
@@ -259,6 +340,8 @@ TC.init({
             setDot(lx, ly, result.status.state || '', lf);
             updUIBig(result);
             if (autoRun && lf) ensureVis(lx, ly);
+            // 路线: 用玩家坐标更新进度
+            RouteModule.updateFromPlayer(lx, ly);
         }
     },
 });
@@ -269,9 +352,12 @@ async function init() {
     MI.src = mapInfo.display_map_url + '?t='+Date.now();
     await new Promise(function(ok,no){ MI.onload=ok; MI.onerror=function(){no(new Error('\u5730\u56fe\u52a0\u8f7d\u5931\u8d25'));}; });
     fitMap();
+    // 初始化路线 SVG 层的视口
+    var rl=$('routeLayer');
+    if(rl&&mapInfo)rl.setAttribute('viewBox','0 0 '+mapInfo.map_width+' '+mapInfo.map_height);
     setTimeout(function(){ $('ldMask').classList.add('hide'); },300);
     bindEv();
-    TC.log('\u5c31\u7eea - ' + mapInfo.map_width + 'x' + mapInfo.map_height);
+    TC.log('就绪 - ' + mapInfo.map_width + 'x' + mapInfo.map_height);
 }
 
 function fitMap() {
@@ -486,7 +572,352 @@ function setIM(m){
     $(m==='file'?'mf':'ms').classList.add('active');
 }
 
-// ========== 启动 ==========
+// ========== 路线模块 ==========
+var RouteModule = (function(){
+    var currentRoute = null;   // 当前加载的路线数据
+    var activeIndex = -1;      // 当前激活的 waypoint 索引 (-1=未开始)
+    var routeVisible = true;   // 路线是否显示
+
+    // 颜色常量（兼容 sift-map-tracker）
+    var COLORS = {
+        line: '#FFC448',       // 青蓝色线条
+        point: '#FFC448',      // 默认点
+        passed: '#787878',     // 已经过 - 灰色
+        active: '#78E650',     // 当前目标 - 绿色
+        labelFill: '#fff',
+        labelStroke: '#000'
+    };
+
+    /**
+     * 加载并渲染路线数据 (兼容 sift-map-tracker JSON 格式)
+     * @param {Object} data - {name, loop, points:[{x,y,label,radius}], notes}
+     */
+    function loadRoute(data) {
+        if (!data || !data.points || !data.points.length) return;
+        currentRoute = data;
+        activeIndex = -1;
+        render();
+        updateBtnState();
+        TC.log('已加载路线: ' + (data.name || '未命名') + ' (' + data.points.length + ' 点' + (data.loop ? ', 循环' : '') + ')');
+    }
+
+    /** 清除当前路线 */
+    function clear() {
+        currentRoute = null;
+        activeIndex = -1;
+        render();
+        updateBtnState();
+        // 取消选中状态
+        var items = document.querySelectorAll('#routeList .rp-item');
+        items.forEach(function(el){ el.classList.remove('selected'); });
+    }
+
+    /** 切换可见性 */
+    function toggleVisibility() {
+        routeVisible = !routeVisible;
+        var layer = $('routeLayer');
+        if (layer) layer.style.display = routeVisible ? '' : 'none';
+        return routeVisible;
+    }
+
+    /** 设置当前 waypoint 索引 (供外部调用，根据玩家位置推进) */
+    function setActiveIndex(idx) {
+        if (!currentRoute || idx === activeIndex) return;
+        activeIndex = idx;
+        render();
+    }
+
+    /** 计算两点间距离 */
+    function _dist(ax, ay, bx, by) { var dx=ax-bx, dy=ay-by; return Math.sqrt(dx*dx+dy*dy); }
+
+    /**
+     * 根据玩家坐标自动计算最近的 waypoint 并推进索引
+     *
+     * 算法 (兼容 sift-map-tracker RouteNavigator.update):
+     * 1. 初始状态(activeIndex<0): 找到最近的点作为起点
+     * 2. 正常导航: 检查玩家是否进入当前目标点的 radius 范围内
+     * 3. 进入范围则推进 activeIndex
+     * 4. 循环路线到达末尾时回到起点
+     */
+    function updateFromPlayer(px, py) {
+        if (!currentRoute || !currentRoute.points.length) return;
+        if (px == null || py == null) return;
+
+        var pts = currentRoute.points;
+        var len = pts.length;
+
+        // --- 阶段1: 初始定位 ---
+        // 还没开始导航时，找到离玩家最近的点作为起点
+        if (activeIndex < 0) {
+            var minDist = Infinity, bestIdx = 0;
+            for (var i = 0; i < len; i++) {
+                var d = _dist(px, py, pts[i].x, pts[i].y);
+                if (d < minDist) { minDist = d; bestIdx = i; }
+            }
+            activeIndex = bestIdx;
+            render();
+            return;
+        }
+
+        // --- 阶段2: 正常导航推进 ---
+
+        // 计算玩家到当前目标点的距离
+        var curPt = pts[activeIndex];
+        var distToActive = _dist(px, py, curPt.x, curPt.y);
+        var reachRadius = curPt.radius || 28;
+
+        // 检查是否进入当前目标点的判定范围
+        if (distToActive <= reachRadius) {
+            if (activeIndex < len - 1) {
+                // 推进到下一个点
+                activeIndex++;
+                render();
+                return;
+            } else if (currentRoute.loop && activeIndex >= len - 1) {
+                // 循环路线：回到起点
+                activeIndex = 0;
+                render();
+                return;
+            }
+        }
+
+        // 阶段3: 容错 — 如果玩家跳过了某个点（比如传送），
+        // 检查后面是否有更近的点，允许跳跃前进
+        for (var lookAhead = activeIndex + 1; lookAhead < len; lookAhead++) {
+            var dAhead = _dist(px, py, pts[lookAhead].x, pts[lookAhead].y);
+            if (dAhead <= (pts[lookAhead].radius || 28)) {
+                activeIndex = lookAhead;
+                render();
+                return;
+            }
+        }
+
+        // 阶段4: 回退检测 — 如果玩家往回走了很多，
+        // 且离前面的点更近，则回退 activeIndex（仅非循环路线）
+        if (!currentRoute.loop && activeIndex > 0) {
+            for (var lookBack = activeIndex - 1; lookBack >= 0; lookBack--) {
+                var dBack = _dist(px, py, pts[lookBack].x, pts[lookBack].y);
+                if (dBack <= (pts[lookBack].radius || 28)) {
+                    activeIndex = lookBack;
+                    render();
+                    return;
+                }
+                // 如果距离越来越远就停止回退搜索
+                if (lookBack < activeIndex - 3) break; // 最多回退3个点
+            }
+        }
+    }
+
+    /** 核心渲染函数: 在 SVG 层上绘制路线 */
+    function render() {
+        var svg = $('routeLayer');
+        if (!svg) return;
+        svg.innerHTML = '';
+
+        if (!currentRoute || !currentRoute.points.length) return;
+        if (!routeVisible) return;
+
+        var pts = currentRoute.points;
+        if (pts.length === 0) return;
+
+        // 设置 SVG 视口为地图尺寸
+        if (mapInfo) {
+            svg.setAttribute('viewBox', '0 0 ' + mapInfo.map_width + ' ' + mapInfo.map_height);
+        }
+
+        // 1. 绘制连线 (polyline 或 polygon)
+        if (pts.length >= 2) {
+            var pointsStr = pts.map(function(p){ return p.x + ',' + p.y; }).join(' ');
+            var polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+            polyline.setAttribute('points', pointsStr);
+            polyline.setAttribute('class', 'route-line');
+            svg.appendChild(polyline);
+        }
+
+        // 2. 绘制每个路径点
+        for (var i = 0; i < pts.length; i++) {
+            var p = pts[i];
+            var g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+            // 确定点样式
+            var isPassed = (activeIndex >= 0 && i < activeIndex);
+            var isActive = (activeIndex >= 0 && i === activeIndex);
+            var isCompleted = (activeIndex >= 0 && !currentRoute.loop && activeIndex >= pts.length);
+
+            var circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            circle.setAttribute('cx', p.x);
+            circle.setAttribute('cy', p.y);
+            circle.setAttribute('r', '7');
+            circle.setAttribute('class', 'route-point' + (isPassed ? ' passed' : '') + (isActive ? ' active' : ''));
+            g.appendChild(circle);
+
+            // 白色描边圆 (半径10)
+            var outline = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+            outline.setAttribute('cx', p.x);
+            outline.setAttribute('cy', p.y);
+            outline.setAttribute('r', '10');
+            outline.setAttribute('fill', 'none');
+            outline.setAttribute('stroke', isActive ? '#fff' : (isPassed ? '#dcdcdc' : 'rgba(255,255,255,.6)'));
+            outline.setAttribute('stroke-width', '2');
+            g.appendChild(outline);
+
+            // 半径指示圈 (淡色)
+            var rad = p.radius || 28;
+            if (rad > 0) {
+                var radCircle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+                radCircle.setAttribute('cx', p.x);
+                radCircle.setAttribute('cy', p.y);
+                radCircle.setAttribute('r', String(rad));
+                radCircle.setAttribute('fill', 'none');
+                radCircle.setAttribute('stroke', isActive ? 'rgba(120,230,80,.25)' : 'rgba(255,196,72,.15)');
+                radCircle.setAttribute('stroke-width', '1');
+                radCircle.setAttribute('stroke-dasharray', '4,4');
+                g.appendChild(radCircle);
+            }
+
+            // 标签文本
+            var lbl = p.label || ('节点 ' + (i + 1));
+            var text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+            text.setAttribute('x', p.x + 14);
+            text.setAttribute('y', p.y + 4);
+            text.setAttribute('class', 'route-label');
+            text.textContent = lbl;
+            g.appendChild(text);
+
+            svg.appendChild(g);
+        }
+    }
+
+    /** 更新顶栏按钮状态 */
+    function updateBtnState() {
+        var btn = $('routeToggleBtn');
+        if (!btn) return;
+        if (currentRoute) {
+            btn.classList.add('active');
+            btn.innerHTML = '&#10003; ' + (currentRoute.name || '已加载').substring(0, 8);
+            btn.title = (currentRoute.name || '') + ' (' + currentRoute.points.length + ' 点)';
+        } else {
+            btn.classList.remove('active');
+            btn.innerHTML = '&#8679; 路线';
+            btn.title = '路线管理';
+        }
+        // 显示/隐藏工具栏
+        var tb = $('routeToolbar');
+        if (tb) tb.style.display = currentRoute ? 'flex' : 'none';
+    }
+
+    /** 获取当前路线信息 */
+    function getInfo() {
+        if (!currentRoute) return null;
+        return {
+            name: currentRoute.name,
+            loop: currentRoute.loop,
+            totalPoints: currentRoute.points.length,
+            activeIndex: activeIndex,
+            completed: activeIndex >= 0 && !currentRoute.loop && activeIndex >= currentRoute.points.length,
+        };
+    }
+
+    return {
+        load: loadRoute,
+        clear: clear,
+        toggleVisibility: toggleVisibility,
+        setActiveIndex: setActiveIndex,
+        updateFromPlayer: updateFromPlayer,
+        render: render,
+        getInfo: getInfo,
+        get currentRoute(){return currentRoute;},
+        get activeIndex(){return activeIndex;}
+    };
+})();
+
+/** 加载远程路线列表 */
+async function loadRouteList(){
+    try {
+        var resp = await fetch('/api/routes');
+        var routes = await resp.json();
+        var listEl = $('routeList');
+        if (!listEl) return;
+        listEl.innerHTML = '';
+        if (routes.length === 0) {
+            listEl.innerHTML = '<li style="color:#666;font-size:12px;padding:8px 0">暂无路线文件</li>';
+            return;
+        }
+        routes.forEach(function(r){
+            var li = document.createElement('li');
+            li.className = 'rp-item';
+            li.dataset.filename = r.filename;
+            li.innerHTML =
+                '<span class="rp-name">' + escapeHtml(r.name) + '</span>' +
+                (r.loop ? '<span class="rp-loop">循环</span>' : '') +
+                '<span class="rp-meta">' + r.point_count + '点</span>';
+            li.onclick = function(){ selectRoute(this); };
+            listEl.appendChild(li);
+        });
+    } catch(e){
+        console.error('加载路线列表失败:', e);
+    }
+}
+
+/** 选中并加载单个路线 */
+async function selectRoute(liEl){
+    var filename = liEl.dataset.filename;
+    if(!filename) return;
+
+    // UI 选中效果
+    document.querySelectorAll('#routeList .rp-item').forEach(function(e){e.classList.remove('selected');});
+    liEl.classList.add('selected');
+
+    try{
+        var resp = await fetch('/api/routes/' + encodeURIComponent(filename));
+        var data = await resp.json();
+        RouteModule.load(data);
+        // 自动关闭面板
+        // $('routePanel').classList.add('hidden');
+    }catch(e){
+        TC.log('加载路线失败: '+e.message);
+    }
+}
+
+/** 清除当前路线 */
+function clearRoute(){
+    RouteModule.clear();
+    TC.log('已清除路线');
+}
+
+/** 导入本地 JSON 路线文件 */
+function importRouteFile(input){
+    var file = input.files[0];
+    if(!file) return;
+    var reader = new FileReader();
+    reader.onload = function(e){
+        try{
+            var data = JSON.parse(e.target.result);
+            data.name = data.name || file.name.replace('.json','');
+            RouteModule.load(data);
+            TC.log('已导入: '+(data.name||file.name));
+        }catch(err){
+            TC.log('JSON 解析失败: '+err.message);
+        }
+    };
+    reader.readAsText(file);
+    input.value = ''; // reset 以便重复导入同一文件
+}
+
+/** 切换路线面板 */
+function toggleRoutePanel(){
+    var panel=$('routePanel'),btn=$('routeToggleBtn');
+    panel.classList.toggle('hidden');
+    if(!panel.classList.contains('hidden')){
+        loadRouteList(); // 打开时刷新列表
+    }
+    if(btn)btn.classList.toggle('active',!panel.classList.contains('hidden'));
+}
+
+/** HTML 转义 */
+function escapeHtml(str){
+    var d=document.createElement('div');d.textContent=str;return d.innerHTML;
+}
 init();
 </script>
 </body>

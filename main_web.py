@@ -30,6 +30,34 @@ from flask_socketio import SocketIO, emit
 from tracker_core import AIMapTrackerWeb
 
 
+# ==================== 路线文件管理 ====================
+
+_ROUTES_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'sift-map-tracker', 'routes'))
+
+
+def _get_route_files():
+    """扫描 routes 目录，返回可用的路线文件列表"""
+    routes = []
+    if not os.path.isdir(_ROUTES_DIR):
+        return routes
+    for f in sorted(os.listdir(_ROUTES_DIR)):
+        if f.lower().endswith('.json'):
+            routes.append(f)
+    return routes
+
+
+def _load_route_data(filename):
+    """加载单个路线 JSON 文件"""
+    filepath = os.path.join(_ROUTES_DIR, filename)
+    if not os.path.isfile(filepath):
+        return None
+    try:
+        with open(filepath, 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
 # 解析启动参数: python main_web.py [cpu|sift|ai|loftr]
 _START_MODE = (sys.argv[1].lower() if len(sys.argv) > 1 else 'ai')
 _SIFT_ONLY = _START_MODE in ('cpu', 'sift')
@@ -260,6 +288,31 @@ def get_result():
     return jsonify({'error': 'No result yet'}), 404
 
 
+@app.route('/api/latest_frame')
+def get_latest_frame():
+    """获取最新渲染的地图帧（JPEG 二进制）- 供外部悬浮窗使用"""
+    # 优先返回缓存的 JPEG 字节
+    if tracker.latest_result_jpeg:
+        return send_file(
+            BytesIO(tracker.latest_result_jpeg),
+            mimetype='image/jpeg',
+        )
+    # 如果有 base64 结果，尝试解码
+    if tracker.latest_result_image:
+        try:
+            b64 = tracker.latest_result_image
+            if ',' in b64:
+                b64 = b64.split(',', 1)[1]
+            jpeg_bytes = base64.b64decode(b64)
+            return send_file(
+                BytesIO(jpeg_bytes),
+                mimetype='image/jpeg',
+            )
+        except Exception:
+            pass
+    return jsonify({'error': 'No frame available yet'}), 404
+
+
 @app.route('/api/process')
 def process():
     """手动触发一次处理（用于文件模式）"""
@@ -270,6 +323,39 @@ def process():
             'status': tracker.latest_status,
         })
     return jsonify({'error': 'No minimap set'}), 400
+
+
+# ==================== 路线 API ====================
+
+@app.route('/api/routes')
+def api_list_routes():
+    """列出所有可用路线文件"""
+    files = _get_route_files()
+    routes = []
+    for f in files:
+        data = _load_route_data(f)
+        if data:
+            routes.append({
+                'filename': f,
+                'name': data.get('name', f),
+                'loop': data.get('loop', False),
+                'point_count': len(data.get('points', [])),
+            })
+    return jsonify(routes)
+
+
+@app.route('/api/routes/<path:filename>')
+def api_get_route(filename):
+    """获取单个路线的完整数据"""
+    # 安全检查：防止路径穿越
+    safe_name = os.path.basename(filename)
+    if not safe_name.endswith('.json'):
+        return jsonify({'error': 'Only JSON files allowed'}), 400
+    data = _load_route_data(safe_name)
+    if data is None:
+        return jsonify({'error': 'Route not found'}), 404
+    data['filename'] = safe_name
+    return jsonify(data)
 
 
 # ==================== WebSocket 端点 ====================
