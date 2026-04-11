@@ -19,7 +19,8 @@ $:
             onlyPreview: true
             launch: uv run main_web.py cpu
             keepAliveTimeout: 3600000
-            daemon: true
+            daemon: false
+            backup: true
       stages:
         - name: ls
           script: ls -al
