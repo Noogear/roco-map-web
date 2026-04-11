@@ -48,12 +48,12 @@ class _ArrowDirectionSystem:
         self._cache_matrix = None       # (N, NUM_SECTORS) 向量化匹配矩阵
         self._cache_matrix_dirty = True # 缓存更新后标记脏
 
-        # --- 移动检测 ---
-        self._prev_x = None
-        self._prev_y = None
+        # --- 移动检测（3 帧累积位移，过滤建筑攻爪/SIFT 单帧抖动）---
+        self._pos_history = deque(maxlen=3)   # 最近 3 帧地图坐标
         self._move_threshold = getattr(config, 'ARROW_MOVE_MIN_DISPLACEMENT', 6)
+        self._cum_move_threshold = self._move_threshold * 2  # 3 帧净位移判动阈值
         self._stopped_frames = 0
-        self._stopped_min = getattr(config, 'ARROW_STOPPED_FRAMES_MIN', 4)
+        self._stopped_min = getattr(config, 'ARROW_STOPPED_FRAMES_MIN', 2)
 
         # --- 输出状态 ---
         self._last_angle = 0.0
@@ -84,6 +84,9 @@ class _ArrowDirectionSystem:
         self._frame_ref = None      # 上次处理的 minimap 对象引用
         self._frame_pos = None      # (cx, cy) or None
         self._frame_feat = None     # feature vector or None
+        self._frame_mask = None     # 箭头 mask（缩小分辨率），供 PCA 支流使用
+        self._frame_cxs = None      # 质心在缩小图内的坐标
+        self._frame_cys = None
 
     # ========== 核心管线（帧级缓存）==========
 
@@ -111,6 +114,9 @@ class _ArrowDirectionSystem:
         self._frame_ref = minimap_bgr
         self._frame_pos = None
         self._frame_feat = None
+        self._frame_mask = None
+        self._frame_cxs = None
+        self._frame_cys = None
 
         h_orig, w_orig = minimap_bgr.shape[:2]
         if h_orig < 10 or w_orig < 10:
@@ -163,6 +169,9 @@ class _ArrowDirectionSystem:
         cx = float(cx_s * s)
         cy = float(cy_s * s)
         self._frame_pos = (cx, cy)
+        self._frame_mask = mask   # 保存 mask 供 PCA 支流
+        self._frame_cxs = cx_s
+        self._frame_cys = cy_s
 
         # --- 特征提取：箭头像素角度扇区直方图（在缩小图上计算）---
         ys, xs = np.where(mask > 0)
@@ -195,6 +204,52 @@ class _ArrowDirectionSystem:
         """返回箭头方向特征向量或 None。"""
         _, feat = self._detect_full(minimap_bgr)
         return feat
+
+    def _estimate_arrow_angle_moments(self):
+        """
+        直接用箭头像素的 PCA 主轴估算朝向（不依赖特征缓存）。
+        作为缓存匹配失败时的保底方法，解决挂机过久后缓存稀疏导致方向冻结的问题。
+
+        原理：箭头尾三角形，尖端像素少、基底像素多。
+               PCA 主轴 = 指向轴；质心偏向基底一侧 = 尖端在反侧。
+        Returns: 角度 (0=北, 顺时针) 或 None。
+        """
+        if self._frame_mask is None or self._frame_cxs is None:
+            return None
+        ys, xs = np.where(self._frame_mask > 0)
+        if len(xs) < 8:
+            return None
+
+        dx = xs.astype(np.float32) - self._frame_cxs
+        dy = ys.astype(np.float32) - self._frame_cys
+
+        # PCA：找方差最大的主轴（箭头的长轴方向）
+        cov = np.cov(dx, dy)
+        vals, vecs = np.linalg.eigh(cov)
+        axis = vecs[:, np.argmax(vals)]  # [ax, ay]
+
+        # 解 180° 歧义：投影到主轴，像素少的那侧是尖端（移动方向）
+        proj = dx * axis[0] + dy * axis[1]
+        tip_dir = axis if np.sum(proj > 0) < np.sum(proj < 0) else -axis
+
+        # 转换：0=北=屏幕上方(-y)，顺时针增加
+        return math.degrees(math.atan2(float(tip_dir[0]), -float(tip_dir[1]))) % 360
+
+    def _try_visual_angle(self, minimap_bgr):
+        """
+        纯视觉朝向估算：特征缓存匹配 → PCA 矩保底。
+        返回 (raw_angle or None, features or None, source: 'cache'|'pca'|None)。
+        不修改 EMA 状态，由调用方决定是否平滑。
+        """
+        features = self._extract_features(minimap_bgr)
+        if features is not None:
+            matched, score = self._match_features(features)
+            if matched is not None:
+                return matched, features, 'cache'
+            pca_angle = self._estimate_arrow_angle_moments()
+            if pca_angle is not None:
+                return pca_angle, features, 'pca'
+        return None, features, None
 
     # ========== 缓存管理 ==========
 
@@ -278,28 +333,30 @@ class _ArrowDirectionSystem:
         Returns:
             angle (float) — 箭头朝向角 (0=北, 顺时针)
         """
-        features = None  # 延迟提取：仅在需要时才调用 _extract_features
         angle = self._last_angle
 
         if map_x is not None and map_y is not None:
-            if self._prev_x is not None and self._prev_y is not None:
-                dx = map_x - self._prev_x
-                dy = map_y - self._prev_y
-                dist = math.sqrt(dx * dx + dy * dy)
+            self._pos_history.append((map_x, map_y))
 
-                if dist > self._move_threshold:
-                    # ===== 移动中 =====
+            if len(self._pos_history) >= 2:
+                old_x, old_y = self._pos_history[0]
+                cum_dx = map_x - old_x
+                cum_dy = map_y - old_y
+                cum_dist = math.sqrt(cum_dx * cum_dx + cum_dy * cum_dy)
+
+                if cum_dist > self._cum_move_threshold:
+                    # ===== 移动中（多帧累积位移超阈值，单帧抖动被过滤）=====
                     self._stopped_frames = 0
-                    move_angle = math.degrees(math.atan2(dx, -dy)) % 360
+                    move_angle = math.degrees(math.atan2(cum_dx, -cum_dy)) % 360
                     angle = move_angle
                     self._last_moving_angle = move_angle
+                    self._ema_angle = move_angle  # 重置 EMA，防止静止后角度回弹
 
-                    # 跳帧缓存：每 N 帧才提取特征并缓存（减少计算）
+                    # 跳帧缓存：每 N 帧才提取特征并写入（移动位移是 ground truth）
                     self._move_frame_counter += 1
                     if self._move_frame_counter >= self._cache_every_n:
                         self._move_frame_counter = 0
-                        if features is None:
-                            features = self._extract_features(minimap_bgr)
+                        features = self._extract_features(minimap_bgr)
                         if features is not None:
                             self._cache_feature(move_angle, features)
                             idx = self._angle_to_bin(move_angle)
@@ -311,33 +368,26 @@ class _ArrowDirectionSystem:
                     # ===== 静止 =====
                     self._stopped_frames += 1
                     if self._stopped_frames >= self._stopped_min:
-                        features = self._extract_features(minimap_bgr)
-                        if features is not None:
-                            matched, score = self._match_features(features)
-                            if matched is not None:
-                                angle = matched
-                            elif self._last_moving_angle is not None:
-                                angle = self._last_moving_angle
+                        vis_raw, features, source = self._try_visual_angle(minimap_bgr)
+                        if vis_raw is not None:
+                            angle = self._smooth_angle(vis_raw)
+                            # 仅 PCA 保底时才种子填充缓存（位移校准才是真正的 ground truth）
+                            if source == 'pca' and features is not None:
+                                if self._stopped_frames % (self._cache_every_n * 2) == 0:
+                                    self._cache_feature(vis_raw, features)
                         elif self._last_moving_angle is not None:
                             angle = self._last_moving_angle
                     elif self._last_moving_angle is not None:
                         angle = self._last_moving_angle
-
-            self._prev_x = map_x
-            self._prev_y = map_y
         else:
-            # ===== 无坐标（惯性/丢失）：纯视觉特征匹配 =====
-            features = self._extract_features(minimap_bgr)
-            if features is not None:
-                matched, score = self._match_features(features)
-                if matched is not None:
-                    angle = matched
-                elif self._last_moving_angle is not None:
-                    angle = self._last_moving_angle
+            # ===== 无坐标（惯性/丢失）：纯视觉 =====
+            vis_raw, _, _ = self._try_visual_angle(minimap_bgr)
+            if vis_raw is not None:
+                angle = self._smooth_angle(vis_raw)
             elif self._last_moving_angle is not None:
                 angle = self._last_moving_angle
 
-        angle = self._smooth_angle(angle)
+        # 移动时直接输出（不经 EMA）；静止/无坐标分支内已应用 EMA
         self._last_angle = angle
         return angle
 

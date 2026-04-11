@@ -356,13 +356,14 @@ var lAngle=0; // 最新箭头角度
 // === 静止死区：上次被接受的地图坐标，用于过滤 SIFT 微小随机抖动 ===
 var _lastDotMapX = null, _lastDotMapY = null, _lastDotAngle = null;
 var DOT_POS_DEADZONE = 2;   // 地图坐标单位，低于此距离视为静止不触发 lerp
-var DOT_ANGLE_DEADZONE = 5; // 度，低于此角度变化不触发 lerp
+var DOT_ANGLE_DEADZONE = 2; // 度，低于此角度变化不触发 lerp
 
 const MIN_S=.08, MAX_S=15;
 
 // ========== rAF 插值 ==========
 var _lerp = { tx:0, ty:0, cx:0, cy:0, tAngle:0, cAngle:0, running:false };
-var LERP_FACTOR = 0.25; // 每帧趋近 25%
+var LERP_FACTOR = 0.25; // 每帧趋近 25%（位置）
+var ANGLE_LERP_FACTOR = 0.5; // 角度每帧趋近 50%（独立系数，更灵敏）
 
 function _angDiff(a, b) { var d=(a-b)%360; return d>180?d-360:d<-180?d+360:d; }
 
@@ -378,7 +379,7 @@ function _lerpTick() {
     }
     _lerp.cx += dx * LERP_FACTOR;
     _lerp.cy += dy * LERP_FACTOR;
-    _lerp.cAngle += da * LERP_FACTOR;
+    _lerp.cAngle += da * ANGLE_LERP_FACTOR;
     _applyDotPos(_lerp.cx, _lerp.cy, _lerp.cAngle);
     requestAnimationFrame(_lerpTick);
 }
