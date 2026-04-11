@@ -312,6 +312,9 @@ class SIFTMapTracker:
             [cx + size * 0.6, cy + size * 0.7],
         ], dtype=np.float64)
 
+        # 额外增加180度翻转箭头
+        angle = (angle + 180) % 360
+
         if angle != 0:
             rad = math.radians(-angle)
             cos_a = math.cos(rad)
