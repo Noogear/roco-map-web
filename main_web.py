@@ -81,6 +81,13 @@ class SIFTMapTracker:
         self._perf_time = _time
         self._frame_times = []
 
+        # === 坐标锁定模式 ===
+        self.coord_lock_enabled = False
+        self._lock_history_size = getattr(config, 'COORD_LOCK_HISTORY_SIZE', 10)
+        self._lock_search_radius = getattr(config, 'COORD_LOCK_SEARCH_RADIUS', 400)
+        self._lock_max_retries = getattr(config, 'COORD_LOCK_MAX_RETRIES', 5)
+        self._lock_min_to_activate = getattr(config, 'COORD_LOCK_MIN_HISTORY_TO_ACTIVATE', 15)
+
     # ------------------------------------------
     # 构建/重建 FLANN 索引
     # ------------------------------------------
@@ -121,6 +128,141 @@ class SIFTMapTracker:
         self.using_local = False
         self.local_fail_count = 0
         print(f"🌍 已切换到 全局 搜索模式 | 特征点: {len(self.kp_big_all)} | lost: {self.lost_frames}")
+
+    # ------------------------------------------
+    # 坐标锁定模式
+    # ------------------------------------------
+    def set_coord_lock(self, enabled):
+        """开启/关闭坐标锁定模式"""
+        if enabled:
+            # 需要足够的历史坐标才能启用
+            if len(self.kp_coords) == 0:
+                return False
+            print(f"🔒 坐标锁定已启用 (历史{self._lock_history_size}均值±{self._lock_search_radius})")
+        else:
+            print(f"🔓 坐标锁定已关闭，恢复正常搜索")
+        self.coord_lock_enabled = enabled
+        return True
+
+    def _get_lock_anchor(self):
+        """
+        计算坐标锁定的锚点：从 AIMapTrackerWeb 的 pos_history 取最近 N 个坐标的平均值。
+        此方法由 AIMapTrackerWeb.process_frame 调用时传入 history 引用。
+        返回 (anchor_x, anchor_y) 或 None（历史不足时）
+        """
+        # 通过 tracker 实例的 pos_history 计算
+        # 注意：这里需要外部传入或通过共享引用获取
+        # 我们在 match 方法中改为接收可选参数
+        return None  # 由 _match_impl 的调用方处理
+
+    @staticmethod
+    def _compute_lock_anchor(pos_deque, n=10):
+        """从坐标历史 deque 计算最近 N 个坐标的平均值"""
+        if pos_deque is None or len(pos_deque) < n:
+            return None
+        recent = list(pos_deque)[-n:]
+        ax = sum(p[0] for p in recent) / len(recent)
+        ay = sum(p[1] for p in recent) / len(recent)
+        return int(ax), int(ay)
+
+    def _match_locked(self, minimap_bgr, anchor_x, anchor_y):
+        """
+        锁定模式下的匹配：以 anchor 为中心，限定搜索范围 ±RADIUS。
+        失败则逐步放宽阈值重试，最多 MAX_RETRIES 次。
+        返回与 _match_impl 相同格式的 dict
+        """
+        t_start = self._perf_time.perf_counter()
+        r = self._lock_search_radius
+
+        minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
+        minimap_gray = self.clahe.apply(minimap_gray)
+        kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, None)
+
+        if des_mini is None or len(kp_mini) < 2:
+            return self._make_locked_result(False, None, None, t_start, "NO_FEATURES")
+
+        # 在全局特征点中筛选锚点范围内的点
+        dx = np.abs(self.kp_coords[:, 0] - anchor_x)
+        dy = np.abs(self.kp_coords[:, 1] - anchor_y)
+        mask = (dx < r) & (dy < r)
+        indices = np.where(mask)[0]
+
+        if len(indices) < 5:
+            return self._make_locked_result(False, None, None, t_start, "FEW_KPTS")
+
+        locked_kp = [self.kp_big_all[i] for i in indices]
+        locked_des = self.des_big_all[indices]
+        locked_flann = self._create_flann(locked_des)
+
+        # 逐步放宽阈值的重试策略
+        retry_ratios = [0.9, 0.8, 0.75, 0.7, 0.65]
+        retry_min_matches = [5, 4, 4, 3, 3]
+
+        for attempt in range(min(self._lock_max_retries, len(retry_ratios))):
+            ratio = retry_ratios[attempt] if attempt < len(retry_ratios) else 0.65
+            min_match = retry_min_matches[attempt] if attempt < len(retry_min_matches) else 3
+
+            try:
+                matches = locked_flann.knnMatch(des_mini, k=2)
+            except cv2.error:
+                continue
+
+            good = []
+            for m_n in matches:
+                if len(m_n) == 2:
+                    m, n = m_n
+                    if m.distance < ratio * n.distance:
+                        good.append(m)
+
+            if len(good) >= min_match:
+                src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst_pts = np.float32([locked_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
+                if M is not None:
+                    inlier_count = int(mask.sum()) if mask is not None else 0
+                    if inlier_count >= min_match:
+                        h, w = minimap_gray.shape
+                        arrow_center = self._detect_arrow_center(minimap_bgr)
+                        if arrow_center is not None:
+                            ref_x, ref_y, ref_angle = arrow_center
+                        else:
+                            # 箭头未检测到 → 跳过此轮重试
+                            continue
+
+                        center_pt = np.float32([[[ref_x, ref_y]]])
+                        dst_center = cv2.perspectiveTransform(center_pt, M)
+                        tx = int(dst_center[0][0][0])
+                        ty = int(dst_center[0][0][1])
+
+                        # 验证结果在锚点合理范围内（允许比搜索半径稍大）
+                        if abs(tx - anchor_x) <= r * 1.5 and abs(ty - anchor_y) <= r * 1.5:
+                            if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
+                                return self._make_locked_result(True, tx, ty, t_start, "LOCKED", arrow_angle=ref_angle,
+                                                           retry=attempt + 1)
+
+        # 所有重试都失败
+        return self._make_locked_result(False, None, None, t_start, "LOCK_FAIL")
+
+    def _make_locked_result(self, found, cx, cy, t_start, state, arrow_angle=None, retry=0):
+        """构造锁定模式的返回字典"""
+        t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000
+        self._frame_times.append(t_elapsed)
+        if len(self._frame_times) >= 60:
+            avg = sum(self._frame_times) / len(self._frame_times)
+            print(f"[🔒锁定] 平均耗时: {avg:.1f}ms | state: {state} | retries: {retry}")
+            self._frame_times.clear()
+        return {
+            'found': found,
+            'center_x': cx,
+            'center_y': cy,
+            'arrow_angle': arrow_angle,
+            'is_inertial': not found,
+            'match_count': 0,
+            'map_width': self.map_width,
+            'map_height': self.map_height,
+            '_locked_state': state,
+        }
 
     # ------------------------------------------
     # 箭头检测：从圆形小地图中提取玩家箭头中心坐标
@@ -335,14 +477,14 @@ class SIFTMapTracker:
 
                         h, w = minimap_gray.shape
 
-                        # === 箭头中心检测（替代几何中心）===
+                        # === 箭头中心检测（必须检测到才有效）===
                         arrow_center = self._detect_arrow_center(minimap_bgr)
                         if arrow_center is not None:
                             ref_x, ref_y, ref_angle = arrow_center
                             arrow_angle = ref_angle
                         else:
-                            # 回退：使用图像几何中心
-                            ref_x, ref_y = w / 2, h / 2
+                            # 箭头未检测到 → 丢弃此帧（不回退几何中心）
+                            continue
 
                         center_pt = np.float32([[[ref_x, ref_y]]])
                         dst_center = cv2.perspectiveTransform(center_pt, M)
@@ -626,6 +768,9 @@ class AIMapTrackerWeb:
         # 坐标历史（用于异常值过滤）
         self.pos_history = deque(maxlen=POS_HISTORY_SIZE)
 
+        # 线性过滤器：连续丢弃帧计数器（防死锁）
+        self._linear_filter_consecutive = 0
+
         # 坐标平滑缓冲池（60帧滑动窗口 + 中位数滤波，消除 SIFT 抖动）
         self.SMOOTH_BUFFER_SIZE = 60
         self.smooth_buffer_x = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
@@ -706,6 +851,58 @@ class AIMapTrackerWeb:
         except Exception as e:
             pass  # 静默失败，不影响主流程
 
+    def _linear_filter(self, cx, cy):
+        """
+        线性速度一致性过滤：
+        用最近 N 帧坐标计算平均速度向量 (vx, vy)，
+        预测下一帧位置 = last + (vx, vy)。
+        如果实际坐标偏离预测位置超过阈值 → 丢弃，返回惯性坐标。
+
+        防死锁：连续 N 帧都被过滤后，强制接受真实坐标（可能发生了传送/跳跃），
+        让 pos_history 自然更新，速度模型会自动重新学习。
+        返回 (filtered_x, filtered_y)
+        """
+        window = getattr(config, 'LINEAR_FILTER_WINDOW', 10)
+        max_dev = getattr(config, 'LINEAR_FILTER_MAX_DEVIATION', 300)
+        max_consecutive = getattr(config, 'LINEAR_FILTER_MAX_CONSECUTIVE', 5)
+
+        if len(self.pos_history) < window:
+            self._linear_filter_consecutive = 0
+            return cx, cy  # 历史不够，不过滤
+
+        recent = list(self.pos_history)[-window:]
+        n = len(recent)
+        # 计算平均速度（每帧位移）
+        vx = sum(recent[i][0] - recent[i - 1][0] for i in range(1, n)) / (n - 1)
+        vy = sum(recent[i][1] - recent[i - 1][1] for i in range(1, n)) / (n - 1)
+
+        # 预测下一帧应该在哪
+        last_x, last_y = recent[-1]
+        pred_x = last_x + vx
+        pred_y = last_y + vy
+
+        # 实际坐标与预测的偏差
+        dev = math.sqrt((cx - pred_x) ** 2 + (cy - pred_y) ** 2)
+
+        if dev > max_dev:
+            self._linear_filter_consecutive += 1
+            if self._linear_filter_consecutive >= max_consecutive:
+                # 连续多帧超差，速度模型已失效（传送/跳跃等）
+                # 强制接受真实值，让历史自然更新，模型会重新学习新速度
+                self._linear_filter_consecutive = 0
+                print(f"[线性过滤] 连续{max_consecutive}帧超差(偏差{dev:.0f}px)，"
+                      f"强制接受真实坐标({cx},{cy})，重置速度模型")
+                return cx, cy
+            # 非线性跳变！丢弃，用预测值替代
+            print(f"[线性过滤] 偏差={dev:.0f}px > {max_dev}px → 丢弃 "
+                  f"({cx},{cy}) → 用惯性 ({int(pred_x)},{int(pred_y)}) "
+                  f"[第{self._linear_filter_consecutive}/{max_consecutive}次]")
+            return int(pred_x), int(pred_y)
+
+        # 正常范围内，重置计数器
+        self._linear_filter_consecutive = 0
+        return cx, cy
+
     def set_minimap(self, minimap_bgr):
         with self.lock:
             self.current_frame_bgr = minimap_bgr.copy()
@@ -736,11 +933,43 @@ class AIMapTrackerWeb:
         half_view = config.VIEW_SIZE // 2
 
         if self.current_mode == 'sift':
-            result = self.sift_engine.match(minimap_bgr)
+            # === 坐标锁定模式检测 ===
+            if self.sift_engine.coord_lock_enabled:
+                anchor = SIFTMapTracker._compute_lock_anchor(
+                    self.pos_history, self.sift_engine._lock_history_size)
+                if anchor is not None:
+                    result = self.sift_engine._match_locked(minimap_bgr, anchor[0], anchor[1])
+                    locked_state = result.get('_locked_state', '')
+                    if result['found'] and not result.get('is_inertial'):
+                        # 锁定匹配成功：同步更新 last_x/y，保证惯性兜底一致
+                        self.sift_engine.last_x = result['center_x']
+                        self.sift_engine.last_y = result['center_y']
+                    elif not result['found'] and self.sift_engine.last_x is not None:
+                        # 锁定完全失败：惯性兜底
+                        result['center_x'] = self.sift_engine.last_x
+                        result['center_y'] = self.sift_engine.last_y
+                        result['found'] = True
+                        result['is_inertial'] = True
+                else:
+                    # 历史不足，降级为普通匹配
+                    result = self.sift_engine.match(minimap_bgr)
+            else:
+                result = self.sift_engine.match(minimap_bgr)
+
             found = result['found']
             cx, cy = result['center_x'], result['center_y']
             arrow_angle = result.get('arrow_angle', 0) or 0
             is_inertial = result.get('is_inertial', False)
+
+            # === 线性速度一致性过滤 ===
+            if (found and cx is not None and not is_inertial
+                    and getattr(config, 'LINEAR_FILTER_ENABLED', True)
+                    and self.sift_engine.coord_lock_enabled):
+                filtered_cx, filtered_cy = self._linear_filter(cx, cy)
+                if filtered_cx != cx or filtered_cy != cy:
+                    # 被过滤掉了，用惯性坐标替换
+                    cx, cy = filtered_cx, filtered_cy
+                    is_inertial = True
 
             # 坐标平滑：原始坐标用于状态机，平滑坐标用于渲染
             smooth_x, smooth_y = self._smooth_coord(cx, cy)
@@ -759,20 +988,45 @@ class AIMapTrackerWeb:
                 local_x = (smooth_x + ox) - x1
                 local_y = (smooth_y + oy) - y1
                 if not is_inertial:
+                    # 正常匹配 → 绿色点
                     self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle)
-                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=3, color=(255, 255, 255), thickness=-1)
+                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=4, color=(0, 255, 0), thickness=-1)
+                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=7, color=(255, 255, 255), thickness=1)
                 else:
+                    # 惯性/线性过滤偏离 → 黄色点
                     self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle)
-                    overlay = display_crop.copy()
-                    overlay[:] = (0, 180, 180)  # 青色蒙版
-                    mask_arr = np.zeros_like(display_crop)
-                    cv2.circle(mask_arr, (local_x, int(local_y + 4)), 10, (255, 255, 255), -1)
-                    cv2.addWeighted(overlay, 0.4, display_crop, 0.6, 0, display_crop)
+                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=4, color=(0, 255, 255), thickness=-1)
+                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=7, color=(255, 255, 255), thickness=1)
             else:
-                display_crop = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
-                cv2.putText(display_crop, "SIFT Searching...", (70, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                # 未找到 → 红色点（显示上一帧位置）
+                y1 = max(0, self.sift_engine.last_y - half_view)
+                y2 = min(self.map_height, self.sift_engine.last_y + half_view)
+                x1 = max(0, self.sift_engine.last_x - half_view)
+                x2 = min(self.map_width, self.sift_engine.last_x + half_view)
+                if x2 > x1 and y2 > y1:
+                    display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
+                    local_x = self.sift_engine.last_x - x1
+                    local_y = self.sift_engine.last_y - y1
+                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=5, color=(0, 0, 255), thickness=-1)
+                    cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=8, color=(255, 255, 255), thickness=1)
+                else:
+                    display_crop = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
+                    lock_label = "🔒 " if self.sift_engine.coord_lock_enabled else ""
+                    cv2.putText(display_crop, f"{lock_label}Lost...", (130, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-            status_state = 'INERTIAL' if is_inertial else ('FOUND' if found else 'SEARCHING')
+            # 状态显示：区分锁定/普通模式
+            if self.sift_engine.coord_lock_enabled:
+                locked_state = result.get('_locked_state', '')
+                if locked_state == 'LOCKED':
+                    status_state = '🔒锁定'
+                elif locked_state in ('LOCK_FAIL', 'NO_FEATURES', 'FEW_KPTS'):
+                    status_state = '🔒重试中'
+                elif is_inertial:
+                    status_state = '🔒惯性'
+                else:
+                    status_state = 'INERTIAL' if is_inertial else ('FOUND' if found else 'SEARCHING')
+            else:
+                status_state = 'INERTIAL' if is_inertial else ('FOUND' if found else 'SEARCHING')
             match_count = 0
             # 状态上报用平滑后坐标（前端显示更稳定）
             last_x = smooth_x
@@ -839,6 +1093,7 @@ class AIMapTrackerWeb:
             'position': {'x': last_x, 'y': last_y},
             'found': found,
             'matches': match_count,
+            'coord_lock': self.sift_engine.coord_lock_enabled,
         }
         self.latest_result_image = img_base64
         self.latest_result_jpeg = jpeg_bytes
@@ -940,6 +1195,65 @@ def set_mode():
     return jsonify({'error': f'Invalid mode: {mode}'}), 400
 
 
+@app.route('/api/coord_lock', methods=['POST'])
+def api_coord_lock():
+    """坐标锁定模式: 开/关/查询"""
+    data = request.get_json(silent=True) or {}
+    action = data.get('action', 'toggle').lower()  # on / off / toggle
+    engine = tracker.sift_engine
+
+    if action == 'query':
+        return jsonify({
+            'enabled': engine.coord_lock_enabled,
+            'history_count': len(tracker.pos_history),
+            'can_activate': len(tracker.pos_history) >= engine._lock_min_to_activate,
+        })
+
+    if action == 'on':
+        if len(tracker.pos_history) < engine._lock_min_to_activate:
+            return jsonify({'error': f'历史坐标不足 (需要{engine._lock_min_to_activate}个，当前{len(tracker.pos_history)}个)'}), 400
+        ok = engine.set_coord_lock(True)
+        return jsonify({'success': ok, 'enabled': True})
+
+    elif action == 'off':
+        ok = engine.set_coord_lock(False)
+        return jsonify({'success': ok, 'enabled': False})
+
+    else:  # toggle
+        if engine.coord_lock_enabled:
+            ok = engine.set_coord_lock(False)
+            return jsonify({'success': ok, 'enabled': False})
+        else:
+            if len(tracker.pos_history) < engine._lock_min_to_activate:
+                return jsonify({'error': f'历史坐标不足 (需要{engine._lock_min_to_activate}个，当前{len(tracker.pos_history)}个)'}), 400
+            ok = engine.set_coord_lock(True)
+            return jsonify({'success': ok, 'enabled': True})
+
+
+@app.route('/api/reset_history', methods=['POST'])
+def api_reset_history():
+    """清空坐标历史 + 关闭锁定 + 重置线性过滤器"""
+    engine = tracker.sift_engine
+    cleared = len(tracker.pos_history)
+
+    # 1. 清空坐标历史
+    tracker.pos_history.clear()
+
+    # 2. 关闭坐标锁定
+    was_locked = engine.coord_lock_enabled
+    engine.set_coord_lock(False)
+
+    # 3. 重置线性过滤器计数器
+    tracker._linear_filter_consecutive = 0
+
+    print(f"🗑 历史已重置: 清除{cleared}条记录, 锁定{'已关闭' if was_locked else '未开启'}, 线性过滤器已重置")
+    return jsonify({
+        'success': True,
+        'cleared_count': cleared,
+        'was_locked': was_locked,
+    })
+
+
 @app.route('/api/result')
 def get_result():
     """获取最新的结果图片"""
@@ -986,6 +1300,52 @@ def ws_set_mode(data):
     emit('mode_result', {'success': ok, 'mode': tracker.current_mode})
 
 
+@socketio.on('coord_lock')
+def ws_coord_lock(data):
+    """通过 WS 切换坐标锁定模式"""
+    action = (data.get('action', 'toggle') if isinstance(data, dict) else 'toggle').lower()
+    engine = tracker.sift_engine
+
+    if action == 'query':
+        emit('lock_result', {
+            'enabled': engine.coord_lock_enabled,
+            'history_count': len(tracker.pos_history),
+            'can_activate': len(tracker.pos_history) >= engine._lock_min_to_activate,
+        })
+        return
+
+    if action == 'on' or (action == 'toggle' and not engine.coord_lock_enabled):
+        need = engine._lock_min_to_activate
+        have = len(tracker.pos_history)
+        if have < need:
+            emit('lock_result', {'success': False, 'error': f'历史不足({have}/{need})'})
+            return
+        ok = engine.set_coord_lock(True)
+        emit('lock_result', {'success': ok, 'enabled': True})
+    elif action == 'off' or (action == 'toggle' and engine.coord_lock_enabled):
+        ok = engine.set_coord_lock(False)
+        emit('lock_result', {'success': ok, 'enabled': False})
+
+
+@socketio.on('reset_history')
+def ws_reset_history():
+    """通过 WS 重置坐标历史"""
+    engine = tracker.sift_engine
+    cleared = len(tracker.pos_history)
+
+    tracker.pos_history.clear()
+    was_locked = engine.coord_lock_enabled
+    engine.set_coord_lock(False)
+    tracker._linear_filter_consecutive = 0
+
+    print(f"🗑 [WS] 历史已重置: 清除{cleared}条, 锁定{'已关闭' if was_locked else '未开启'}")
+    emit('reset_result', {
+        'success': True,
+        'cleared_count': cleared,
+        'was_locked': was_locked,
+    })
+
+
 @socketio.on('frame')
 def ws_receive_frame(raw_bytes):
     """
@@ -1008,6 +1368,7 @@ def ws_receive_frame(raw_bytes):
             'y': tracker.latest_status['position']['y'],
             'f': int(tracker.latest_status['found']),
             'c': tracker.latest_status['matches'],
+            'l': int(tracker.sift_engine.coord_lock_enabled),  # l = lock
         }, separators=(',', ':')).encode('utf-8')
 
         # 发送: [4字节大端长度][JSON状态][JPEG图片] → 广播给所有人
@@ -1036,6 +1397,7 @@ def ws_frame_coords(raw_bytes):
             'y': tracker.latest_status['position']['y'],
             'f': int(tracker.latest_status['found']),
             'c': tracker.latest_status['matches'],
+            'l': int(tracker.sift_engine.coord_lock_enabled),
         }, separators=(',', ':')).encode('utf-8')
 
         emit('coords',

@@ -39,7 +39,18 @@ SEARCH_RADIUS = 400                  # 局部搜索半径（像素）
 LOCAL_FAIL_LIMIT = 3                 # 局部搜索连续失败 N 帧后回退全局
 SIFT_JUMP_THRESHOLD = 500            # 局部模式下坐标最大允许跳变距离（像素）
 
-# === 渲染偏移校正 ===
+# === 坐标锁定模式设置 ===
+COORD_LOCK_ENABLED = False             # 是否启用坐标锁定（运行时动态切换）
+COORD_LOCK_HISTORY_SIZE = 10           # 锚点计算：取最近 N 个历史坐标的平均值
+COORD_LOCK_SEARCH_RADIUS = 400         # 锁定后允许的搜索半径（像素）
+COORD_LOCK_MAX_RETRIES = 5             # 单帧最大重试次数
+COORD_LOCK_MIN_HISTORY_TO_ACTIVATE = 10   # 至少积累多少个历史坐标才允许开启锁定
+
+# === 线性速度一致性过滤（丢弃非线性跳变）===
+LINEAR_FILTER_ENABLED = True           # 是否启用线性过滤（锁定模式自动生效）
+LINEAR_FILTER_WINDOW = 10              # 取最近多少帧计算平均速度
+LINEAR_FILTER_MAX_DEVIATION = 120      # 允许偏离预测位置的最大距离（像素）
+LINEAR_FILTER_MAX_CONSECUTIVE = 10     # 连续丢弃多少帧后强制接受真实坐标（防死锁）
 # 正值 = 向右/下偏移，负值 = 向左/上偏移。用于微调定位点位置。
 RENDER_OFFSET_X = 0                  # 像素偏移（如果定位点偏左，改为正值如 +10）
 RENDER_OFFSET_Y = 0                  # 像素偏移

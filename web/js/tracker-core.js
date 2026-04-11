@@ -86,22 +86,33 @@ const TrackerCore = (() => {
 
         // ========== 状态格式化 ==========
         formatStatus(status) {
-            var text = '--', cls = 'warn';
+            // 状态颜色逻辑：
+            // 绿色 = 正常匹配 (found=true, 非惯性)
+            // 黄色 = 惯性/线性过滤/偏离 (found=true but inertial/filtered)
+            // 红色 = 丢失/未找到 (found=false) 或 连续多次异常
+            var text = '--', cls = 'green', label = '';
             if (status.mode === 'sift') {
-                if (status.state === 'INERTIAL') text = '\u60ef\u6027\u5bfc\u822a';
-                else if (status.f) { text = 'SIFT \u8ffd\u8e2a'; cls = 'ok'; }
-                else { text = 'SIFT \u641c\u7d22'; cls = 'err'; }
+                if (!status.f) {
+                    text = '丢失'; cls = 'red'; label = '未找到';
+                } else if (status.state === 'INERTIAL' || status.is_inertial) {
+                    text = '惯性'; cls = 'yellow'; label = '惯性导航';
+                } else {
+                    text = '正常'; cls = 'green'; label = 'SIFT追踪';
+                }
             } else {
-                if (status.state === 'GLOBAL_SCAN') text = '\u5168\u5c40\u626b\u63cf';
-                else if (status.f) { text = '\u90e8\u5206\u8ffd\u8e2a'; cls = 'ok'; }
-                else { text = '\u4e22\u5931'; cls = 'err'; }
+                if (status.state === 'GLOBAL_SCAN') {
+                    text = '扫描'; cls = 'red'; label = '全局扫描';
+                } else if (status.f) {
+                    text = '正常'; cls = 'green'; label = '局部追踪';
+                } else {
+                    text = '丢失'; cls = 'red'; label = '目标丢失';
+                }
             }
-            return { stateText: text, stateClass: cls };
+            return { stateText: text, stateClass: cls, stateLabel: label };
         },
 
         updateStatusDOM(status, ids) {
             ids = ids || {};
-            var se = document.getElementById(ids.state || 'statusState');
             var fe = document.getElementById(ids.found || 'statusFound');
             var me = document.getElementById(ids.mode || 'statusMode');
             var xe = document.getElementById(ids.x || 'statusX');
@@ -110,14 +121,18 @@ const TrackerCore = (() => {
 
             var f = this.formatStatus(status);
 
+            // 状态指示灯
+            var dotEl = document.getElementById('statusDot');
+            var labelEl = document.getElementById('statusDotLabel');
+            if (dotEl) {
+                dotEl.className = 'status-dot dot-' + f.stateClass;
+                dotEl.title = f.stateText;
+            }
+            if (labelEl) labelEl.textContent = f.stateLabel;
+
             if (me && status.mode) {
                 me.textContent = status.mode.toUpperCase();
                 me.style.color = status.mode === 'sift' ? '#ffa726' : '#00d4ff';
-            }
-            if (se) {
-                se.textContent = f.stateText;
-                var map = { ok: 'state-local', warn: 'state-global', err: 'state-lost' };
-                se.className = 'status-value ' + (map[f.stateClass] || '');
             }
             if (xe && status.position) xe.textContent = status.position.x;
             if (ye && status.position) ye.textContent = status.position.y;
@@ -374,17 +389,18 @@ const TrackerCore = (() => {
                         var jpegBytes = data.slice(jpegStart);
                         if (jpegBytes.byteLength > 2) {
                             var b64 = _arrayBufferToBase64(jpegBytes);
-                            var result = {
-                                success: true,
-                                image: b64,
-                                status: {
-                                    mode: status.m,
-                                    state: status.s,
-                                    position: { x: status.x, y: status.y },
-                                    found: !!status.f,
-                                    matches: status.c,
-                                }
-                            };
+                        var result = {
+                            success: true,
+                            image: b64,
+                            status: {
+                                mode: status.m,
+                                state: status.s,
+                                position: { x: status.x, y: status.y },
+                                found: !!status.f,
+                                matches: status.c,
+                                coord_lock: !!status.l,
+                            }
+                        };
                             if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                         }
                     });

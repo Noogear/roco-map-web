@@ -83,6 +83,8 @@
         .state-lost { color: #ef5350; }
         .found-yes { color: #66bb6a; }
         .found-no { color: #ef5350; }
+        .lock-on { color: #4caf50; font-weight:bold; }
+        .lock-off { color: #666; }
 
         .btn-row {
             display: flex;
@@ -111,6 +113,37 @@
         .btn-watch { background: #e91e63; color: #fff; border: 1px solid #f48fb1; }
         .btn-watch:hover { background: #c2185b; }
         .btn-watch.active { background: #00e676; color: #000; border-color: #00e676; }
+        .btn-lock { background: #555; color: #ccc; border: 1px solid #777; cursor: not-allowed; opacity: 0.5; }
+        .btn-lock.ready { background: #ff9800; color: #000; border: 1px solid #ffb74d; cursor: pointer; opacity: 1; }
+        .btn-lock.ready:hover { background: #f57c00; transform: translateY(-1px); }
+        .btn-lock.active { background: #4caf50; color: #fff; border: 1px solid #81c784; cursor: pointer; opacity: 1; animation: lockPulse 2s infinite; }
+        .btn-lock.active:hover { background: #388e3c; }
+        .btn-reset { background: #607d8b; color: #fff; border: 1px solid #90a4ae; cursor: pointer; }
+        /* 状态指示灯 */
+        .status-dot {
+            display: inline-block;
+            width: 14px; height: 14px;
+            border-radius: 50%;
+            transition: background-color 0.3s, box-shadow 0.3s;
+            flex-shrink: 0;
+        }
+        .dot-green  { background: #4caf50; box-shadow: 0 0 6px rgba(76,175,80,0.6); }
+        .dot-yellow { background: #ff9800; box-shadow: 0 0 6px rgba(255,152,0,0.6); animation: dotBlink 0.8s infinite; }
+        .dot-red    { background: #f44336; box-shadow: 0 0 6px rgba(244,67,54,0.5); animation: dotBlink 0.4s infinite; }
+        @keyframes dotBlink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .status-dot-wrap {
+            display: flex; align-items: center; gap: 8px;
+        }
+        .status-dot-label { font-size: 12px; color: #aaa; }
+        .btn-reset:hover { background: #455a64; transform: translateY(-1px); }
+        .btn-reset:active { background: #37474f; }
+        @keyframes lockPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.4); }
+            50% { box-shadow: 0 0 0 6px rgba(76, 175, 80, 0); }
+        }
 
         /* 观看模式 */
         .watch-mode .float-body > .mode-toggle:first-of-type,
@@ -341,9 +374,14 @@
                     <div class="status-label">引擎</div>
                     <div class="status-value" id="statusMode" style="color:#00d4ff;">SIFT</div>
                 </div>
-                <div class="status-item" style="display:none;">
+                <div class="status-item">
                     <div class="status-label">状态</div>
-                    <div class="status-value state-global" id="statusState">--</div>
+                    <div class="status-value">
+                        <div class="status-dot-wrap">
+                            <span id="statusDot" class="status-dot dot-green" title="正常"></span>
+                            <span id="statusDotLabel" class="status-dot-label">--</span>
+                        </div>
+                    </div>
                 </div>
                 <div class="status-item">
                     <div class="status-label">坐标 X</div>
@@ -352,6 +390,10 @@
                 <div class="status-item">
                     <div class="status-label">坐标 Y</div>
                     <div class="status-value" id="statusY">--</div>
+                </div>
+                <div class="status-item" id="lockStatusItem" style="display:none;">
+                    <div class="status-label">锁定</div>
+                    <div class="status-value" id="statusLock">--</div>
                 </div>
                 <div class="status-item" style="display:none;">
                     <div class="status-label">是否找到</div>
@@ -401,6 +443,8 @@
                 <label for="fileInput" class="file-label">📂 上传图片</label>
                 <input type="file" id="fileInput" accept="image/*">
                 <button class="btn-primary" onclick="processImage()">▶️ 分析定位</button>
+                <button id="coordLockBtn" class="btn-lock" onclick="toggleCoordLock()" disabled title="需要先分析定位积累坐标历史">🔒 坐标锁</button>
+                <button class="btn-reset" onclick="resetHistory()" title="清空坐标历史，重新开始累积">🗑 重置历史</button>
                 <button class="btn-pip" id="pipBtn" onclick="toggleNativePiP()">🎠 浏览器画中画</button>
                 <button class="btn-danger" onclick="stopScreenCapture()" id="stopScreenBtn" style="display:none;">⏹ 停止捕获</button>
             </div>
@@ -434,6 +478,20 @@ TC.init({
         }
         if (result.status) {
             TC.updateStatusDOM(result.status);
+            // 更新锁定状态显示
+            var lockEl = document.getElementById('statusLock');
+            if (lockEl && result.status.coord_lock !== undefined) {
+                if (result.status.coord_lock) {
+                    lockEl.textContent = '🔒';
+                    lockEl.style.color = '#4caf50';
+                } else {
+                    lockEl.textContent = '未锁';
+                    lockEl.style.color = '#888';
+                }
+                // 同步前端状态
+                coordLockEnabled = result.status.coord_lock;
+                updateLockButton();
+            }
         }
     },
     onScreenStart: function() {
@@ -734,6 +792,118 @@ async function toggleNativePiP() {
         TC.log('❌ 画中画启动失败：' + err.message);
     }
 }
+
+// ========== 坐标锁定模式 ==========
+var coordLockEnabled = false;
+var lockBtn = document.getElementById('coordLockBtn');
+
+async function toggleCoordLock() {
+    if (!lockBtn || lockBtn.disabled && !lockBtn.classList.contains('active')) return;
+
+    try {
+        var resp = await fetch('/api/coord_lock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'toggle' })
+        });
+        var data = await resp.json();
+        if (data.success !== undefined) {
+            coordLockEnabled = data.enabled;
+            updateLockButton();
+            TC.log(coordLockEnabled ? '🔒 坐标锁定已开启' : '🔓 坐标锁定已关闭');
+        } else {
+            TC.log('⚠️ 锁定操作失败: ' + (data.error || '未知错误'));
+        }
+    } catch(e) {
+        TC.log('❌ 锁定请求失败: ' + e.message);
+    }
+}
+
+function updateLockButton() {
+    if (!lockBtn) return;
+    if (coordLockEnabled) {
+        lockBtn.classList.remove('ready');
+        lockBtn.classList.add('active');
+        lockBtn.textContent = '🔒 已锁定';
+        lockBtn.title = '点击关闭坐标锁定';
+    } else {
+        lockBtn.classList.remove('active');
+        lockBtn.title = '需要先分析定位积累坐标历史';
+        // 是否 ready 由 checkLockReadiness 控制
+    }
+}
+
+function checkLockReadiness() {
+    if (!lockBtn) return;
+    fetch('/api/coord_lock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'query' })
+    }).then(function(r){ return r.json(); }).then(function(data){
+        if (!coordLockEnabled) {
+            if (data.can_activate) {
+                lockBtn.disabled = false;
+                lockBtn.classList.add('ready');
+                lockBtn.title = `历史${data.history_count}个，可开启坐标锁`;
+                if (!lockBtn.classList.contains('active')) {
+                    lockBtn.textContent = '🔒 坐标锁';
+                }
+            } else {
+                lockBtn.disabled = true;
+                lockBtn.classList.remove('ready');
+                lockBtn.textContent = `🔒 坐标锁(${data.history_count})`;
+                lockBtn.title = `还需积累更多坐标 (${data.history_count}/${data.can_activate ? '?' : '...'})`;
+            }
+        }
+    }).catch(function(){});
+}
+
+async function resetHistory() {
+    if (!confirm('确定要清空所有坐标历史吗？\n坐标锁定将被关闭，需要重新积累历史坐标。')) return;
+    
+    try {
+        const resp = await fetch('/api/reset_history', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            TC.log(`🗑 历史已重置 (清除了 ${data.cleared_count} 条记录)`);
+            // 同步状态
+            coordLockEnabled = false;
+            _analyzeCount = 0;
+            updateLockButton();
+            checkLockReadiness();
+        } else {
+            TC.log('⚠️ 重置失败: ' + (data.error || '未知错误'));
+        }
+    } catch(e) {
+        TC.log('❌ 重置请求失败: ' + e.message);
+    }
+}
+
+// 每次分析结果回调时检测锁定按钮是否可用
+var _analyzeCount = 0;  // 记录成功匹配的帧数
+var _lastStatus = null;
+
+// 直接包装已注册的 onAnalyzeResult 回调（TC.init 已在上方调用）
+(function(){
+    // 从 TC 内部获取 opts 的方式：通过检查已有回调
+    var origCb = null;
+    // 我们知道 init 时传了 onAnalyzeResult，直接重新设置来包装它
+    var _origLog = TC.log;
+    var _origUpdateDOM = TC.updateStatusDOM;
+    // 拦截 updateStatusDOM 来触发检查
+    TC.updateStatusDOM = function(status, ids) {
+        _origUpdateDOM.call(TC, status, ids);
+        _lastStatus = status;
+        if (status && status.f) {
+            _analyzeCount++;
+            setTimeout(checkLockReadiness, 50);
+        }
+    };
+})();
+
+// 定期轮询 + 初始化检查
+setInterval(checkLockReadiness, 2000);
+checkLockReadiness();
 </script>
 </body>
 </html>
