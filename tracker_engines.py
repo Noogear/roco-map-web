@@ -228,9 +228,10 @@ class _ArrowDirectionSystem:
         vals, vecs = np.linalg.eigh(cov)
         axis = vecs[:, np.argmax(vals)]  # [ax, ay]
 
-        # 解 180° 歧义：投影到主轴，像素少的那侧是尖端（移动方向）
+        # 解 180° 歧义：投影到主轴。由于部分游戏箭头头部（尖端）较宽、像素较多，
+        # 反转大小比较逻辑以适应头大尾小的箭头图标。
         proj = dx * axis[0] + dy * axis[1]
-        tip_dir = axis if np.sum(proj > 0) < np.sum(proj < 0) else -axis
+        tip_dir = axis if np.sum(proj > 0) > np.sum(proj < 0) else -axis
 
         # 转换：0=北=屏幕上方(-y)，顺时针增加
         return math.degrees(math.atan2(float(tip_dir[0]), -float(tip_dir[1]))) % 360
