@@ -62,12 +62,6 @@
             100%{box-shadow:0 0 10px rgba(255,23,68,.9),0 0 20px rgba(255,23,68,.4)}
         }
         #dot:not(.lost){animation:pulse 1.5s infinite}
-        #ch{
-            position:absolute;pointer-events:none;z-index:9;
-            transform:translate(-50%,-50%);
-            transition:left .05s linear,top .05s linear,opacity .15s;opacity:.25;
-        }
-
         /* ========== 路线绘制层 ========== */
         #routeLayer{
             position:absolute;top:0;left:0;width:100%;height:100%;
@@ -265,15 +259,16 @@
         <img id="mi" draggable="false" alt="map">
         <!-- 路线 SVG 叠加层 -->
         <svg id="routeLayer" xmlns="http://www.w3.org/2000/svg"></svg>
-        <svg id="ch" width="44" height="44" viewBox="0 0 44 44">
-            <line x1="22" y1="0" x2="22" y2="16" stroke="#00d4ff" stroke-width="1"/>
-            <line x1="22" y1="28" x2="22" y2="44" stroke="#00d4ff" stroke-width="1"/>
-            <line x1="0" y1="22" x2="16" y2="22" stroke="#00d4ff" stroke-width="1"/>
-            <line x1="28" y1="22" x2="44" y2="22" stroke="#00d4ff" stroke-width="1"/>
-            <circle cx="22" cy="22" r="10" stroke="#00d4ff" stroke-width="1" fill="none" opacity=".5"/>
-        </svg>
-        <div id="dot"></div>
     </div>
+    <!-- 红点和准星放在 mc 下，与 mw 同级，避免受到地图变换影响 -->
+    <svg id="ch" width="44" height="44" viewBox="0 0 44 44" style="position:absolute;pointer-events:none;z-index:9;transform:translate(-50%,-50%);transition:left .05s linear,top .05s linear,opacity .15s;opacity:.25;">
+        <line x1="22" y1="0" x2="22" y2="16" stroke="#00d4ff" stroke-width="1"/>
+        <line x1="22" y1="28" x2="22" y2="44" stroke="#00d4ff" stroke-width="1"/>
+        <line x1="0" y1="22" x2="16" y2="22" stroke="#00d4ff" stroke-width="1"/>
+        <line x1="28" y1="22" x2="44" y2="22" stroke="#00d4ff" stroke-width="1"/>
+        <circle cx="22" cy="22" r="10" stroke="#00d4ff" stroke-width="1" fill="none" opacity=".5"/>
+    </svg>
+    <div id="dot"></div>
 </div>
 
 <!-- 悬浮输入面板 (和 index 一致的风格) -->
@@ -398,7 +393,7 @@ function applyT() { MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+
 
 // ========== 红点 & UI 更新 ==========
 function setDot(x,y,state,found){
-    // 将地图坐标转换为屏幕显示坐标（考虑缩放和平移）
+    // #dot 和 #ch 现在在 #mc 下与 #mw 同级，需要使用屏幕坐标
     var screenX = x * sc + ox;
     var screenY = y * sc + oy;
     DOT.style.left=screenX+'px';DOT.style.top=screenY+'px';
