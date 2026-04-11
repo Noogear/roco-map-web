@@ -446,7 +446,9 @@ def ws_receive_frame(raw_bytes):
             'y': tracker.latest_status['position']['y'],
             'f': int(tracker.latest_status['found']),
             'c': tracker.latest_status['matches'],
+            'q': round(tracker.latest_status.get('match_quality', 0), 2),
             'l': int(tracker.sift_engine.coord_lock_enabled),
+            'h': int(tracker.latest_status.get('hybrid_busy', False)),
         }, separators=(',', ':')).encode('utf-8')
 
         emit('result',
@@ -474,7 +476,9 @@ def ws_frame_coords(raw_bytes):
             'y': tracker.latest_status['position']['y'],
             'f': int(tracker.latest_status['found']),
             'c': tracker.latest_status['matches'],
+            'q': round(tracker.latest_status.get('match_quality', 0), 2),
             'l': int(tracker.sift_engine.coord_lock_enabled),
+            'h': int(tracker.latest_status.get('hybrid_busy', False)),
         }, separators=(',', ':')).encode('utf-8')
 
         emit('coords',

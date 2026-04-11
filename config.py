@@ -38,6 +38,7 @@ SIFT_RANSAC_THRESHOLD = 8.0           # 允许的空间误差阈值
 SEARCH_RADIUS = 400                  # 局部搜索半径（像素）
 LOCAL_FAIL_LIMIT = 3                 # 局部搜索连续失败 N 帧后回退全局
 SIFT_JUMP_THRESHOLD = 500            # 局部模式下坐标最大允许跳变距离（像素）
+SIFT_MAX_HOMOGRAPHY_SCALE = 8.0      # Homography 最大允许缩放 (防UI误匹配，正常≈1-3)
 
 # === 坐标锁定模式设置 ===
 COORD_LOCK_ENABLED = False             # 是否启用坐标锁定（运行时动态切换）
@@ -66,3 +67,15 @@ AI_RANSAC_THRESHOLD = 8.0             # 允许的空间误差阈值
 AI_SCAN_SIZE = 1600                   # 全局搜索时的区块大小
 AI_SCAN_STEP = 1400                   # 全局搜索的步长
 AI_TRACK_RADIUS = 500                 # 局部追踪时，向外扩展的半径 (400即截取800x800)
+
+# ==========================================
+# 混合引擎模式 (SIFT 主引擎 + LoFTR 后台重定位)
+# ==========================================
+HYBRID_ENABLED = True                  # 非 sift-only 模式下自动启用混合引擎
+HYBRID_TRIGGER_LOST_FRAMES = 5         # SIFT 连续惯性 N 帧后触发 LoFTR 重定位
+HYBRID_CONFUSED_IMMEDIATE = True       # SIFT 几何混乱时立即触发 LoFTR（不等 N 帧）
+HYBRID_COOLDOWN = 3.0                  # LoFTR 两次触发最小间隔（秒）
+HYBRID_COARSE_TILE = 400               # 粗扫阶段的 tile 目标尺寸（像素，缩放后）
+HYBRID_COARSE_STEP = 350               # 粗扫步长（缩放前 = step*4）
+HYBRID_FINE_RADIUS = 300               # 精定位阶段的 crop 半径（像素）
+HYBRID_MINI_SIZE = 128                 # LoFTR 输入的 minimap 统一尺寸
