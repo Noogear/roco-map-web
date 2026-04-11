@@ -14,8 +14,7 @@ env/
 debug_minimap.png
 _debug_*.png
 _debug_*.py
-_test_batch.py
-_test_angle.py
+_test_*.py
 
 # 临时环境/实验目录
 .tmp_prebuilt_env/

@@ -353,6 +353,11 @@ var autoRun=false, autoT=null;
 var sending=false;
 var lAngle=0; // 最新箭头角度
 
+// === 静止死区：上次被接受的地图坐标，用于过滤 SIFT 微小随机抖动 ===
+var _lastDotMapX = null, _lastDotMapY = null, _lastDotAngle = null;
+var DOT_POS_DEADZONE = 2;   // 地图坐标单位，低于此距离视为静止不触发 lerp
+var DOT_ANGLE_DEADZONE = 5; // 度，低于此角度变化不触发 lerp
+
 const MIN_S=.08, MAX_S=15;
 
 // ========== rAF 插值 ==========
@@ -428,7 +433,17 @@ function fitMap() {
     oy=(ch-mapInfo.map_height*sc)/2;
     applyT();
 }
-function applyT() { MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')'; ZL.textContent=Math.round(sc*100)+'%'; }
+function applyT() {
+    MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')';
+    ZL.textContent=Math.round(sc*100)+'%';
+    // 缩放/平移后立即同步点位屏幕坐标，防止点位漂移到错误位置
+    if (lx !== null) {
+        var _sx = lx * sc + ox, _sy = ly * sc + oy;
+        _lerp.tx = _sx; _lerp.ty = _sy;
+        _lerp.cx = _sx; _lerp.cy = _sy;
+        _applyDotPos(_sx, _sy, _lerp.cAngle);
+    }
+}
 
 // ========== 红点 & UI 更新 ==========
 function setDot(x, y, state, found, angle){
@@ -436,6 +451,25 @@ function setDot(x, y, state, found, angle){
     var screenX = x * sc + ox;
     var screenY = y * sc + oy;
     angle = angle || 0;
+
+    // === 静止死区过滤：位置和角度变化量均低于阈值时跳过 lerp，消除静止抖动 ===
+    if (_lastDotMapX !== null) {
+        var _dp = Math.sqrt((x-_lastDotMapX)*(x-_lastDotMapX)+(y-_lastDotMapY)*(y-_lastDotMapY));
+        var _da = Math.abs(_angDiff(angle, _lastDotAngle));
+        if (_dp < DOT_POS_DEADZONE && _da < DOT_ANGLE_DEADZONE) {
+            // 仅更新状态样式与坐标显示，不触发新的 lerp 动画
+            DOT.classList.remove('inertial','lost');
+            if(!found){ DOT.classList.add('lost'); ARWD.style.opacity='0'; }
+            else {
+                if(state==='INERTIAL') DOT.classList.add('inertial');
+                ARWD.style.opacity='.85';
+            }
+            CH.style.opacity=found?'.25':'0';
+            SX.textContent=Math.round(x); SY.textContent=Math.round(y);
+            return;
+        }
+    }
+    _lastDotMapX = x; _lastDotMapY = y; _lastDotAngle = angle;
 
     // 更新 lerp 目标
     if (_lerp.cx === 0 && _lerp.cy === 0) {

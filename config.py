@@ -67,7 +67,7 @@ MINIMAP_CIRCLE_RECALIBRATE_MISS = 30    # 连续多少帧未检测到圆 → 重
 ARROW_TEMPLATE_MATCH_THRESHOLD = 0.65   # 模板匹配相关系数阈值 (快速路径)
 ARROW_ROI_PADDING = 15                  # 模板匹配 ROI 扩展像素
 ARROW_HSV_LEARN_ALPHA = 0.1             # HSV 范围自适应学习率
-ARROW_ANGLE_SMOOTH_ALPHA = 0.4          # 角度 EMA 平滑系数 (0=不平滑, 1=无惯性)
+ARROW_ANGLE_SMOOTH_ALPHA = 0.2          # 角度 EMA 平滑系数 (0=不平滑, 1=无惯性)
 
 # === 坐标锁定模式设置 ===
 COORD_LOCK_ENABLED = False             # 是否启用坐标锁定（运行时动态切换）
