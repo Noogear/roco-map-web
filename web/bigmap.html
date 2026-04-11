@@ -199,6 +199,24 @@
         label.fl:hover{background:#3f51b5}
         input[type=file]{display:none}
 
+        /* 坐标锁定按钮 */
+        .btn-lock{background:#555;color:#ccc;border:1px solid #777;cursor:not-allowed;opacity:.5;font-size:.82em;padding:7px 10px;border-radius:8px}
+        .btn-lock.ready{background:#ff9800;color:#000;border-color:#ffb74d;cursor:pointer;opacity:1}
+        .btn-lock.ready:hover{background:#f57c00}
+        .btn-lock.active{background:#4caf50;color:#fff;border-color:#81c784;cursor:pointer;opacity:1}
+        .btn-lock.active:hover{background:#388e3a}
+        .btn-reset{background:#607d8b;color:#fff;border:1px solid #90a4ae;cursor:pointer;font-size:.82em;padding:7px 10px;border-radius:8px}
+        .btn-reset:hover{background:#455a64}
+
+        /* 测试图片选择器 */
+        .test-images{display:none;margin-top:10px;padding-top:8px;border-top:1px solid #333}
+        .test-images.show{display:block}
+        .test-label{font-size:.75em;color:#888;margin-bottom:6px}
+        .test-grid{display:flex;flex-wrap:wrap;gap:4px;max-height:160px;overflow-y:auto}
+        .test-item{width:48px;height:48px;border-radius:4px;object-fit:cover;cursor:pointer;border:1.5px solid transparent;transition:border-color .15s}
+        .test-item:hover{border-color:#00d4ff}
+        .test-item.selected{border-color:#66bb6a}
+
         #logArea{
             font-family:monospace;font-size:.72em;color:#0f0;background:#0a0a15;
             border-radius:6px;padding:6px 8px;max-height:80px;overflow-y:auto;margin-top:8px;
@@ -290,6 +308,14 @@
             <button class="bp" onclick="analyzeOnce()">分析</button>
             <button class="bs" id="autoBtn" onclick="toggleAuto()">自动追踪</button>
             <button class="bd" id="stpBtn" style="display:none" onclick="stopSC()">停止</button>
+            <button class="btn-lock" id="coordLockBtn" onclick="toggleCoordLock()" disabled title="需要先分析定位积累坐标历史">&#128274; 坐标锁</button>
+            <button class="btn-reset" onclick="resetHistory()" title="清空坐标历史">&#128465; 重置</button>
+        </div>
+
+        <!-- 测试小地图选择器 -->
+        <div class="test-images" id="testImagesArea" style="display:none;">
+            <div class="test-label">&#127941; 测试图片（点击选择）：</div>
+            <div class="test-grid" id="testGrid"></div>
         </div>
 
         <div id="logArea"></div>
@@ -372,13 +398,16 @@ function applyT() { MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+
 
 // ========== 红点 & UI 更新 ==========
 function setDot(x,y,state,found){
-    DOT.style.left=x+'px';DOT.style.top=y+'px';
-    CH.style.left=x+'px';CH.style.top=y+'px';
+    // 将地图坐标转换为屏幕显示坐标（考虑缩放和平移）
+    var screenX = x * sc + ox;
+    var screenY = y * sc + oy;
+    DOT.style.left=screenX+'px';DOT.style.top=screenY+'px';
+    CH.style.left=screenX+'px';CH.style.top=screenY+'px';
     DOT.classList.remove('inertial','lost');
     if(!found)DOT.classList.add('lost');
     else if(state==='INERTIAL')DOT.classList.add('inertial');
     CH.style.opacity=found?'.25':'0';
-    SX.textContent=x;SY.textContent=y;
+    SX.textContent=Math.round(x);SY.textContent=Math.round(y);
 }
 
 function updUIBig(d){
@@ -514,16 +543,30 @@ function setupRegionDrag() {
     window.__bmUpdateRegionBox = updateCircleSize;
 }
 
-// ========== 分析逻辑 (HTTP API，与 index 一致) ==========
+// ========== 分析逻辑 (升级: WS 优先 + 圆形选区保存) ==========
+var useWSMode=true;
 async function analyzeOnce(){
     var data=TC.imageData;
-    if(!data&&TC.mode==='screen'){
-        data=TC.captureScreenImg();
-    }
-    if(!data){TC.log('\u8bf7\u5148\u9009\u62e9\u56fe\u7246\u6216\u5f00\u542f\u5c4f\u5e55\u6355\u83b7');return}
+    if(!data&&TC.mode==='screen'){data=TC.captureScreenImg();}
+    if(!data){TC.log('\u8bf7\u5148\u9009\u62e9\u56fe\u7246\u6216\u5f00\u542c\u5c4f\u5e55\u6355\u83b7');return}
+    await saveCircleState();
     TC.log('\u6b63\u5728\u5206\u6790...');
+    // 优先 WS 二进制模式
+    if(useWSMode && TC.wsConnected){
+        try{
+            var blob=await new Promise(function(res){
+                var img=new Image();img.onload=function(){
+                    var c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;
+                    var ctx=c.getContext('2d');ctx.drawImage(img,0,0);
+                    c.toBlob(res,'image/png',.95);
+                };img.src=data;
+            });
+            if(blob){await TC.sendViaWS(blob);return;}
+        }catch(e){useWSMode=false;TC.log('WS \u56de送 HTTP \u6a21式');}
+    }
     try{await TC.sendAndDisplay(data);}catch(err){TC.log('\u9519\u8bef: '+err.message);}
 }
+
 
 // ========== 自动追踪 ==========
 function toggleAuto(){
@@ -720,7 +763,7 @@ var RouteModule = (function(){
         var pts = currentRoute.points;
         if (pts.length === 0) return;
 
-        // 设置 SVG 视口为地图尺寸
+        // 设置 SVG 视口为地图尺寸 (routeLayer 是 #mw 的子元素，自动继承变换)
         if (mapInfo) {
             svg.setAttribute('viewBox', '0 0 ' + mapInfo.map_width + ' ' + mapInfo.map_height);
         }
@@ -914,7 +957,104 @@ function toggleRoutePanel(){
     if(btn)btn.classList.toggle('active',!panel.classList.contains('hidden'));
 }
 
-/** HTML 转义 */
+// ========== 坐标锁定模式 (与 index 一致) ==========
+var coordLockEnabled = false;
+var lockBtn = $('coordLockBtn');
+
+async function toggleCoordLock() {
+    if (!lockBtn || lockBtn.disabled && !lockBtn.classList.contains('active')) return;
+    try {
+        var resp = await fetch('/api/coord_lock', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'toggle' })
+        });
+        var data = await resp.json();
+        if (data.success !== undefined) {
+            coordLockEnabled = data.enabled;
+            updateLockButton();
+            TC.log(coordLockEnabled ? '\U0001f512 坐标锁定已开启' : '\U0001f513 坐标锁定已关闭');
+        } else { TC.log('\u26a0\ufe0f 锁定操作失败: ' + (data.error || '')); }
+    } catch(e) { TC.log('\u274c 锁定请求失败: ' + e.message); }
+}
+
+function updateLockButton() {
+    if (!lockBtn) return;
+    if (coordLockEnabled) {
+        lockBtn.classList.remove('ready'); lockBtn.classList.add('active');
+        lockBtn.textContent=' 已锁定'; lockBtn.title='点击关闭坐标锁定';
+    } else {
+        lockBtn.classList.remove('active');
+        lockBtn.title='需要先分析定位积累坐标历史';
+    }
+}
+
+function checkLockReadiness() {
+    if (!lockBtn) return;
+    fetch('/api/coord_lock', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'query' })
+    }).then(function(r){ return r.json(); }).then(function(data){
+        if (!coordLockEnabled) {
+            if (data.can_activate) {
+                lockBtn.disabled = false; lockBtn.classList.add('ready');
+                lockBtn.title='历史'+data.history_count+'个，可开启坐标锁';
+                if (!lockBtn.classList.contains('active')) lockBtn.textContent=' 坐标锁';
+            } else {
+                lockBtn.disabled = true; lockBtn.classList.remove('ready');
+                lockBtn.textContent='\U0001f512 锁('+data.history_count+')';
+                lockBtn.title='还需积累更多坐标 ('+data.history_count+'/10)';
+            }
+        }
+    }).catch(function(){});
+}
+
+async function resetHistory() {
+    if (!confirm('确定清空所有坐标历史？\n坐标锁定将被关闭。')) return;
+    try {
+        var resp = await fetch('/api/reset_history', { method: 'POST' });
+        var data = await resp.json();
+        if (data.success) {
+            TC.log('\U0001f5d1 已清除 '+data.cleared_count+' 条记录');
+            coordLockEnabled = false; updateLockButton(); checkLockReadiness();
+        } else TC.log('\u26a0\ufe0f 失败: '+(data.error||''));
+    } catch(e) { TC.log('\u274c 请求失败: '+e.message); }
+}
+
+// 分析结果时检测锁定按钮可用性
+var _analyzeCount = 0;
+(function(){
+    var _origUpdateDOM = TC.updateStatusDOM;
+    TC.updateStatusDOM = function(status, ids){
+        _origUpdateDOM.call(TC, status, ids);
+        if (status && status.f) { _analyzeCount++; setTimeout(checkLockReadiness, 50); }
+    };
+})();
+setInterval(checkLockReadiness, 2000);
+checkLockReadiness();
+
+// ========== 保存圆形选区到服务器 (与 index 一致) ==========
+async function saveCircleState(){
+    var sc = TC.selCircle; if(!sc)return;
+    try{
+        await fetch('/api/circle_state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cx:sc.cx,cy:sc.cy,r:sc.r})});
+    }catch(e){}
+}
+
+// ========== 测试图片选择器 (与 index 一致) ==========
+document.addEventListener('testimage:selected',function(e){
+    var img=e.detail.imgEl,src=e.detail.src;
+    var cvs=$('minimapCanvas'),ctx=cvs.getContext('2d');
+    ctx.clearRect(0,0,220,220);
+    var s=Math.min(220/img.naturalWidth,220/img.naturalHeight);
+    var w=img.naturalWidth*s,h=img.naturalHeight*s;
+    ctx.drawImage(img,(220-w)/2,(220-h)/2,w,h);
+    TC.imageData=cvs.toDataURL('image/png');
+    TC.log('已选择测试图: '+src);
+});
+TC.loadTestImages('testGrid').then(function(imgs){
+    if(imgs.length>0) $('testImagesArea').classList.add('show');
+});
+TC.checkEngines();
 function escapeHtml(str){
     var d=document.createElement('div');d.textContent=str;return d.innerHTML;
 }
