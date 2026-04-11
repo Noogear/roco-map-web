@@ -1,32 +1,49 @@
 $:
   web_trigger_vscode:
     - docker:
-        image: docker.cnb.cool/wss/ai/mlsharp:latest
+        build:
+          dockerfile: .ide/Dockerfile
+          by:
+            - .ide/Dockerfile
+            - pyproject.toml
+            - uv.lock
+          versionBy:
+            - .ide/Dockerfile
+            - pyproject.toml
+            - uv.lock
+      runner:
+        tags: cnb:arch:amd64:gpu
       services:
         - vscode
-        - docker
       stages:
-        - name: ls
-          script: ls -al
+        - name: check-ai-env
+          script: |
+            /opt/game-map-web-env/.venv/bin/python -c "import torch, kornia; print(f'torch={torch.__version__}, kornia={kornia.__version__}, cuda={torch.cuda.is_available()}')"
+            ls -al
   vscode:
     - docker:
-        image: docker.cnb.cool/wss/ai/mlsharp:latest
+        build:
+          dockerfile: .ide/Dockerfile
+          by:
+            - .ide/Dockerfile
+            - pyproject.toml
+            - uv.lock
+          versionBy:
+            - .ide/Dockerfile
+            - pyproject.toml
+            - uv.lock
       runner:
-       cpus: 6
-       gpus: 1
+        tags: cnb:arch:amd64:gpu
       services:
         - name: vscode
           options:
             onlyPreview: true
-            launch: uv run main_web.py ai
+            launch: /opt/game-map-web-env/.venv/bin/python main_web.py ai
             keepAliveTimeout: 3600000
             daemon: true
             backup: true
       stages:
-        - name: install-torch-cuda
+        - name: check-ai-env
           script: |
-            uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 || true
-            uv pip install kornia || true
-            uv sync
-        - name: ls
-          script: ls -al
+            /opt/game-map-web-env/.venv/bin/python -c "import torch, kornia; print(f'torch={torch.__version__}, kornia={kornia.__version__}, cuda={torch.cuda.is_available()}')"
+            ls -al
