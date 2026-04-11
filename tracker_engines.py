@@ -25,377 +25,89 @@ def _angular_diff(a, b):
 
 class _ArrowDirectionSystem:
     """
-    基于移动方向校准 + 小地图箭头视觉特征匹配的方向系统。
+    纯坐标驱动的方向系统（无视觉特征依赖）。
 
     核心思路:
-      移动时 → 位移方向即为真实朝向，同时提取箭头视觉特征并按角度缓存
-      静止时 → 提取当前箭头特征，与缓存特征库对比匹配，输出最接近的已知角度
-      跑图越久 → 特征库覆盖角度越全 → 方向匹配越准确
-
-    特征: 以箭头质心为原点，将周围像素划分为 N 个角度扇区，
-          统计每个扇区内箭头像素的数量，构成旋转敏感的直方图特征。
+      - 每帧接收地图坐标，根据坐标位移方向计算箭头朝向
+      - 多帧累积位移 + EMA 平滑，过滤 SIFT 单帧抖动
+      - 瞬间反向转向时快速跟随（角度差超阈值则跳过平滑直接赋值）
+      - 静止不动时标记 is_stopped，前端渲染为圆点
     """
 
     def __init__(self):
-        self.NUM_BINS = getattr(config, 'ARROW_FEATURE_BINS', 36)
-        self.NUM_SECTORS = getattr(config, 'ARROW_FEATURE_SECTORS', 18)
+        # 位置历史（用于累积位移判断移动/静止）
+        _hist_len = getattr(config, 'ARROW_POS_HISTORY_LEN', 4)
+        self._pos_history = deque(maxlen=_hist_len)
 
-        # --- 角度 → 特征 缓存（向量化匹配用）---
-        self.feature_cache = [None] * self.NUM_BINS
-        self.cache_confidence = np.zeros(self.NUM_BINS, dtype=np.float32)
-        self.cache_count = np.zeros(self.NUM_BINS, dtype=np.int32)
-        self._total_cached_bins = 0
-        self._cache_matrix = None       # (N, NUM_SECTORS) 向量化匹配矩阵
-        self._cache_matrix_dirty = True # 缓存更新后标记脏
-
-        # --- 移动检测（3 帧累积位移，过滤建筑攻爪/SIFT 单帧抖动）---
-        self._pos_history = deque(maxlen=3)   # 最近 3 帧地图坐标
+        # 移动判定阈值（累积位移 < 阈值 → 静止）
         self._move_threshold = getattr(config, 'ARROW_MOVE_MIN_DISPLACEMENT', 6)
-        self._cum_move_threshold = self._move_threshold * 2  # 3 帧净位移判动阈值
-        self._stopped_frames = 0
-        self._stopped_min = getattr(config, 'ARROW_STOPPED_FRAMES_MIN', 2)
 
-        # --- 输出状态 ---
+        # 静止防抖：连续 N 帧低于阈值才判定为静止
+        self._stopped_debounce = getattr(config, 'ARROW_STOPPED_DEBOUNCE', 3)
+        self._low_move_streak = 0
+
+        # EMA 平滑
+        self._ema_alpha = getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.35)
+
+        # 急转弯阈值：角度差超过此值时跳过 EMA 直接赋值（应付瞬间反向）
+        self._snap_threshold = getattr(config, 'ARROW_SNAP_THRESHOLD', 90)
+
+        # 输出状态
         self._last_angle = 0.0
-        self._last_moving_angle = None
         self._ema_angle = None
-        self._ema_alpha = getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.3)
+        self._is_stopped = True
 
-        # --- HSV 范围 (固定) ---
-        self._hsv_lower = np.array([15, 120, 180], dtype=np.uint8)
-        self._hsv_upper = np.array([35, 255, 255], dtype=np.uint8)
-
-        # --- 学习参数 ---
-        self._learn_alpha = getattr(config, 'ARROW_FEATURE_LEARN_ALPHA', 0.2)
-        self._match_min_score = getattr(config, 'ARROW_MATCH_MIN_SCORE', 0.4)
-
-        # --- 降分辨率 ---
-        self._downscale = getattr(config, 'ARROW_DOWNSCALE', 2)
-
-        # --- 移动时跳帧缓存 ---
-        self._cache_every_n = getattr(config, 'ARROW_CACHE_EVERY_N_FRAMES', 3)
-        self._move_frame_counter = 0
-
-        # --- 可复用对象（避免每帧重建）---
-        self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        self._circ_mask_cache = {}  # (h, w) -> mask
-
-        # --- 帧级缓存（同一帧 minimap 只做一次 HSV+形态学+轮廓）---
-        self._frame_ref = None      # 上次处理的 minimap 对象引用
-        self._frame_pos = None      # (cx, cy) or None
-        self._frame_feat = None     # feature vector or None
-        self._frame_mask = None     # 箭头 mask（缩小分辨率），供 PCA 支流使用
-        self._frame_cxs = None      # 质心在缩小图内的坐标
-        self._frame_cys = None
-
-    # ========== 核心管线（帧级缓存）==========
-
-    def _get_circ_mask(self, h, w):
-        """带缓存的圆形掩码（小地图尺寸稳定后不再重建）"""
-        key = (h, w)
-        cached = self._circ_mask_cache.get(key)
-        if cached is not None:
-            return cached
-        circ = np.zeros((h, w), dtype=np.uint8)
-        cv2.circle(circ, (w // 2, h // 2), min(w, h) // 2 - 2, 255, -1)
-        self._circ_mask_cache[key] = circ
-        return circ
-
-    def _detect_full(self, minimap_bgr):
+    def update(self, map_x=None, map_y=None):
         """
-        核心管线：降分辨率 → HSV → mask → 形态学 → 轮廓 → 质心 + 特征直方图。
-        同一帧 minimap 仅执行一次（帧级缓存），后续调用直接返回缓存结果。
-        返回 ((cx, cy) or None, feature_vector or None)。
-        质心坐标已映射回原始分辨率。
-        """
-        if minimap_bgr is self._frame_ref:
-            return self._frame_pos, self._frame_feat
-
-        self._frame_ref = minimap_bgr
-        self._frame_pos = None
-        self._frame_feat = None
-        self._frame_mask = None
-        self._frame_cxs = None
-        self._frame_cys = None
-
-        h_orig, w_orig = minimap_bgr.shape[:2]
-        if h_orig < 10 or w_orig < 10:
-            return None, None
-
-        # --- 降分辨率（减少 HSV / 形态学 / 轮廓计算量）---
-        s = self._downscale
-        if s > 1:
-            small = cv2.resize(minimap_bgr, (w_orig // s, h_orig // s),
-                               interpolation=cv2.INTER_AREA)
-        else:
-            small = minimap_bgr
-        h, w = small.shape[:2]
-
-        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)
-        mask = mask & self._get_circ_mask(h, w)
-        # 单次 CLOSE 即可（降分辨率后噪点已减少）
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel, iterations=1)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None, None
-
-        # 选取最靠近中心的轮廓（面积阈值按缩放调整）
-        mcx, mcy = w / 2.0, h / 2.0
-        area_min = max(5, 20 // (s * s))
-        best_cnt = None
-        best_dist = float('inf')
-        for cnt in contours:
-            if cv2.contourArea(cnt) < area_min:
-                continue
-            M_c = cv2.moments(cnt)
-            if M_c['m00'] < 1e-6:
-                continue
-            ccx = M_c['m10'] / M_c['m00']
-            ccy = M_c['m01'] / M_c['m00']
-            d = (ccx - mcx) ** 2 + (ccy - mcy) ** 2
-            if d < best_dist:
-                best_dist = d
-                best_cnt = cnt
-
-        if best_cnt is None:
-            return None, None
-
-        M_m = cv2.moments(best_cnt)
-        cx_s = M_m['m10'] / M_m['m00']
-        cy_s = M_m['m01'] / M_m['m00']
-        # 映射回原始分辨率
-        cx = float(cx_s * s)
-        cy = float(cy_s * s)
-        self._frame_pos = (cx, cy)
-        self._frame_mask = mask   # 保存 mask 供 PCA 支流
-        self._frame_cxs = cx_s
-        self._frame_cys = cy_s
-
-        # --- 特征提取：箭头像素角度扇区直方图（在缩小图上计算）---
-        ys, xs = np.where(mask > 0)
-        if len(xs) >= 6:
-            dx = xs.astype(np.float32) - cx_s
-            dy = ys.astype(np.float32) - cy_s
-            dist_sq = dx * dx + dy * dy
-            far = dist_sq > 1.0  # 降分辨率后阈值相应缩小
-            dx, dy = dx[far], dy[far]
-            if len(dx) >= 3:
-                angles = np.degrees(np.arctan2(dy, dx)) % 360
-                bin_size = 360.0 / self.NUM_SECTORS
-                bins = (angles / bin_size).astype(np.int32) % self.NUM_SECTORS
-                hist = np.bincount(bins, minlength=self.NUM_SECTORS).astype(np.float32)
-                norm = np.linalg.norm(hist)
-                if norm > 1e-6:
-                    hist /= norm
-                    self._frame_feat = hist
-
-        return self._frame_pos, self._frame_feat
-
-    # ========== 公开接口（薄代理到缓存管线）==========
-
-    def detect_arrow_position(self, minimap_bgr):
-        """返回箭头质心 (cx, cy) 或 None。供 Homography 参考点使用。"""
-        pos, _ = self._detect_full(minimap_bgr)
-        return pos
-
-    def _extract_features(self, minimap_bgr):
-        """返回箭头方向特征向量或 None。"""
-        _, feat = self._detect_full(minimap_bgr)
-        return feat
-
-    def _estimate_arrow_angle_moments(self):
-        """
-        直接用箭头像素的 PCA 主轴估算朝向（不依赖特征缓存）。
-        作为缓存匹配失败时的保底方法，解决挂机过久后缓存稀疏导致方向冻结的问题。
-
-        原理：箭头尾三角形，尖端像素少、基底像素多。
-               PCA 主轴 = 指向轴；质心偏向基底一侧 = 尖端在反侧。
-        Returns: 角度 (0=北, 顺时针) 或 None。
-        """
-        if self._frame_mask is None or self._frame_cxs is None:
-            return None
-        ys, xs = np.where(self._frame_mask > 0)
-        if len(xs) < 8:
-            return None
-
-        dx = xs.astype(np.float32) - self._frame_cxs
-        dy = ys.astype(np.float32) - self._frame_cys
-
-        # PCA：找方差最大的主轴（箭头的长轴方向）
-        cov = np.cov(dx, dy)
-        vals, vecs = np.linalg.eigh(cov)
-        axis = vecs[:, np.argmax(vals)]  # [ax, ay]
-
-        # 解 180° 歧义：投影到主轴。由于部分游戏箭头头部（尖端）较宽、像素较多，
-        # 反转大小比较逻辑以适应头大尾小的箭头图标。
-        proj = dx * axis[0] + dy * axis[1]
-        tip_dir = axis if np.sum(proj > 0) > np.sum(proj < 0) else -axis
-
-        # 转换：0=北=屏幕上方(-y)，顺时针增加
-        return math.degrees(math.atan2(float(tip_dir[0]), -float(tip_dir[1]))) % 360
-
-    def _try_visual_angle(self, minimap_bgr):
-        """
-        纯视觉朝向估算：特征缓存匹配 → PCA 矩保底。
-        返回 (raw_angle or None, features or None, source: 'cache'|'pca'|None)。
-        不修改 EMA 状态，由调用方决定是否平滑。
-        """
-        features = self._extract_features(minimap_bgr)
-        if features is not None:
-            matched, score = self._match_features(features)
-            if matched is not None:
-                return matched, features, 'cache'
-            pca_angle = self._estimate_arrow_angle_moments()
-            if pca_angle is not None:
-                return pca_angle, features, 'pca'
-        return None, features, None
-
-    # ========== 缓存管理 ==========
-
-    def _angle_to_bin(self, angle):
-        return int(angle / 360.0 * self.NUM_BINS) % self.NUM_BINS
-
-    def _cache_feature(self, angle, features):
-        """将特征存入对应角度 bin（EMA 更新）"""
-        idx = self._angle_to_bin(angle)
-        if self.feature_cache[idx] is None:
-            self.feature_cache[idx] = features.copy()
-            self._total_cached_bins += 1
-        else:
-            a = self._learn_alpha
-            self.feature_cache[idx] = (1 - a) * self.feature_cache[idx] + a * features
-        self.cache_count[idx] += 1
-        self.cache_confidence[idx] = min(1.0, self.cache_count[idx] / 10.0)
-        self._cache_matrix_dirty = True
-
-    def _build_cache_matrix(self):
-        """构建向量化匹配矩阵（仅在缓存更新后重建）"""
-        filled = [i for i in range(self.NUM_BINS) if self.feature_cache[i] is not None]
-        if not filled:
-            self._cache_matrix = None
-            self._cache_indices = None
-            self._cache_conf_vec = None
-        else:
-            self._cache_indices = np.array(filled, dtype=np.int32)
-            self._cache_matrix = np.stack([self.feature_cache[i] for i in filled])  # (N, sectors)
-            self._cache_conf_vec = self.cache_confidence[self._cache_indices]
-        self._cache_matrix_dirty = False
-
-    def _match_features(self, features):
-        """
-        向量化匹配：numpy 矩阵乘法替代 Python 循环。
-        返回 (angle, score) 或 (None, 0.0)。
-        """
-        if self._cache_matrix_dirty:
-            self._build_cache_matrix()
-
-        if self._cache_matrix is None:
-            return None, 0.0
-
-        # (N,) = (N, sectors) @ (sectors,) 批量余弦相似度
-        sims = self._cache_matrix @ features
-        weighted = sims * self._cache_conf_vec
-        best_idx = int(np.argmax(weighted))
-        best_score = float(weighted[best_idx])
-
-        if best_score >= self._match_min_score:
-            best_bin = int(self._cache_indices[best_idx])
-            angle = (best_bin + 0.5) * 360.0 / self.NUM_BINS
-            return angle, best_score
-        return None, 0.0
-
-    # ========== 角度平滑 ==========
-
-    def _smooth_angle(self, raw):
-        """圆形 EMA 平滑"""
-        if self._ema_angle is None:
-            self._ema_angle = raw
-            return raw
-        diff = _angular_diff(raw, self._ema_angle)
-        self._ema_angle = (self._ema_angle + self._ema_alpha * diff) % 360
-        return self._ema_angle
-
-    # ========== 主入口 ==========
-
-    def update(self, minimap_bgr, map_x=None, map_y=None):
-        """
-        每帧调用：根据移动/静止状态更新箭头方向。
-
-        移动时: 用坐标位移方向作为真实朝向 + 缓存箭头视觉特征
-        静止时: 用视觉特征匹配缓存库中最接近的已知角度
-        无坐标时: 纯视觉特征匹配（惯性帧等）
+        每帧调用：根据坐标位移更新方向。
 
         Args:
-            minimap_bgr: 小地图 BGR 图像
             map_x, map_y: 当前帧地图坐标 (None = 定位失败/惯性帧)
 
         Returns:
-            angle (float) — 箭头朝向角 (0=北, 顺时针)
+            (angle, is_stopped)
+            angle: float — 箭头朝向角 (0=北, 顺时针)
+            is_stopped: bool — 是否处于静止状态
         """
-        angle = self._last_angle
+        if map_x is None or map_y is None:
+            return self._last_angle, self._is_stopped
 
-        if map_x is not None and map_y is not None:
-            self._pos_history.append((map_x, map_y))
+        self._pos_history.append((map_x, map_y))
 
-            if len(self._pos_history) >= 2:
-                old_x, old_y = self._pos_history[0]
-                cum_dx = map_x - old_x
-                cum_dy = map_y - old_y
-                cum_dist = math.sqrt(cum_dx * cum_dx + cum_dy * cum_dy)
+        if len(self._pos_history) < 2:
+            return self._last_angle, self._is_stopped
 
-                if cum_dist > self._cum_move_threshold:
-                    # ===== 移动中（多帧累积位移超阈值，单帧抖动被过滤）=====
-                    self._stopped_frames = 0
-                    move_angle = math.degrees(math.atan2(cum_dx, -cum_dy)) % 360
-                    angle = move_angle
-                    self._last_moving_angle = move_angle
-                    self._ema_angle = move_angle  # 重置 EMA，防止静止后角度回弹
+        # 累积位移：最旧帧 → 当前帧
+        old_x, old_y = self._pos_history[0]
+        cum_dx = map_x - old_x
+        cum_dy = map_y - old_y
+        cum_dist = math.sqrt(cum_dx * cum_dx + cum_dy * cum_dy)
 
-                    # 跳帧缓存：每 N 帧才提取特征并写入（移动位移是 ground truth）
-                    self._move_frame_counter += 1
-                    if self._move_frame_counter >= self._cache_every_n:
-                        self._move_frame_counter = 0
-                        features = self._extract_features(minimap_bgr)
-                        if features is not None:
-                            self._cache_feature(move_angle, features)
-                            idx = self._angle_to_bin(move_angle)
-                            if self.cache_count[idx] == 1:
-                                cov = self._total_cached_bins / self.NUM_BINS * 100
-                                print(f"  [箭头特征] 新角度 bin {idx} "
-                                      f"(~{move_angle:.0f}°) | 覆盖率: {cov:.0f}%")
-                else:
-                    # ===== 静止 =====
-                    self._stopped_frames += 1
-                    if self._stopped_frames >= self._stopped_min:
-                        vis_raw, features, source = self._try_visual_angle(minimap_bgr)
-                        if vis_raw is not None:
-                            angle = self._smooth_angle(vis_raw)
-                            # 仅 PCA 保底时才种子填充缓存（位移校准才是真正的 ground truth）
-                            if source == 'pca' and features is not None:
-                                if self._stopped_frames % (self._cache_every_n * 2) == 0:
-                                    self._cache_feature(vis_raw, features)
-                        elif self._last_moving_angle is not None:
-                            angle = self._last_moving_angle
-                    elif self._last_moving_angle is not None:
-                        angle = self._last_moving_angle
+        if cum_dist < self._move_threshold:
+            # 低位移，累加静止计数
+            self._low_move_streak += 1
+            if self._low_move_streak >= self._stopped_debounce:
+                self._is_stopped = True
+            return self._last_angle, self._is_stopped
+
+        # 有效移动 → 重置静止计数
+        self._low_move_streak = 0
+        self._is_stopped = False
+
+        raw_angle = math.degrees(math.atan2(cum_dx, -cum_dy)) % 360
+
+        # 平滑 or 急转快跳
+        if self._ema_angle is None:
+            self._ema_angle = raw_angle
         else:
-            # ===== 无坐标（惯性/丢失）：纯视觉 =====
-            vis_raw, _, _ = self._try_visual_angle(minimap_bgr)
-            if vis_raw is not None:
-                angle = self._smooth_angle(vis_raw)
-            elif self._last_moving_angle is not None:
-                angle = self._last_moving_angle
+            diff = _angular_diff(raw_angle, self._ema_angle)
+            if abs(diff) >= self._snap_threshold:
+                self._ema_angle = raw_angle
+            else:
+                self._ema_angle = (self._ema_angle + self._ema_alpha * diff) % 360
 
-        # 移动时直接输出（不经 EMA）；静止/无坐标分支内已应用 EMA
-        self._last_angle = angle
-        return angle
-
-    @property
-    def coverage(self):
-        """特征库角度覆盖率 (0.0 ~ 1.0)"""
-        return self._total_cached_bins / self.NUM_BINS
+        self._last_angle = self._ema_angle
+        return self._last_angle, self._is_stopped
 
 
 class SIFTMapTracker:
@@ -417,9 +129,10 @@ class SIFTMapTracker:
         _sift_contrast = getattr(config, 'SIFT_CONTRAST_THRESHOLD', 0.02)
         self.sift = cv2.SIFT_create(contrastThreshold=_sift_contrast)
 
-        # 上一帧箭头角度（用于箭头检测失败时降级，tracker_core 也读取此属性）
+        # 上一帧箭头角度
         self._last_arrow_angle = 0.0
-        # 箭头方向系统（移动校准 + 特征匹配）
+        self._last_arrow_stopped = True
+        # 箭头方向系统（纯坐标驱动）
         self._arrow_dir = _ArrowDirectionSystem()
 
         # 线程锁（防止并发请求导致 kp_local / flann 竞态）
@@ -474,7 +187,6 @@ class SIFTMapTracker:
         self.last_y = None
         self.lost_frames = 0
         self._sift_confused = False  # scale 异常时标记，供混合引擎快速升级
-        self._arrow_offset = (0.0, 0.0)  # 箭头中心相对 minimap 中心的偏移（降级复用）
 
         # === 状态冻结（BLOCK 期间保持局部索引 + 坐标，恢复时直接复用）===
         self._frozen = False
@@ -748,11 +460,7 @@ class SIFTMapTracker:
                         if avg_scale > max_scale or avg_scale < 1.0 / max_scale:
                             continue
                         h, w = minimap_gray.shape
-                        arrow_pos = self._arrow_dir.detect_arrow_position(minimap_bgr)
-                        if arrow_pos is not None:
-                            ref_x, ref_y = arrow_pos
-                        else:
-                            ref_x, ref_y = w / 2.0, h / 2.0
+                        ref_x, ref_y = w / 2.0, h / 2.0
 
                         center_pt = np.float32([[[ref_x, ref_y]]])
                         dst_center = cv2.perspectiveTransform(center_pt, M)
@@ -761,16 +469,16 @@ class SIFTMapTracker:
 
                         if abs(tx - anchor_x) <= r * 1.5 and abs(ty - anchor_y) <= r * 1.5:
                             if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
-                                # 锁定模式下更新方向系统
-                                angle = self._arrow_dir.update(minimap_bgr, tx, ty)
+                                angle, stopped = self._arrow_dir.update(tx, ty)
                                 self._last_arrow_angle = angle
+                                self._last_arrow_stopped = stopped
                                 return self._make_locked_result(True, tx, ty, t_start, "LOCKED", arrow_angle=angle,
-                                                           retry=attempt + 1)
+                                                           arrow_stopped=stopped, retry=attempt + 1)
 
         # 所有重试都失败
         return self._make_locked_result(False, None, None, t_start, "LOCK_FAIL")
 
-    def _make_locked_result(self, found, cx, cy, t_start, state, arrow_angle=None, retry=0):
+    def _make_locked_result(self, found, cx, cy, t_start, state, arrow_angle=None, arrow_stopped=True, retry=0):
         """构造锁定模式的返回字典"""
         t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000
         self._frame_times.append(t_elapsed)
@@ -783,6 +491,7 @@ class SIFTMapTracker:
             'center_x': cx,
             'center_y': cy,
             'arrow_angle': arrow_angle,
+            'arrow_stopped': arrow_stopped,
             'is_inertial': not found,
             'match_count': 0,
             'map_width': self.map_width,
@@ -791,34 +500,42 @@ class SIFTMapTracker:
         }
 
     @staticmethod
-    def _draw_arrow_marker(img_bgr, cx, cy, size=None, angle=0):
+    def _draw_arrow_marker(img_bgr, cx, cy, size=None, angle=0, stopped=False):
         """
-        在地图上绘制玩家方向箭头标记。
+        在地图上绘制玩家方向标记。
+        stopped=True 时画圆点，否则画方向箭头。
         angle: 旋转角度（度），0=朝上，顺时针增加
         """
         if size is None:
             size = 12
 
-        pts = np.array([
-            [cx, cy - size],
-            [cx - size * 0.6, cy + size * 0.7],
-            [cx + size * 0.6, cy + size * 0.7],
-        ], dtype=np.float64)
-
-        if angle != 0:
-            rad = math.radians(angle)   # 正角度 = 从北顺时针旋转（修正左右镜像）
-            cos_a = math.cos(rad)
-            sin_a = math.sin(rad)
-            centered = pts - np.array([cx, cy])
-            rot_mat = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-            rotated = (rot_mat @ centered.T).T + np.array([cx, cy])
-            pts = rotated.astype(np.int32)
-        else:
-            pts = pts.astype(np.int32)
-
         overlay = img_bgr.copy()
-        cv2.fillPoly(overlay, [pts], (48, 182, 254))
-        cv2.polylines(overlay, [pts], True, (255, 255, 255), 1)
+
+        if stopped:
+            r = int(size * 0.6)
+            cv2.circle(overlay, (int(cx), int(cy)), r, (48, 182, 254), -1)
+            cv2.circle(overlay, (int(cx), int(cy)), r, (255, 255, 255), 1)
+        else:
+            pts = np.array([
+                [cx, cy - size],
+                [cx - size * 0.6, cy + size * 0.7],
+                [cx + size * 0.6, cy + size * 0.7],
+            ], dtype=np.float64)
+
+            if angle != 0:
+                rad = math.radians(angle)
+                cos_a = math.cos(rad)
+                sin_a = math.sin(rad)
+                centered = pts - np.array([cx, cy])
+                rot_mat = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+                rotated = (rot_mat @ centered.T).T + np.array([cx, cy])
+                pts = rotated.astype(np.int32)
+            else:
+                pts = pts.astype(np.int32)
+
+            cv2.fillPoly(overlay, [pts], (48, 182, 254))
+            cv2.polylines(overlay, [pts], True, (255, 255, 255), 1)
+
         cv2.addWeighted(overlay, 0.85, img_bgr, 0.15, 0, img_bgr)
 
     @staticmethod
@@ -1038,17 +755,7 @@ class SIFTMapTracker:
                             continue
 
                         h, w = minimap_gray.shape
-
-                        # 箭头位置检测：获取精确中心（方向由 _arrow_dir 后续处理）
-                        arrow_pos = self._arrow_dir.detect_arrow_position(minimap_bgr)
-                        if arrow_pos is not None:
-                            ref_x, ref_y = arrow_pos
-                            self._arrow_offset = (ref_x - w / 2.0, ref_y - h / 2.0)
-                            quality_bonus = 1.0
-                        else:
-                            ox, oy = getattr(self, '_arrow_offset', (0.0, 0.0))
-                            ref_x, ref_y = w / 2.0 + ox, h / 2.0 + oy
-                            quality_bonus = 0.6
+                        ref_x, ref_y = w / 2.0, h / 2.0
 
                         center_pt = np.float32([[[ref_x, ref_y]]])
                         dst_center = cv2.perspectiveTransform(center_pt, M)
@@ -1057,7 +764,7 @@ class SIFTMapTracker:
 
                         # 置信度评分
                         inlier_ratio = inlier_count / max(len(good), 1)
-                        match_quality = min(1.0, inlier_ratio * quality_bonus)
+                        match_quality = min(1.0, inlier_ratio)
 
                         if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
                             if self.last_x is not None:
@@ -1129,20 +836,24 @@ class SIFTMapTracker:
                   f"fps: {1000/avg:.1f}")
             self._frame_times.clear()
 
-        # ===== 箭头方向：移动校准 + 特征匹配 =====
+        # ===== 箭头方向：纯坐标驱动 =====
+        arrow_stopped = True
         if found and not is_inertial:
-            arrow_angle = self._arrow_dir.update(minimap_bgr, center_x, center_y)
+            arrow_angle, arrow_stopped = self._arrow_dir.update(center_x, center_y)
         elif found and is_inertial:
-            arrow_angle = self._arrow_dir.update(minimap_bgr, None, None)
+            arrow_angle, arrow_stopped = self._arrow_dir.update(None, None)
         else:
             arrow_angle = self._arrow_dir._last_angle
+            arrow_stopped = self._arrow_dir._is_stopped
         self._last_arrow_angle = arrow_angle
+        self._last_arrow_stopped = arrow_stopped
 
         return {
             'found': found,
             'center_x': center_x,
             'center_y': center_y,
             'arrow_angle': arrow_angle,
+            'arrow_stopped': arrow_stopped,
             'is_inertial': is_inertial,
             'match_count': 0,
             'match_quality': match_quality,

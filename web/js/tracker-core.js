@@ -42,6 +42,7 @@ const TrackerCore = (() => {
         selCircle: { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) },
         wsSocket: null,
         wsConnected: false,
+        captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
     };
 
     let opts = {
@@ -282,8 +283,10 @@ const TrackerCore = (() => {
             var sz = Math.max(10, Math.round(r * 2 * margin));
             var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
 
-            var c = document.createElement('canvas');
-            c.width = sz; c.height = sz;
+            // 复用 canvas 避免每帧创建新元素导致 GPU 内存堆积
+            if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
+            var c = S.captureCanvas;
+            if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
             return c.toDataURL('image/jpeg', 0.80);
@@ -309,8 +312,10 @@ const TrackerCore = (() => {
             var sz = Math.max(10, Math.round(r * 2 * margin));
             var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
 
-            var c = document.createElement('canvas');
-            c.width = sz; c.height = sz;
+            // 复用 canvas 避免每帧创建新元素导致 GPU 内存堆积
+            if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
+            var c = S.captureCanvas;
+            if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
 
@@ -414,6 +419,7 @@ const TrackerCore = (() => {
                                 matches: status.c,
                                 match_quality: status.q || 0,
                                 arrow_angle: status.a || 0,
+                                arrow_stopped: !!status.as,
                                 coord_lock: !!status.l,
                                 hybrid_busy: !!status.h,
                             }
@@ -447,7 +453,7 @@ const TrackerCore = (() => {
                 return Promise.reject(new Error('WS not connected'));
             }
             S.wsSocket.emit('frame', blob);
-            this.log('\u5df2发送二进制帧 (' + Math.round(blob.size / 1024) + ' KB)');
+            // 不在此处逐帧打日志，避免每帧触发 DOM 重排（scrollTop）
             return Promise.resolve();
         },
 

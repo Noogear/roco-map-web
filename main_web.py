@@ -463,6 +463,7 @@ def ws_receive_frame(raw_bytes):
             'c': status['matches'],
             'q': round(status.get('match_quality', 0), 2),
             'a': round(status.get('arrow_angle', 0), 1),
+            'as': int(status.get('arrow_stopped', True)),
             'l': int(tracker.sift_engine.coord_lock_enabled),
             'h': int(status.get('hybrid_busy', False)),
         }, separators=(',', ':')).encode('utf-8')
@@ -497,6 +498,7 @@ def ws_frame_coords(raw_bytes):
             'c': status['matches'],
             'q': round(status.get('match_quality', 0), 2),
             'a': round(status.get('arrow_angle', 0), 1),
+            'as': int(status.get('arrow_stopped', True)),
             'l': int(tracker.sift_engine.coord_lock_enabled),
             'h': int(status.get('hybrid_busy', False)),
         }, separators=(',', ':')).encode('utf-8')

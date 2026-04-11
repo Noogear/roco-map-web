@@ -273,8 +273,10 @@
     <svg id="arrowDir" width="40" height="40" viewBox="0 0 40 40"
          style="position:absolute;left:0;top:0;pointer-events:none;z-index:11;
                 will-change:transform;transition:opacity .15s;opacity:0;">
-        <polygon points="20,2 14,16 26,16" fill="#FFC448" stroke="#fff" stroke-width="1.2"
+        <polygon id="arrowPoly" points="20,2 14,16 26,16" fill="#FFC448" stroke="#fff" stroke-width="1.2"
                  opacity=".85"/>
+        <circle id="arrowCircle" cx="20" cy="20" r="7" fill="#FFC448" stroke="#fff" stroke-width="1.2"
+                opacity=".85" display="none"/>
     </svg>
 </div>
 
@@ -352,6 +354,7 @@ var lx=null, ly=null, lf=false;
 var autoRun=false, autoT=null;
 var sending=false;
 var lAngle=0; // 最新箭头角度
+var lStopped=true; // 是否静止
 
 // === 静止死区：上次被接受的地图坐标，用于过滤 SIFT 微小随机抖动 ===
 var _lastDotMapX = null, _lastDotMapY = null, _lastDotAngle = null;
@@ -403,7 +406,8 @@ TC.init({
             ly = result.status.position.y;
             lf = !!result.status.found;
             lAngle = result.status.arrow_angle || 0;
-            setDot(lx, ly, result.status.state || '', lf, lAngle);
+            lStopped = !!result.status.arrow_stopped;
+            setDot(lx, ly, result.status.state || '', lf, lAngle, lStopped);
             updUIBig(result);
             if (autoRun && lf) ensureVis(lx, ly);
             // 路线: 用玩家坐标更新进度
@@ -447,11 +451,20 @@ function applyT() {
 }
 
 // ========== 红点 & UI 更新 ==========
-function setDot(x, y, state, found, angle){
+function setDot(x, y, state, found, angle, stopped){
     // 地图坐标 → 屏幕坐标
     var screenX = x * sc + ox;
     var screenY = y * sc + oy;
     angle = angle || 0;
+    stopped = !!stopped;
+
+    // 箭头/圆形切换
+    var ap = document.getElementById('arrowPoly');
+    var ac = document.getElementById('arrowCircle');
+    if (ap && ac) {
+        ap.setAttribute('display', stopped ? 'none' : '');
+        ac.setAttribute('display', stopped ? '' : 'none');
+    }
 
     // === 静止死区过滤：位置和角度变化量均低于阈值时跳过 lerp，消除静止抖动 ===
     if (_lastDotMapX !== null) {

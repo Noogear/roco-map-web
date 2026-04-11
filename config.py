@@ -63,16 +63,12 @@ MINIMAP_CIRCLE_R_TOLERANCE = 8          # 校准后允许半径偏差 (像素)
 MINIMAP_CIRCLE_CENTER_TOLERANCE = 15    # 校准后允许圆心偏移 (像素)
 MINIMAP_CIRCLE_RECALIBRATE_MISS = 30    # 连续多少帧未检测到圆 → 重新校准
 
-# === 箭头方向系统 (移动校准 + 特征匹配) ===
-ARROW_ANGLE_SMOOTH_ALPHA = 0.3          # 角度 EMA 平滑系数 (0=不平滑, 1=无惯性)
-ARROW_FEATURE_BINS = 36                 # 角度缓存粒度: 360°/36 = 每 10° 一个 bin
-ARROW_FEATURE_SECTORS = 18              # 特征直方图扇区数: 360°/18 = 每 20° 一个扇区
-ARROW_FEATURE_LEARN_ALPHA = 0.2         # 特征缓存 EMA 学习率
-ARROW_MATCH_MIN_SCORE = 0.4             # 特征匹配最低余弦相似度
-ARROW_MOVE_MIN_DISPLACEMENT = 6         # 判定移动的最小位移 (像素)
-ARROW_STOPPED_FRAMES_MIN = 4            # 连续静止多少帧后才用特征匹配角度
-ARROW_CACHE_EVERY_N_FRAMES = 3          # 移动时每 N 帧缓存一次特征（减少计算）
-ARROW_DOWNSCALE = 2                     # HSV 检测前缩小倍数（1=不缩小）
+# === 箭头方向系统 (纯坐标驱动) ===
+ARROW_ANGLE_SMOOTH_ALPHA = 0.35         # 角度 EMA 平滑系数 (0=强平滑, 1=无平滑)
+ARROW_MOVE_MIN_DISPLACEMENT = 6         # 判定移动的最小累积位移 (像素)
+ARROW_POS_HISTORY_LEN = 4              # 坐标历史帧数 (用于累积位移计算)
+ARROW_STOPPED_DEBOUNCE = 3             # 连续低位移多少帧后判定为静止
+ARROW_SNAP_THRESHOLD = 90              # 角度差超此值时跳过平滑直接赋值（应付瞬间反向）
 
 # === 坐标锁定模式设置 ===
 COORD_LOCK_ENABLED = False             # 是否启用坐标锁定（运行时动态切换）

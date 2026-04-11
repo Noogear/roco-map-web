@@ -527,6 +527,7 @@ class AIMapTrackerWeb:
             'matches': match_count,
             'match_quality': getattr(self, '_last_match_quality', 0),
             'arrow_angle': getattr(self, '_last_arrow_angle_out', 0),
+            'arrow_stopped': getattr(self, '_last_arrow_stopped_out', True),
             'coord_lock': self.sift_engine.coord_lock_enabled,
             'hybrid': self._hybrid_enabled,
             'hybrid_busy': self._hybrid_busy,
@@ -570,6 +571,7 @@ class AIMapTrackerWeb:
                 sx, sy = frozen_pos
                 display_crop, status_state = self._render_sift_crop(
                     sx, sy, sx, sy, True, True, self.sift_engine._last_arrow_angle,
+                    self.sift_engine._last_arrow_stopped,
                     {'_locked_state': ''}, half_view)
                 return True, display_crop, 'SCENE_CHANGE', 0, sx, sy
 
@@ -579,6 +581,7 @@ class AIMapTrackerWeb:
                 sx, sy = predicted
                 display_crop, status_state = self._render_sift_crop(
                     sx, sy, sx, sy, True, True, self.sift_engine._last_arrow_angle,
+                    self.sift_engine._last_arrow_stopped,
                     {'_locked_state': ''}, half_view)
                 return True, display_crop, 'SCENE_CHANGE', 0, sx, sy
             display_crop = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
@@ -617,7 +620,9 @@ class AIMapTrackerWeb:
         found = result['found']
         cx, cy = result['center_x'], result['center_y']
         arrow_angle = result.get('arrow_angle', 0) or 0
+        arrow_stopped = result.get('arrow_stopped', True)
         self._last_arrow_angle_out = arrow_angle
+        self._last_arrow_stopped_out = arrow_stopped
         is_inertial = result.get('is_inertial', False)
         match_quality = result.get('match_quality', 1.0 if found and not is_inertial else 0.0)
         self._last_match_quality = match_quality
@@ -673,7 +678,7 @@ class AIMapTrackerWeb:
 
         # 渲染裁剪区域 + 画点
         display_crop, status_state = self._render_sift_crop(
-            smooth_x, smooth_y, cx, cy, found, is_inertial, arrow_angle,
+            smooth_x, smooth_y, cx, cy, found, is_inertial, arrow_angle, arrow_stopped,
             result, half_view)
 
         match_count = 0
@@ -688,7 +693,7 @@ class AIMapTrackerWeb:
 
         return found, display_crop, status_state, match_count, last_x, last_y
 
-    def _render_sift_crop(self, smooth_x, smooth_y, cx, cy, found, is_inertial, arrow_angle, result, half_view):
+    def _render_sift_crop(self, smooth_x, smooth_y, cx, cy, found, is_inertial, arrow_angle, arrow_stopped, result, half_view):
         """SIFT 模式的地图裁剪和标记绘制，返回 (display_crop, status_state)"""
         if found and cx is not None:
             ox = getattr(config, 'RENDER_OFFSET_X', 0)
@@ -702,11 +707,11 @@ class AIMapTrackerWeb:
             local_x = (smooth_x + ox) - x1
             local_y = (smooth_y + oy) - y1
             if not is_inertial:
-                self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle)
+                self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle, stopped=arrow_stopped)
                 cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=4, color=(0, 255, 0), thickness=-1)
                 cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=7, color=(255, 255, 255), thickness=1)
             else:
-                self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle)
+                self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle, stopped=arrow_stopped)
                 cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=4, color=(0, 255, 255), thickness=-1)
                 cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=7, color=(255, 255, 255), thickness=1)
         else:

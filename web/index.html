@@ -535,7 +535,7 @@ TC.init({
         document.getElementById('regionInfo').style.display = '';
     },
     onScreenStop: function() {
-        if (screenAutoId) { cancelAnimationFrame(screenAutoId); screenAutoId = null; }
+        if (screenAutoId) { clearTimeout(screenAutoId); screenAutoId = null; }
         screenRunning = false;
         document.getElementById('screenVideoContainer').style.display = 'none';
         document.getElementById('stopScreenBtn').style.display = 'none';
@@ -634,7 +634,10 @@ function initRegionBox(videoEl) {
 }
 
 var dragState = { active: false, type: '', startX: 0, startY: 0, startCircle: null };
+var _regionDragSetup = false;  // 防止多次调用累积全局监听器
 function setupRegionDrag(videoEl) {
+    if (_regionDragSetup) return;
+    _regionDragSetup = true;
     var box = document.getElementById('regionBox');
     var overlay = document.getElementById('regionOverlay');
     var handle = box.querySelector('.region-handle');
