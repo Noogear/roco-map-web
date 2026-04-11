@@ -32,7 +32,7 @@ from tracker_core import AIMapTrackerWeb
 
 # ==================== 路线文件管理 ====================
 
-_ROUTES_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'sift-map-tracker', 'routes'))
+_ROUTES_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'routes'))
 
 
 def _get_route_files():

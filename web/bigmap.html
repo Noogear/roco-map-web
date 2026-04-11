@@ -636,6 +636,20 @@ var RouteModule = (function(){
         activeIndex = -1;
         render();
         updateBtnState();
+        // 视角移动到路线中心
+        var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        data.points.forEach(function(p) {
+            minX = Math.min(minX, p.x);
+            maxX = Math.max(maxX, p.x);
+            minY = Math.min(minY, p.y);
+            maxY = Math.max(maxY, p.y);
+        });
+        var centerX = (minX + maxX) / 2;
+        var centerY = (minY + maxY) / 2;
+        var cw = MC.clientWidth, ch = MC.clientHeight;
+        ox = cw/2 - centerX * sc;
+        oy = ch/2 - centerY * sc;
+        applyT();
         TC.log('已加载路线: ' + (data.name || '未命名') + ' (' + data.points.length + ' 点' + (data.loop ? ', 循环' : '') + ')');
     }
 
