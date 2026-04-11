@@ -1,49 +1,30 @@
 $:
   web_trigger_vscode:
     - docker:
-        build:
-          dockerfile: .ide/Dockerfile
-          by:
-            - .ide/Dockerfile
-            - pyproject.toml
-            - uv.lock
-          versionBy:
-            - .ide/Dockerfile
-            - pyproject.toml
-            - uv.lock
+        image: docker.cnb.cool/wss/ai/mlsharp:latest
       runner:
-        tags: cnb:arch:amd64:gpu
+        tags: cnb:arch:amd64
+        cpus: 6
       services:
         - vscode
+        - docker
       stages:
-        - name: check-ai-env
-          script: |
-            /opt/game-map-web-env/.venv/bin/python -c "import torch, kornia; print(f'torch={torch.__version__}, kornia={kornia.__version__}, cuda={torch.cuda.is_available()}')"
-            ls -al
+        - name: ls
+          script: ls -al
   vscode:
     - docker:
-        build:
-          dockerfile: .ide/Dockerfile
-          by:
-            - .ide/Dockerfile
-            - pyproject.toml
-            - uv.lock
-          versionBy:
-            - .ide/Dockerfile
-            - pyproject.toml
-            - uv.lock
+        image: docker.cnb.cool/wss/ai/mlsharp:latest
       runner:
-        tags: cnb:arch:amd64:gpu
+        tags: cnb:arch:amd64
+        cpus: 6
       services:
         - name: vscode
           options:
             onlyPreview: true
-            launch: /opt/game-map-web-env/.venv/bin/python main_web.py ai
+            launch: uv run main_web.py cpu
             keepAliveTimeout: 3600000
             daemon: true
             backup: true
       stages:
-        - name: check-ai-env
-          script: |
-            /opt/game-map-web-env/.venv/bin/python -c "import torch, kornia; print(f'torch={torch.__version__}, kornia={kornia.__version__}, cuda={torch.cuda.is_available()}')"
-            ls -al
+        - name: ls
+          script: ls -al
