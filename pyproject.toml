@@ -26,3 +26,6 @@ map-tracker-web = "main_web:main"
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main_web", "main_sift", "tracker_core", "tracker_engines", "config", "download_map", "draw_markers"]
