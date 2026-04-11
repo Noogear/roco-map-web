@@ -63,11 +63,16 @@ MINIMAP_CIRCLE_R_TOLERANCE = 8          # 校准后允许半径偏差 (像素)
 MINIMAP_CIRCLE_CENTER_TOLERANCE = 15    # 校准后允许圆心偏移 (像素)
 MINIMAP_CIRCLE_RECALIBRATE_MISS = 30    # 连续多少帧未检测到圆 → 重新校准
 
-# === 箭头检测优化 ===
-ARROW_TEMPLATE_MATCH_THRESHOLD = 0.65   # 模板匹配相关系数阈值 (快速路径)
-ARROW_ROI_PADDING = 15                  # 模板匹配 ROI 扩展像素
-ARROW_HSV_LEARN_ALPHA = 0.1             # HSV 范围自适应学习率
-ARROW_ANGLE_SMOOTH_ALPHA = 0.2          # 角度 EMA 平滑系数 (0=不平滑, 1=无惯性)
+# === 箭头方向系统 (移动校准 + 特征匹配) ===
+ARROW_ANGLE_SMOOTH_ALPHA = 0.3          # 角度 EMA 平滑系数 (0=不平滑, 1=无惯性)
+ARROW_FEATURE_BINS = 36                 # 角度缓存粒度: 360°/36 = 每 10° 一个 bin
+ARROW_FEATURE_SECTORS = 18              # 特征直方图扇区数: 360°/18 = 每 20° 一个扇区
+ARROW_FEATURE_LEARN_ALPHA = 0.2         # 特征缓存 EMA 学习率
+ARROW_MATCH_MIN_SCORE = 0.4             # 特征匹配最低余弦相似度
+ARROW_MOVE_MIN_DISPLACEMENT = 6         # 判定移动的最小位移 (像素)
+ARROW_STOPPED_FRAMES_MIN = 4            # 连续静止多少帧后才用特征匹配角度
+ARROW_CACHE_EVERY_N_FRAMES = 3          # 移动时每 N 帧缓存一次特征（减少计算）
+ARROW_DOWNSCALE = 2                     # HSV 检测前缩小倍数（1=不缩小）
 
 # === 坐标锁定模式设置 ===
 COORD_LOCK_ENABLED = False             # 是否启用坐标锁定（运行时动态切换）
@@ -84,6 +89,13 @@ LINEAR_FILTER_MAX_CONSECUTIVE = 10     # 连续丢弃多少帧后强制接受真
 # 正值 = 向右/下偏移，负值 = 向左/上偏移。用于微调定位点位置。
 RENDER_OFFSET_X = 0                  # 像素偏移（如果定位点偏左，改为正值如 +10）
 RENDER_OFFSET_Y = 0                  # 像素偏移
+
+# === 渲染平滑防抖 ===
+# 静止死区：渲染坐标变化量 ≤ 此阈值（像素）时保持不动，消除静止时的 SIFT 噪声抖动
+RENDER_STILL_THRESHOLD = 2
+# 移动 EMA 平滑系数：0=完全锁死(无跟随), 1=不平滑(直接跳变)，建议 0.35~0.55
+# 值越小越平滑但跟随延迟越大；值越大越接近原始坐标
+RENDER_EMA_ALPHA = 0.45
 
 # ==========================================
 # LoFTR AI 深度学习算法专属配置 (main_ai.py)

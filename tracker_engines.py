@@ -23,129 +23,328 @@ def _angular_diff(a, b):
     return d - 360 if d > 180 else d
 
 
-class _ArrowCache:
+class _ArrowDirectionSystem:
     """
-    箭头检测运行时缓存：模板快速路径 + HSV 自适应学习 + 角度 EMA 平滑。
-    箭头形状/颜色/大小在游戏中固定，利用这一先验逐步提升检测成功率。
+    基于移动方向校准 + 小地图箭头视觉特征匹配的方向系统。
+
+    核心思路:
+      移动时 → 位移方向即为真实朝向，同时提取箭头视觉特征并按角度缓存
+      静止时 → 提取当前箭头特征，与缓存特征库对比匹配，输出最接近的已知角度
+      跑图越久 → 特征库覆盖角度越全 → 方向匹配越准确
+
+    特征: 以箭头质心为原点，将周围像素划分为 N 个角度扇区，
+          统计每个扇区内箭头像素的数量，构成旋转敏感的直方图特征。
     """
 
     def __init__(self):
-        # 模板缓存
-        self.template_gray = None       # 上次成功的灰度箭头 patch
-        self.template_mask = None       # 对应的二值 mask (前景区域)
-        self.last_bbox = None           # (x1, y1, x2, y2) in minimap coords
-        self.hit_count = 0              # 连续模板命中次数
-        self.miss_streak = 0            # 连续检测失败次数
+        self.NUM_BINS = getattr(config, 'ARROW_FEATURE_BINS', 36)
+        self.NUM_SECTORS = getattr(config, 'ARROW_FEATURE_SECTORS', 18)
 
-        # HSV 自适应范围
+        # --- 角度 → 特征 缓存（向量化匹配用）---
+        self.feature_cache = [None] * self.NUM_BINS
+        self.cache_confidence = np.zeros(self.NUM_BINS, dtype=np.float32)
+        self.cache_count = np.zeros(self.NUM_BINS, dtype=np.int32)
+        self._total_cached_bins = 0
+        self._cache_matrix = None       # (N, NUM_SECTORS) 向量化匹配矩阵
+        self._cache_matrix_dirty = True # 缓存更新后标记脏
+
+        # --- 移动检测 ---
+        self._prev_x = None
+        self._prev_y = None
+        self._move_threshold = getattr(config, 'ARROW_MOVE_MIN_DISPLACEMENT', 6)
+        self._stopped_frames = 0
+        self._stopped_min = getattr(config, 'ARROW_STOPPED_FRAMES_MIN', 4)
+
+        # --- 输出状态 ---
+        self._last_angle = 0.0
+        self._last_moving_angle = None
+        self._ema_angle = None
+        self._ema_alpha = getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.3)
+
+        # --- HSV 范围 (固定) ---
         self._hsv_lower = np.array([15, 120, 180], dtype=np.uint8)
         self._hsv_upper = np.array([35, 255, 255], dtype=np.uint8)
-        self._learned_lower = None
-        self._learned_upper = None
-        self._hsv_samples = 0
-        self._hsv_learn_alpha = getattr(config, 'ARROW_HSV_LEARN_ALPHA', 0.1)
 
-        # 角度 EMA
-        self._ema_angle = None
-        self._angle_alpha = getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.4)
+        # --- 学习参数 ---
+        self._learn_alpha = getattr(config, 'ARROW_FEATURE_LEARN_ALPHA', 0.2)
+        self._match_min_score = getattr(config, 'ARROW_MATCH_MIN_SCORE', 0.4)
 
-        # wake 检测状态（本帧是否成功从白色区域推算了方向）
-        self.last_wake_success = False
+        # --- 降分辨率 ---
+        self._downscale = getattr(config, 'ARROW_DOWNSCALE', 2)
 
-    # ---------- 模板快速路径 ----------
-    def try_template_match(self, minimap_bgr):
-        """在上次位置附近用模板匹配快速检测箭头，返回 (cx, cy) 或 None"""
-        if self.template_gray is None or self.last_bbox is None:
-            return None
+        # --- 移动时跳帧缓存 ---
+        self._cache_every_n = getattr(config, 'ARROW_CACHE_EVERY_N_FRAMES', 3)
+        self._move_frame_counter = 0
 
-        h, w = minimap_bgr.shape[:2]
-        pad = getattr(config, 'ARROW_ROI_PADDING', 15)
-        x1, y1, x2, y2 = self.last_bbox
-        rx1 = max(0, x1 - pad)
-        ry1 = max(0, y1 - pad)
-        rx2 = min(w, x2 + pad)
-        ry2 = min(h, y2 + pad)
+        # --- 可复用对象（避免每帧重建）---
+        self._morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        self._circ_mask_cache = {}  # (h, w) -> mask
 
-        if rx2 <= rx1 or ry2 <= ry1:
-            return None
-        roi = cv2.cvtColor(minimap_bgr[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2GRAY)
-        th, tw = self.template_gray.shape[:2]
-        if roi.shape[0] < th or roi.shape[1] < tw:
-            return None
+        # --- 帧级缓存（同一帧 minimap 只做一次 HSV+形态学+轮廓）---
+        self._frame_ref = None      # 上次处理的 minimap 对象引用
+        self._frame_pos = None      # (cx, cy) or None
+        self._frame_feat = None     # feature vector or None
 
-        threshold = getattr(config, 'ARROW_TEMPLATE_MATCH_THRESHOLD', 0.65)
-        res = cv2.matchTemplate(roi, self.template_gray, cv2.TM_CCOEFF_NORMED,
-                                mask=self.template_mask)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    # ========== 核心管线（帧级缓存）==========
 
-        if max_val >= threshold:
-            # 命中: 模板左上角 → 中心坐标(minimap 坐标系)
-            cx = rx1 + max_loc[0] + tw / 2.0
-            cy = ry1 + max_loc[1] + th / 2.0
-            self.hit_count += 1
-            self.miss_streak = 0
-            return cx, cy
-        return None
+    def _get_circ_mask(self, h, w):
+        """带缓存的圆形掩码（小地图尺寸稳定后不再重建）"""
+        key = (h, w)
+        cached = self._circ_mask_cache.get(key)
+        if cached is not None:
+            return cached
+        circ = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(circ, (w // 2, h // 2), min(w, h) // 2 - 2, 255, -1)
+        self._circ_mask_cache[key] = circ
+        return circ
 
-    def update_template(self, minimap_bgr, mask, bbox):
-        """成功检测后更新模板缓存"""
-        x1, y1, x2, y2 = bbox
-        h, w = minimap_bgr.shape[:2]
-        pad = 3
-        x1p, y1p = max(0, x1 - pad), max(0, y1 - pad)
-        x2p, y2p = min(w, x2 + pad), min(h, y2 + pad)
+    def _detect_full(self, minimap_bgr):
+        """
+        核心管线：降分辨率 → HSV → mask → 形态学 → 轮廓 → 质心 + 特征直方图。
+        同一帧 minimap 仅执行一次（帧级缓存），后续调用直接返回缓存结果。
+        返回 ((cx, cy) or None, feature_vector or None)。
+        质心坐标已映射回原始分辨率。
+        """
+        if minimap_bgr is self._frame_ref:
+            return self._frame_pos, self._frame_feat
 
-        patch = cv2.cvtColor(minimap_bgr[y1p:y2p, x1p:x2p], cv2.COLOR_BGR2GRAY)
-        patch_mask = mask[y1p:y2p, x1p:x2p]
-        if patch.size > 0 and patch_mask.size > 0:
-            self.template_gray = patch.copy()
-            self.template_mask = patch_mask.copy()
-            self.last_bbox = (x1p, y1p, x2p, y2p)
+        self._frame_ref = minimap_bgr
+        self._frame_pos = None
+        self._frame_feat = None
 
-    # ---------- HSV 自适应学习 ----------
-    def get_hsv_bounds(self):
-        """返回当前使用的 HSV 阈值 (lower, upper)"""
-        if self._learned_lower is not None and self._hsv_samples >= 20:
-            return self._learned_lower.copy(), self._learned_upper.copy()
-        return self._hsv_lower.copy(), self._hsv_upper.copy()
+        h_orig, w_orig = minimap_bgr.shape[:2]
+        if h_orig < 10 or w_orig < 10:
+            return None, None
 
-    def learn_hsv(self, hsv_img, mask):
-        """从成功检测的像素中学习 HSV 范围"""
-        pixels = hsv_img[mask > 0]
-        if len(pixels) < 10:
-            return
-        h_min, s_min, v_min = pixels.min(axis=0)
-        h_max, s_max, v_max = pixels.max(axis=0)
-        # 留 margin 防止过拟合
-        margin = np.array([3, 15, 15], dtype=np.float32)
-        obs_lower = np.clip(np.array([h_min, s_min, v_min], dtype=np.float32) - margin, 0, 255)
-        obs_upper = np.clip(np.array([h_max, s_max, v_max], dtype=np.float32) + margin, 0, 255)
-
-        alpha = self._hsv_learn_alpha
-        if self._learned_lower is None:
-            self._learned_lower = obs_lower
-            self._learned_upper = obs_upper
+        # --- 降分辨率（减少 HSV / 形态学 / 轮廓计算量）---
+        s = self._downscale
+        if s > 1:
+            small = cv2.resize(minimap_bgr, (w_orig // s, h_orig // s),
+                               interpolation=cv2.INTER_AREA)
         else:
-            self._learned_lower = (1 - alpha) * self._learned_lower + alpha * obs_lower
-            self._learned_upper = (1 - alpha) * self._learned_upper + alpha * obs_upper
-        self._hsv_samples += 1
+            small = minimap_bgr
+        h, w = small.shape[:2]
 
-    # ---------- 角度 EMA ----------
-    def smooth_angle(self, raw_angle):
-        """圆形 EMA 平滑角度"""
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)
+        mask = mask & self._get_circ_mask(h, w)
+        # 单次 CLOSE 即可（降分辨率后噪点已减少）
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel, iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, None
+
+        # 选取最靠近中心的轮廓（面积阈值按缩放调整）
+        mcx, mcy = w / 2.0, h / 2.0
+        area_min = max(5, 20 // (s * s))
+        best_cnt = None
+        best_dist = float('inf')
+        for cnt in contours:
+            if cv2.contourArea(cnt) < area_min:
+                continue
+            M_c = cv2.moments(cnt)
+            if M_c['m00'] < 1e-6:
+                continue
+            ccx = M_c['m10'] / M_c['m00']
+            ccy = M_c['m01'] / M_c['m00']
+            d = (ccx - mcx) ** 2 + (ccy - mcy) ** 2
+            if d < best_dist:
+                best_dist = d
+                best_cnt = cnt
+
+        if best_cnt is None:
+            return None, None
+
+        M_m = cv2.moments(best_cnt)
+        cx_s = M_m['m10'] / M_m['m00']
+        cy_s = M_m['m01'] / M_m['m00']
+        # 映射回原始分辨率
+        cx = float(cx_s * s)
+        cy = float(cy_s * s)
+        self._frame_pos = (cx, cy)
+
+        # --- 特征提取：箭头像素角度扇区直方图（在缩小图上计算）---
+        ys, xs = np.where(mask > 0)
+        if len(xs) >= 6:
+            dx = xs.astype(np.float32) - cx_s
+            dy = ys.astype(np.float32) - cy_s
+            dist_sq = dx * dx + dy * dy
+            far = dist_sq > 1.0  # 降分辨率后阈值相应缩小
+            dx, dy = dx[far], dy[far]
+            if len(dx) >= 3:
+                angles = np.degrees(np.arctan2(dy, dx)) % 360
+                bin_size = 360.0 / self.NUM_SECTORS
+                bins = (angles / bin_size).astype(np.int32) % self.NUM_SECTORS
+                hist = np.bincount(bins, minlength=self.NUM_SECTORS).astype(np.float32)
+                norm = np.linalg.norm(hist)
+                if norm > 1e-6:
+                    hist /= norm
+                    self._frame_feat = hist
+
+        return self._frame_pos, self._frame_feat
+
+    # ========== 公开接口（薄代理到缓存管线）==========
+
+    def detect_arrow_position(self, minimap_bgr):
+        """返回箭头质心 (cx, cy) 或 None。供 Homography 参考点使用。"""
+        pos, _ = self._detect_full(minimap_bgr)
+        return pos
+
+    def _extract_features(self, minimap_bgr):
+        """返回箭头方向特征向量或 None。"""
+        _, feat = self._detect_full(minimap_bgr)
+        return feat
+
+    # ========== 缓存管理 ==========
+
+    def _angle_to_bin(self, angle):
+        return int(angle / 360.0 * self.NUM_BINS) % self.NUM_BINS
+
+    def _cache_feature(self, angle, features):
+        """将特征存入对应角度 bin（EMA 更新）"""
+        idx = self._angle_to_bin(angle)
+        if self.feature_cache[idx] is None:
+            self.feature_cache[idx] = features.copy()
+            self._total_cached_bins += 1
+        else:
+            a = self._learn_alpha
+            self.feature_cache[idx] = (1 - a) * self.feature_cache[idx] + a * features
+        self.cache_count[idx] += 1
+        self.cache_confidence[idx] = min(1.0, self.cache_count[idx] / 10.0)
+        self._cache_matrix_dirty = True
+
+    def _build_cache_matrix(self):
+        """构建向量化匹配矩阵（仅在缓存更新后重建）"""
+        filled = [i for i in range(self.NUM_BINS) if self.feature_cache[i] is not None]
+        if not filled:
+            self._cache_matrix = None
+            self._cache_indices = None
+            self._cache_conf_vec = None
+        else:
+            self._cache_indices = np.array(filled, dtype=np.int32)
+            self._cache_matrix = np.stack([self.feature_cache[i] for i in filled])  # (N, sectors)
+            self._cache_conf_vec = self.cache_confidence[self._cache_indices]
+        self._cache_matrix_dirty = False
+
+    def _match_features(self, features):
+        """
+        向量化匹配：numpy 矩阵乘法替代 Python 循环。
+        返回 (angle, score) 或 (None, 0.0)。
+        """
+        if self._cache_matrix_dirty:
+            self._build_cache_matrix()
+
+        if self._cache_matrix is None:
+            return None, 0.0
+
+        # (N,) = (N, sectors) @ (sectors,) 批量余弦相似度
+        sims = self._cache_matrix @ features
+        weighted = sims * self._cache_conf_vec
+        best_idx = int(np.argmax(weighted))
+        best_score = float(weighted[best_idx])
+
+        if best_score >= self._match_min_score:
+            best_bin = int(self._cache_indices[best_idx])
+            angle = (best_bin + 0.5) * 360.0 / self.NUM_BINS
+            return angle, best_score
+        return None, 0.0
+
+    # ========== 角度平滑 ==========
+
+    def _smooth_angle(self, raw):
+        """圆形 EMA 平滑"""
         if self._ema_angle is None:
-            self._ema_angle = raw_angle
-            return raw_angle
-        diff = _angular_diff(raw_angle, self._ema_angle)
-        self._ema_angle = (self._ema_angle + self._angle_alpha * diff) % 360
+            self._ema_angle = raw
+            return raw
+        diff = _angular_diff(raw, self._ema_angle)
+        self._ema_angle = (self._ema_angle + self._ema_alpha * diff) % 360
         return self._ema_angle
 
-    def record_miss(self):
-        """检测失败时更新状态"""
-        self.miss_streak += 1
-        self.hit_count = 0
-        if self.miss_streak > 10:
-            self._ema_angle = None  # 过久未检测到 → 重置角度平滑
+    # ========== 主入口 ==========
+
+    def update(self, minimap_bgr, map_x=None, map_y=None):
+        """
+        每帧调用：根据移动/静止状态更新箭头方向。
+
+        移动时: 用坐标位移方向作为真实朝向 + 缓存箭头视觉特征
+        静止时: 用视觉特征匹配缓存库中最接近的已知角度
+        无坐标时: 纯视觉特征匹配（惯性帧等）
+
+        Args:
+            minimap_bgr: 小地图 BGR 图像
+            map_x, map_y: 当前帧地图坐标 (None = 定位失败/惯性帧)
+
+        Returns:
+            angle (float) — 箭头朝向角 (0=北, 顺时针)
+        """
+        features = None  # 延迟提取：仅在需要时才调用 _extract_features
+        angle = self._last_angle
+
+        if map_x is not None and map_y is not None:
+            if self._prev_x is not None and self._prev_y is not None:
+                dx = map_x - self._prev_x
+                dy = map_y - self._prev_y
+                dist = math.sqrt(dx * dx + dy * dy)
+
+                if dist > self._move_threshold:
+                    # ===== 移动中 =====
+                    self._stopped_frames = 0
+                    move_angle = math.degrees(math.atan2(dx, -dy)) % 360
+                    angle = move_angle
+                    self._last_moving_angle = move_angle
+
+                    # 跳帧缓存：每 N 帧才提取特征并缓存（减少计算）
+                    self._move_frame_counter += 1
+                    if self._move_frame_counter >= self._cache_every_n:
+                        self._move_frame_counter = 0
+                        if features is None:
+                            features = self._extract_features(minimap_bgr)
+                        if features is not None:
+                            self._cache_feature(move_angle, features)
+                            idx = self._angle_to_bin(move_angle)
+                            if self.cache_count[idx] == 1:
+                                cov = self._total_cached_bins / self.NUM_BINS * 100
+                                print(f"  [箭头特征] 新角度 bin {idx} "
+                                      f"(~{move_angle:.0f}°) | 覆盖率: {cov:.0f}%")
+                else:
+                    # ===== 静止 =====
+                    self._stopped_frames += 1
+                    if self._stopped_frames >= self._stopped_min:
+                        features = self._extract_features(minimap_bgr)
+                        if features is not None:
+                            matched, score = self._match_features(features)
+                            if matched is not None:
+                                angle = matched
+                            elif self._last_moving_angle is not None:
+                                angle = self._last_moving_angle
+                        elif self._last_moving_angle is not None:
+                            angle = self._last_moving_angle
+                    elif self._last_moving_angle is not None:
+                        angle = self._last_moving_angle
+
+            self._prev_x = map_x
+            self._prev_y = map_y
+        else:
+            # ===== 无坐标（惯性/丢失）：纯视觉特征匹配 =====
+            features = self._extract_features(minimap_bgr)
+            if features is not None:
+                matched, score = self._match_features(features)
+                if matched is not None:
+                    angle = matched
+                elif self._last_moving_angle is not None:
+                    angle = self._last_moving_angle
+            elif self._last_moving_angle is not None:
+                angle = self._last_moving_angle
+
+        angle = self._smooth_angle(angle)
+        self._last_angle = angle
+        return angle
+
+    @property
+    def coverage(self):
+        """特征库角度覆盖率 (0.0 ~ 1.0)"""
+        return self._total_cached_bins / self.NUM_BINS
 
 
 class SIFTMapTracker:
@@ -167,10 +366,10 @@ class SIFTMapTracker:
         _sift_contrast = getattr(config, 'SIFT_CONTRAST_THRESHOLD', 0.02)
         self.sift = cv2.SIFT_create(contrastThreshold=_sift_contrast)
 
-        # 上一帧箭头角度（用于箭头检测失败时降级）
+        # 上一帧箭头角度（用于箭头检测失败时降级，tracker_core 也读取此属性）
         self._last_arrow_angle = 0.0
-        # 箭头运行时缓存（模板快速路径 + HSV 自适应 + 角度平滑）
-        self._arrow_cache = _ArrowCache()
+        # 箭头方向系统（移动校准 + 特征匹配）
+        self._arrow_dir = _ArrowDirectionSystem()
 
         # 线程锁（防止并发请求导致 kp_local / flann 竞态）
         self._lock = Lock()
@@ -251,12 +450,6 @@ class SIFTMapTracker:
         self._lock_search_radius = getattr(config, 'COORD_LOCK_SEARCH_RADIUS', 400)
         self._lock_max_retries = getattr(config, 'COORD_LOCK_MAX_RETRIES', 5)
         self._lock_min_to_activate = getattr(config, 'COORD_LOCK_MIN_HISTORY_TO_ACTIVATE', 15)
-
-        # 移动预测与静止检测（用位移历史推算朝向，防止静止时 wake 随镜头漂移）
-        self._prev_frame_x = None   # 上一帧定位坐标（用于计算位移）
-        self._prev_frame_y = None
-        self._last_moving_angle = None   # 最近一次移动状态下的可信朝向角
-        self._stopped_frames = 0         # 连续静止帧计数
 
     # ------------------------------------------
     # 状态冻结 / 恢复（战斗/背包期间保持局部索引+坐标）
@@ -504,14 +697,11 @@ class SIFTMapTracker:
                         if avg_scale > max_scale or avg_scale < 1.0 / max_scale:
                             continue
                         h, w = minimap_gray.shape
-                        arrow_center = self._detect_arrow_center(minimap_bgr)
-                        if arrow_center is not None:
-                            ref_x, ref_y, ref_angle = arrow_center
-                            self._last_arrow_angle = ref_angle
+                        arrow_pos = self._arrow_dir.detect_arrow_position(minimap_bgr)
+                        if arrow_pos is not None:
+                            ref_x, ref_y = arrow_pos
                         else:
-                            # 降级：使用 minimap 中心点
                             ref_x, ref_y = w / 2.0, h / 2.0
-                            ref_angle = self._last_arrow_angle
 
                         center_pt = np.float32([[[ref_x, ref_y]]])
                         dst_center = cv2.perspectiveTransform(center_pt, M)
@@ -520,7 +710,10 @@ class SIFTMapTracker:
 
                         if abs(tx - anchor_x) <= r * 1.5 and abs(ty - anchor_y) <= r * 1.5:
                             if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
-                                return self._make_locked_result(True, tx, ty, t_start, "LOCKED", arrow_angle=ref_angle,
+                                # 锁定模式下更新方向系统
+                                angle = self._arrow_dir.update(minimap_bgr, tx, ty)
+                                self._last_arrow_angle = angle
+                                return self._make_locked_result(True, tx, ty, t_start, "LOCKED", arrow_angle=angle,
                                                            retry=attempt + 1)
 
         # 所有重试都失败
@@ -545,141 +738,6 @@ class SIFTMapTracker:
             'map_height': self.map_height,
             '_locked_state': state,
         }
-
-    # ------------------------------------------
-    # 箭头检测：从圆形小地图中提取玩家箭头中心坐标
-    # ------------------------------------------
-    def _detect_arrow_center(self, minimap_bgr):
-        """
-        在小地图图像中检测黄色/橙色箭头，返回 (cx, cy, angle) 或 None。
-        两阶段检测：
-          1. 快速路径: 模板匹配（cached patch + 小 ROI）→ ~0.3ms
-          2. 完整路径: HSV + 形态学 → ~1.5ms
-        角度由白色泛光(wake)方向计算，不再依赖凸包尖端。
-        """
-        h, w = minimap_bgr.shape[:2]
-        if h < 10 or w < 10:
-            return None
-
-        cache = self._arrow_cache
-
-        # === 快速路径：模板匹配 ===
-        tmpl_hit = cache.try_template_match(minimap_bgr)
-        if tmpl_hit is not None:
-            cx, cy = tmpl_hit
-            raw_wake = self._compute_wake_angle(minimap_bgr)
-            cache.last_wake_success = raw_wake is not None
-            angle = raw_wake if raw_wake is not None else (
-                cache._ema_angle if cache._ema_angle is not None else 0.0)
-            angle = cache.smooth_angle(angle)
-            return (float(cx), float(cy), float(angle))
-
-        # === 完整路径：HSV 颜色检测 ===
-        hsv = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
-        lower, upper = cache.get_hsv_bounds()
-        mask = cv2.inRange(hsv, lower, upper)
-
-        # 圆形掩码：排除小地图四角以外区域（防止误检建筑物橙色）
-        circ_mask = self._get_circular_mask(h, w)
-        mask = mask & circ_mask
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            cache.record_miss()
-            return None
-
-        # 选取最靠近小地图中心的轮廓（箭头总在中心，最大轮廓可能是边缘建筑）
-        mcx, mcy = w / 2.0, h / 2.0
-        best_cnt = None
-        best_dist = float('inf')
-        for cnt in contours:
-            if cv2.contourArea(cnt) < 20:
-                continue
-            M_c = cv2.moments(cnt)
-            if M_c['m00'] < 1e-6:
-                continue
-            ccx = M_c['m10'] / M_c['m00']
-            ccy = M_c['m01'] / M_c['m00']
-            dist = (ccx - mcx) ** 2 + (ccy - mcy) ** 2
-            if dist < best_dist:
-                best_dist = dist
-                best_cnt = cnt
-
-        if best_cnt is None:
-            cache.record_miss()
-            return None
-
-        M_moments = cv2.moments(best_cnt)
-        cx = M_moments['m10'] / M_moments['m00']
-        cy = M_moments['m01'] / M_moments['m00']
-
-        # 角度计算：白色泛光(wake)方向
-        raw_wake = self._compute_wake_angle(minimap_bgr)
-        cache.last_wake_success = raw_wake is not None
-        angle = raw_wake if raw_wake is not None else (
-            cache._ema_angle if cache._ema_angle is not None else 0.0)
-        angle = cache.smooth_angle(angle)
-
-        # 更新缓存
-        bx, by, bw, bh = cv2.boundingRect(best_cnt)
-        cache.update_template(minimap_bgr, mask, (bx, by, bx + bw, by + bh))
-        cache.learn_hsv(hsv, mask)
-        cache.miss_streak = 0
-
-        return (float(cx), float(cy), float(angle))
-
-    @staticmethod
-    def _compute_wake_angle(minimap_bgr):
-        """
-        通过白色泛光(wake)方向计算箭头朝向。
-        箭头在朝向方向会发出类似手电筒的白色/亮色光晕，
-        这些低饱和度高亮度像素的质心偏移方向即为箭头朝向。
-        在亮色地形（雪地/沙漠等）中像素计数过高时返回 None，交由 EMA 平滑。
-        返回角度(0=北/上, 顺时针增加)或 None。
-        """
-        h, w = minimap_bgr.shape[:2]
-        mcx, mcy = w // 2, h // 2
-
-        hsv = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
-        sat = hsv[:, :, 1]
-        val = hsv[:, :, 2]
-
-        # 距离中心的距离平方映射
-        yy, xx = np.ogrid[:h, :w]
-        dist_sq = (xx - mcx) ** 2 + (yy - mcy) ** 2
-
-        # 内环（跳过箭头图标本身）和外环上限（圆形小地图边界内）
-        inner_r = max(5, min(h, w) // 12)
-        outer_r = min(h, w) // 2 - 3
-
-        # 泛光像素：低饱和 + 高亮度 + 在环形区域内
-        wake = ((sat < 60) & (val > 180)
-                & (dist_sq > inner_r * inner_r)
-                & (dist_sq < outer_r * outer_r))
-
-        wy, wx = np.where(wake)
-        count = len(wx)
-
-        # 太少说明无泛光信号；太多说明地形整体偏亮（雪地等），信噪比太低
-        if count < 15 or count > 3000:
-            return None
-
-        # 亮度加权质心
-        weights = val[wake].astype(np.float64)
-        w_dx = np.average(wx.astype(np.float64), weights=weights) - mcx  # East
-        w_dy = np.average(wy.astype(np.float64), weights=weights) - mcy  # South
-
-        # 偏移量太小说明泛光均匀分布，无法判断方向
-        if math.sqrt(w_dx * w_dx + w_dy * w_dy) < 3.0:
-            return None
-
-        # 图像坐标 → 导航角度 (0=北/上, 90=东/右, 180=南/下, 270=西/左)
-        angle = math.degrees(math.atan2(w_dx, -w_dy)) % 360
-        return angle
 
     @staticmethod
     def _draw_arrow_marker(img_bgr, cx, cy, size=None, angle=0):
@@ -930,20 +988,15 @@ class SIFTMapTracker:
 
                         h, w = minimap_gray.shape
 
-                        # 箭头检测：获取精确中心+泛光方向
-                        arrow_center = self._detect_arrow_center(minimap_bgr)
-                        if arrow_center is not None:
-                            ref_x, ref_y, ref_angle = arrow_center
-                            arrow_angle = ref_angle
-                            self._last_arrow_angle = ref_angle
-                            # 缓存箭头中心偏移量（相对 minimap 中心），降级时复用
+                        # 箭头位置检测：获取精确中心（方向由 _arrow_dir 后续处理）
+                        arrow_pos = self._arrow_dir.detect_arrow_position(minimap_bgr)
+                        if arrow_pos is not None:
+                            ref_x, ref_y = arrow_pos
                             self._arrow_offset = (ref_x - w / 2.0, ref_y - h / 2.0)
                             quality_bonus = 1.0
                         else:
-                            # 降级：使用上次箭头偏移量估算（保持参考点稳定，避免震荡）
                             ox, oy = getattr(self, '_arrow_offset', (0.0, 0.0))
                             ref_x, ref_y = w / 2.0 + ox, h / 2.0 + oy
-                            arrow_angle = self._last_arrow_angle
                             quality_bonus = 0.6
 
                         center_pt = np.float32([[[ref_x, ref_y]]])
@@ -988,7 +1041,6 @@ class SIFTMapTracker:
                     found = True
                     center_x, center_y = orb_result
                     match_quality = 0.5  # ORB 匹配质量标记为中等
-                    arrow_angle = self._last_arrow_angle
                     self.last_x = center_x
                     self.last_y = center_y
                     self.lost_frames = 0
@@ -1026,37 +1078,14 @@ class SIFTMapTracker:
                   f"fps: {1000/avg:.1f}")
             self._frame_times.clear()
 
-        # ===== 移动方向预测 + 静止检测 =====
-        # 目的1: 静止时 wake（白色区域）跟随镜头旋转而非玩家朝向，需冻结角度
-        # 目的2: 移动中 wake 失效时，用位移方向角（地图坐标系推算）作为备选
-        if found and not is_inertial and self._prev_frame_x is not None:
-            dx = center_x - self._prev_frame_x
-            dy = center_y - self._prev_frame_y
-            dist = math.sqrt(dx * dx + dy * dy)
-            _thr = getattr(config, 'ARROW_STOPPED_THRESHOLD', 6)
-            _min_fr = getattr(config, 'ARROW_STOPPED_FRAMES_MIN', 4)
-            if dist > _thr:
-                # 玩家正在移动
-                self._stopped_frames = 0
-                if self._arrow_cache.last_wake_success:
-                    # wake 本帧成功：记录为可信移动角
-                    self._last_moving_angle = arrow_angle
-                else:
-                    # wake 本帧失败：用地图位移方向角补偿
-                    # 地图坐标系: x 右=东, y 下=南 → atan2(dx, -dy) = 导航角(北=0, 顺时针)
-                    move_angle = math.degrees(math.atan2(dx, -dy)) % 360
-                    arrow_angle = move_angle
-                    self._last_moving_angle = move_angle
-            else:
-                # 玩家静止：white area 随镜头旋转，角度不可信
-                self._stopped_frames += 1
-                if (self._stopped_frames >= _min_fr
-                        and self._last_moving_angle is not None):
-                    # 冻结：使用最后一次移动时确认的角度
-                    arrow_angle = self._last_moving_angle
+        # ===== 箭头方向：移动校准 + 特征匹配 =====
         if found and not is_inertial:
-            self._prev_frame_x = center_x
-            self._prev_frame_y = center_y
+            arrow_angle = self._arrow_dir.update(minimap_bgr, center_x, center_y)
+        elif found and is_inertial:
+            arrow_angle = self._arrow_dir.update(minimap_bgr, None, None)
+        else:
+            arrow_angle = self._arrow_dir._last_angle
+        self._last_arrow_angle = arrow_angle
 
         return {
             'found': found,

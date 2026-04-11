@@ -167,6 +167,10 @@ class AIMapTrackerWeb:
         self.SMOOTH_BUFFER_SIZE = 60
         self.smooth_buffer_x = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
         self.smooth_buffer_y = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
+
+        # 渲染静止死区：记录上一帧实际用于渲染的坐标，避免噪声引起地图抖动
+        self._display_x = None
+        self._display_y = None
         self._smooth_median_window = 15  # 取最近15帧的中位数作为输出（抗抖动）
 
         # 持久化文件路径（与 main_web.py 同级）
@@ -639,6 +643,33 @@ class AIMapTrackerWeb:
             self.smooth_buffer_y.append(smooth_y)
             if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
                 self._save_smooth_buffer()
+
+        # === 渲染平滑防抖：静止死区 + 移动 EMA ===
+        still_threshold = getattr(config, 'RENDER_STILL_THRESHOLD', 2)
+        ema_alpha = getattr(config, 'RENDER_EMA_ALPHA', 0.45)
+        if found and smooth_x and smooth_y:
+            if self._display_x is None:
+                # 首帧直接初始化
+                self._display_x = smooth_x
+                self._display_y = smooth_y
+            elif not is_inertial:
+                ddx = smooth_x - self._display_x
+                ddy = smooth_y - self._display_y
+                dist = math.sqrt(ddx * ddx + ddy * ddy)
+                if dist <= still_threshold:
+                    # 静止死区：保持不动
+                    pass
+                else:
+                    # 移动 EMA：平滑向目标靠近，消除方向移动时的横向抖动
+                    self._display_x = int(self._display_x + ema_alpha * ddx)
+                    self._display_y = int(self._display_y + ema_alpha * ddy)
+            else:
+                # 惯性帧：同样用 EMA，但允许在静止死区内跟随（卡尔曼预测不应锁死）
+                ddx = smooth_x - self._display_x
+                ddy = smooth_y - self._display_y
+                self._display_x = int(self._display_x + ema_alpha * ddx)
+                self._display_y = int(self._display_y + ema_alpha * ddy)
+            smooth_x, smooth_y = self._display_x, self._display_y
 
         # 渲染裁剪区域 + 画点
         display_crop, status_state = self._render_sift_crop(
