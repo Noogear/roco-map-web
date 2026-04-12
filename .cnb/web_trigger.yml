@@ -1,5 +1,5 @@
 branch:
-- reg: "^main"
+- reg: "^dev"
   buttons:
     - name: 开发环境
       description: 开发环境
