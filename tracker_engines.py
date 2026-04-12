@@ -200,6 +200,7 @@ class SIFTMapTracker:
         self.last_y = None
         self.lost_frames = 0
         self._sift_confused = False
+        self._cold_start_cd = 0   # 冷启动冷却帧数，防止暂停页面反复误触发
 
         # 状态冻结
         self._frozen = False
@@ -899,13 +900,16 @@ class SIFTMapTracker:
                             match_quality = 0.3
 
         # ---- 冷启动低纹理场景兜底（海洋/大片裸地）----
-        # 触发条件：完全丢失跟踪（last_x=None）且小地图自身为低纹理（texture_std<45）
-        # 适用场景：首次启动在海洋、传送后落在海洋等所有 SIFT/LK/ECC 均无法定位的情况
-        # 候选已过滤 10<mean<200，不会误匹配地图黑白边框或暂停UI
-        # ★ 兜底后恢复：cold_result 作为普通 found 结果进入状态更新，
-        #   last_x/last_y 随即被赋值，下一帧 LK 光流 + SIFT 自动接管，无需额外处理
-        if not found and self.last_x is None and texture_std < 45:
+        # 触发条件：完全丢失跟踪（last_x=None）+ 小地图低纹理 + 冷却结束
+        # 冷却机制：触发一次后冻结 90 帧（约 3 秒），防止暂停页面等纯色 UI
+        #   图像反复误触发 → last_x 被设置 → LK 失败 → last_x 清空 → 再触发 → 闪烁环
+        # ★ 成功后恢复：cold_result 进入普通状态更新，last_x/last_y 赋值，
+        #   下一帧 LK + SIFT 自动接管，不再触发（last_x 已非 None）
+        if self._cold_start_cd > 0:
+            self._cold_start_cd -= 1
+        if not found and self.last_x is None and texture_std < 45 and self._cold_start_cd == 0:
             cold_result = self._ocean_cold_start(minimap_gray_raw)
+            self._cold_start_cd = 90   # 无论成功与否，冷却 90 帧
             if cold_result is not None:
                 found, center_x, center_y = True, cold_result[0], cold_result[1]
                 match_quality = 0.25
