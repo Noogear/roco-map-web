@@ -49,10 +49,10 @@ ECC_ENABLED = True
 ECC_MIN_CORRELATION = 0.25            # findTransformECC 结果低于此阈值则放弃
 
 # --- 海洋/低纹理区域冷启动 ---
-OCEAN_STD_THRESHOLD = 20              # 大地图区块 std 低于此值视为低纹理（海洋/裸地）
+OCEAN_STD_THRESHOLD = 35              # 大地图区块 std 低于此值视为低纹理（海洋/裸地/海岸混合）
 OCEAN_REGION_TILE = 400               # 区块扫描粒度（地图像素）
-OCEAN_COLD_START_MIN_CC = 0.30        # 模板匹配最低相关系数（过低易误匹配）
-OCEAN_COLOR_THRESH = 35               # 小地图均值灰度与候选区块均值之差超过此值则跳过
+OCEAN_COLD_START_MIN_CC = 0.20        # 模板匹配最低相关系数（过低易误匹配）
+OCEAN_COLOR_THRESH = 50               # 小地图均值灰度与候选区块均值之差超过此值则跳过
 
 # --- 状态冻结 ---
 FREEZE_TIMEOUT = 30.0

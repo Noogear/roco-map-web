@@ -869,6 +869,7 @@ const pipBtn = document.getElementById('pipBtn');
 const resultImg = document.getElementById('resultImg');
 let pipTimer = null;
 let pipEventsBound = false;
+let pipRAFActive = false;
 
 // 初始化画布尺寸
 pipCanvas.width = 400;
@@ -890,9 +891,8 @@ function updatePiPCanvas() {
     const h = resultImg.naturalHeight * scale;
     bctx.drawImage(resultImg, (400 - w) / 2, (400 - h) / 2, w, h);
 
-    // 原子式一次性复制到前台画布，避免 captureStream 抓到中间态
+    // 原子式一次性复制到前台画布，不做 clearRect 避免 captureStream 抓到空白帧
     const ctx = pipCanvas.getContext('2d');
-    ctx.clearRect(0, 0, 400, 400);
     ctx.drawImage(back, 0, 0);
 }
 
@@ -901,8 +901,15 @@ function isNativePiPActive() {
 }
 
 function stopPiPRefresh() {
-    if (pipTimer) clearInterval(pipTimer);
+    pipRAFActive = false;
+    if (pipTimer) cancelAnimationFrame(pipTimer);
     pipTimer = null;
+}
+
+function pipRAFLoop() {
+    if (!pipRAFActive) return;
+    updatePiPCanvas();
+    pipTimer = requestAnimationFrame(pipRAFLoop);
 }
 
 function resetPiPButtonState() {
@@ -938,7 +945,7 @@ async function requestNativePiP() {
     }
 
     updatePiPCanvas();
-    pipVideo.srcObject = pipCanvas.captureStream(15);
+    pipVideo.srcObject = pipCanvas.captureStream(30);
     bindPiPEvents();
     await pipVideo.play();
 
@@ -988,8 +995,9 @@ async function toggleNativePiP() {
             pipBtn.classList.add('active');
             pipBtn.textContent = '✅ 关闭画中画';
             
-            // 自动刷新画面
-            pipTimer = setInterval(updatePiPCanvas, 200);
+            // 自动刷新画面（requestAnimationFrame 驱动，消除定时器闪烁）
+            pipRAFActive = true;
+            pipRAFLoop();
 
             TC.log('✅ 原生浏览器画中画已开启' + (mode === 'webkit' ? ' (Safari 兼容模式)' : ''));
         }

@@ -378,7 +378,8 @@ class SIFTMapTracker:
 
     def _make_result(self, found, cx=None, cy=None, t_start=None,
                      arrow_angle=None, arrow_stopped=True, is_inertial=False,
-                     match_count=0, match_quality=0.0, _locked_state=''):
+                     match_count=0, match_quality=0.0, _locked_state='',
+                     _tp_far_candidate=None):
         """统一构造返回字典"""
         if t_start is not None:
             t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000
@@ -393,6 +394,7 @@ class SIFTMapTracker:
             'match_quality': match_quality,
             'map_width': self.map_width, 'map_height': self.map_height,
             '_locked_state': _locked_state,
+            '_tp_far_candidate': _tp_far_candidate,
         }
 
     @staticmethod
@@ -491,6 +493,7 @@ class SIFTMapTracker:
         冷启动低纹理场景定位：将小地图与大地图预标记低纹理区域做多尺度模板匹配。
         - 多尺度：冷启动时比例未知，在 3.5‒5.5 间扫描取最优
         - 圆形掩码：将小地图四角黑边填充为均值，避免干扰相关系数
+        - 半丢失模式：有 last_x 时只搜附近区域（大幅加速+减少误匹配）
         minimap_gray_raw: 未经 CLAHE 增强的原始灰度小地图。
         返回 (tx, ty) 或 None。
         """
@@ -499,13 +502,22 @@ class SIFTMapTracker:
 
         h_mm, w_mm = minimap_gray_raw.shape[:2]
         mini_mean = float(np.mean(minimap_gray_raw))
-        color_thresh = getattr(config, 'OCEAN_COLOR_THRESH', 35)
+        color_thresh = getattr(config, 'OCEAN_COLOR_THRESH', 50)
         margin = self._ocean_region_tile // 2
-        min_cc = getattr(config, 'OCEAN_COLD_START_MIN_CC', 0.30)
+        min_cc = getattr(config, 'OCEAN_COLD_START_MIN_CC', 0.20)
 
-        # 颜色预筛选（快速排除明显不同亮度的区域）
-        close_candidates = [(cx, cy, mm) for cx, cy, mm in self._ocean_candidates
-                            if abs(mm - mini_mean) < color_thresh]
+        # 半丢失时只搜附近 1200px 范围（大幅减少搜索量）
+        _semi_lost_radius = 1200
+        if self.last_x is not None:
+            close_candidates = [
+                (cx, cy, mm) for cx, cy, mm in self._ocean_candidates
+                if (abs(mm - mini_mean) < color_thresh
+                    and abs(cx - self.last_x) < _semi_lost_radius
+                    and abs(cy - self.last_y) < _semi_lost_radius)
+            ]
+        else:
+            close_candidates = [(cx, cy, mm) for cx, cy, mm in self._ocean_candidates
+                                if abs(mm - mini_mean) < color_thresh]
         if not close_candidates:
             return None
 
@@ -717,14 +729,15 @@ class SIFTMapTracker:
         ECC（增强相关系数）像素级匹配，专用于低纹理场景（海洋/雪地）。
         利用上次 SIFT 确定的 scale 在大地图中提取等比例区域，
         用 ECC 找出当前小地图相对于该区域的微小平移。
+        搜索区域为 1.5 倍 crop 大小（允许更大位移）。
         返回 (tx, ty) 或 None。
         """
         if not self._ecc_enabled or self._last_sift_scale is None:
             return None
         s = self._last_sift_scale
         h_mm, w_mm = minimap_gray.shape[:2]
-        crop_w = int(w_mm * s)
-        crop_h = int(h_mm * s)
+        crop_w = int(w_mm * s * 1.5)  # 扩大搜索区域
+        crop_h = int(h_mm * s * 1.5)
         x1 = max(0, cx_hint - crop_w // 2)
         y1 = max(0, cy_hint - crop_h // 2)
         x2 = min(self.map_width, x1 + crop_w)
@@ -790,6 +803,8 @@ class SIFTMapTracker:
         self._lk_frame_num += 1
         run_sift = (self._lk_frame_num % self._lk_sift_every == 0)
 
+        _tp_far_candidate = None  # 传送候选：全局 SIFT 匹配成功但超跳变阈值
+
         # ======================================================
         # 第一层：LK 光流快速跟踪（每帧 ~2ms，跳过部分 SIFT 调用）
         # ======================================================
@@ -844,6 +859,9 @@ class SIFTMapTracker:
                         if self.last_x is not None:
                             max_jump = self.JUMP_THRESHOLD if search_round == 0 else self.JUMP_THRESHOLD * 2
                             if abs(tx - self.last_x) + abs(ty - self.last_y) >= max_jump:
+                                # 超跳变阈值：保留为传送候选（取质量最高的）
+                                if quality >= 0.3 and (_tp_far_candidate is None or quality > _tp_far_candidate[2]):
+                                    _tp_far_candidate = (tx, ty, quality)
                                 continue
                         found, center_x, center_y, match_quality = True, tx, ty, quality
                         # SIFT 成功 → 更新 LK 比例和跟踪点
@@ -899,15 +917,20 @@ class SIFTMapTracker:
                             found, center_x, center_y = True, *ecc_result
                             match_quality = 0.3
 
-        # ---- 冷启动低纹理场景兜底（海洋/大片裸地）----
-        # 触发条件：完全丢失跟踪（last_x=None）+ 小地图低纹理 + 冷却结束
+        # ---- 冷启动低纹理场景兜底（海洋/大片裸地/海岸线）----
+        # 触发条件1: 完全丢失跟踪（last_x=None）+ 小地图低纹理 + 冷却结束
+        # 触发条件2: 半丢失(连续丢帧>15但<MAX)+ 低纹理 — 海洋近岸场景专用
         # 冷却机制：触发一次后冻结 90 帧（约 3 秒），防止暂停页面等纯色 UI
         #   图像反复误触发 → last_x 被设置 → LK 失败 → last_x 清空 → 再触发 → 闪烁环
         # ★ 成功后恢复：cold_result 进入普通状态更新，last_x/last_y 赋值，
         #   下一帧 LK + SIFT 自动接管，不再触发（last_x 已非 None）
         if self._cold_start_cd > 0:
             self._cold_start_cd -= 1
-        if not found and self.last_x is None and texture_std < 45 and self._cold_start_cd == 0:
+        _ocean_texture_thresh = 55  # 包含海岸线混合纹理的阈值（比纯海洋高）
+        _semi_lost = (self.last_x is not None and self.lost_frames >= 15
+                      and texture_std < _ocean_texture_thresh)
+        _fully_lost = (self.last_x is None and texture_std < _ocean_texture_thresh)
+        if not found and (_fully_lost or _semi_lost) and self._cold_start_cd == 0:
             cold_result = self._ocean_cold_start(minimap_gray_raw)
             self._cold_start_cd = 90   # 无论成功与否，冷却 90 帧
             if cold_result is not None:
@@ -964,7 +987,8 @@ class SIFTMapTracker:
             found, center_x, center_y, t_start=t_start,
             arrow_angle=arrow_angle, arrow_stopped=arrow_stopped,
             is_inertial=is_inertial, match_count=0,
-            match_quality=match_quality)
+            match_quality=match_quality,
+            _tp_far_candidate=_tp_far_candidate)
 
 
 class LoFTRMapTracker:
