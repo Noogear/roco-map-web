@@ -672,6 +672,7 @@ function setupRegionDrag(videoEl) {
 // ========== 自动追踪（屏幕捕获模式 - WebSocket 二进制 PNG） ==========
 var screenSending = false;
 var useWSMode = true;  // 是否使用 WS 二进制通道
+var wsReconnectAt = 0; // WS 断线重连限流时间戳
 async function captureAndSendScreenFrame() {
     if (!TC.isScreenActive || screenSending) return;
     screenSending = true;
@@ -680,8 +681,22 @@ async function captureAndSendScreenFrame() {
             // WS 二进制模式: JPEG 压缩 + 零 base64 开销（上传体积减少约 90%）
             var blob = await TC.captureScreenImgBlob();
             if (blob) { await TC.sendViaWS(blob); }
+        } else if (useWSMode && !TC.wsConnected) {
+            // WS 已断开：本帧先走 HTTP，后台每3秒尝试重连一次
+            var data = TC.captureScreenImg();
+            if (data) { TC.imageData = data; await TC.sendAndDisplay(data); }
+            var now = Date.now();
+            if (now >= wsReconnectAt) {
+                wsReconnectAt = now + 3000;
+                TC.log('🔄 WS 断开，尝试重连...');
+                TC.connectWS().then(function() {
+                    TC.log('📶 WS 重连成功，恢复二进制模式');
+                }).catch(function() {
+                    TC.log('⚠️ WS 重连失败，继续 HTTP 模式');
+                });
+            }
         } else {
-            // HTTP fallback: JPEG 有损 + base64
+            // 已明确回退到 HTTP（useWSMode=false）
             var data = TC.captureScreenImg();
             if (data) { TC.imageData = data; await TC.sendAndDisplay(data); }
         }

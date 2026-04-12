@@ -156,12 +156,13 @@ const TrackerCore = (() => {
         // ========== 状态格式化 ==========
         formatStatus(status) {
             var text = '--', cls = 'green', label = '';
+            var found = status.found != null ? status.found : !!status.f;  // 兼容 found / f 两种字段名
             if (status.mode === 'sift') {
                 if (status.state === 'SCENE_CHANGE') {
                     text = '切场'; cls = 'yellow'; label = '场景切换';
-                } else if (!status.f) {
+                } else if (!found) {
                     text = '丢失'; cls = 'red'; label = '未找到';
-                } else if (status.state === 'INERTIAL' || status.is_inertial) {
+                } else if (status.state === 'INERTIAL') {
                     text = '惯性'; cls = 'yellow'; label = '惯性导航';
                 } else {
                     text = '正常'; cls = 'green'; label = 'SIFT追踪';
@@ -169,7 +170,7 @@ const TrackerCore = (() => {
             } else {
                 if (status.state === 'GLOBAL_SCAN') {
                     text = '扫描'; cls = 'red'; label = '全局扫描';
-                } else if (status.f) {
+                } else if (found) {
                     text = '正常'; cls = 'green'; label = '局部追踪';
                 } else {
                     text = '丢失'; cls = 'red'; label = '目标丢失';
@@ -204,8 +205,9 @@ const TrackerCore = (() => {
             if (xe && status.position) xe.textContent = status.position.x;
             if (ye && status.position) ye.textContent = status.position.y;
             if (fe) {
-                fe.textContent = status.f ? '\u2705 \u662f' : '\u274c \u5426';
-                fe.className = 'status-value ' + (status.f ? 'found-yes' : 'found-no');
+                var isFound = status.found != null ? status.found : !!status.f;
+                fe.textContent = isFound ? '\u2705 \u662f' : '\u274c \u5426';
+                fe.className = 'status-value ' + (isFound ? 'found-yes' : 'found-no');
             }
             if (mche) mche.textContent = status.matches;
 
