@@ -165,7 +165,7 @@ class SIFTMapTracker:
         self.NEARBY_SEARCH_RADIUS = getattr(config, 'NEARBY_SEARCH_RADIUS', 600)
 
         # ORB 备份引擎（邻近搜索时使用）
-        self.orb = cv2.ORB_create(nFeatures=500)
+        self.orb = cv2.ORB_create(nfeatures=500)
         self.orb_bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
         # LK 光流状态（帧间快速跟踪）
