@@ -762,9 +762,12 @@ class SIFTMapTracker:
                         tx = int(dst_center[0][0][0])
                         ty = int(dst_center[0][0][1])
 
-                        # 置信度评分
+                        # 置信度评分：综合 inlier 率 + 绝对数量
+                        # 雪地/低纹理场景下 inlier 极少时（5~8），inlier_ratio 可能接近1.0
+                        # 但绝对数量太少意味着匹配本身噪声很大，需要额外惩罚
                         inlier_ratio = inlier_count / max(len(good), 1)
-                        match_quality = min(1.0, inlier_ratio)
+                        count_confidence = min(1.0, inlier_count / 12.0)  # <12个inlier时降低置信度
+                        match_quality = min(1.0, inlier_ratio * count_confidence)
 
                         if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
                             if self.last_x is not None:

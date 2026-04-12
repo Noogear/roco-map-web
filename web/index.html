@@ -399,7 +399,7 @@
                     <div class="status-label">AI辅助</div>
                     <div class="status-value" id="statusHybrid">--</div>
                 </div>
-                <div class="status-item">
+                <div class="status-item" style="display:none;">
                     <div class="status-label">质量</div>
                     <div class="status-value" id="statusQuality">--</div>
                 </div>
@@ -507,7 +507,7 @@ TC.init({
             // 更新混合引擎状态显示
             var hybridEl = document.getElementById('statusHybrid');
             var hybridItem = document.getElementById('hybridStatusItem');
-            if (hybridEl && result.status.hybrid !== undefined) {
+            if (hybridEl && hybridItem && result.status.hybrid !== undefined) {
                 if (result.status.hybrid) {
                     hybridItem.style.display = '';
                     if (result.status.hybrid_busy) {
@@ -517,6 +517,8 @@ TC.init({
                         hybridEl.textContent = '✅就绪';
                         hybridEl.style.color = '#66bb6a';
                     }
+                } else {
+                    hybridItem.style.display = 'none';
                 }
             }
         }
