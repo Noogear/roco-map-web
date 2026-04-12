@@ -152,17 +152,8 @@ tracker.result_callback = _on_result_ready
 
 _CIRCLE_STATE_FILE = os.path.join(_BASE_DIR, '.circle_state.json')
 
-
-def _load_circle_state():
-    return load_circle_state(_CIRCLE_STATE_FILE)
-
-
-def _save_circle_state(cx, cy, r):
-    return save_circle_state(_CIRCLE_STATE_FILE, cx, cy, r)
-
-
 # 启动时加载已有状态
-_saved_circle = _load_circle_state()
+_saved_circle = load_circle_state(_CIRCLE_STATE_FILE)
 if _saved_circle:
     print(f"📍 已恢复圆形选区: cx={_saved_circle.get('cx')}, cy={_saved_circle.get('cy')}, r={_saved_circle.get('r')}")
 
@@ -310,7 +301,7 @@ def api_reset_history():
 def api_circle_state():
     """获取/保存 圆形选区状态 (cx, cy, r) 到服务器本地"""
     if request.method == 'GET':
-        state = _load_circle_state()
+        state = load_circle_state(_CIRCLE_STATE_FILE)
         if state:
             return jsonify({'success': True, **state})
         return jsonify({'success': False, 'error': 'No saved state'})
@@ -324,7 +315,7 @@ def api_circle_state():
     except (TypeError, ValueError):
         return jsonify({'error': 'Invalid parameters'}), 400
 
-    if _save_circle_state(cx, cy, r):
+    if save_circle_state(_CIRCLE_STATE_FILE, cx, cy, r):
         return jsonify({'success': True, 'cx': cx, 'cy': cy, 'r': r})
     return jsonify({'error': 'Save failed'}), 500
 

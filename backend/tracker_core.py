@@ -13,7 +13,6 @@ tracker_core.py - 追踪器编排层（无 Web 框架依赖）
 """
 
 import math
-import json
 import os
 import time
 
@@ -27,11 +26,6 @@ from backend import config
 from backend.tracker_engines import SIFTMapTracker
 from backend.tracking.minimap import CircleCalibrator, detect_and_extract
 from backend.tracking.smoother import CoordSmoother
-
-
-# (坐标过滤参数保留为向后兼容，实际由 CoordSmoother 值守)
-POS_HISTORY_SIZE = CoordSmoother.POS_HISTORY_SIZE
-POS_OUTLIER_THRESHOLD = CoordSmoother.POS_OUTLIER_THRESHOLD
 
 
 class MapTrackerWeb:
@@ -65,9 +59,6 @@ class MapTrackerWeb:
         self._latest_result_image_revision = -1
         self._latest_result_jpeg_revision = -1
 
-        # 坐标历史（用于异常值过滤）
-        self.pos_history = deque(maxlen=POS_HISTORY_SIZE)
-
         # 线性过滤器：连续丢弃帧计数器（防死锁）
         self._linear_filter_consecutive = 0
 
@@ -90,11 +81,7 @@ class MapTrackerWeb:
         _base_dir = os.path.dirname(os.path.abspath(__file__))
         self._smooth_file = os.path.join(_base_dir, '.smooth_coords.json')
         self._smoother = CoordSmoother(smooth_buffer_path=self._smooth_file)
-        # 向后兼容 - _process_sift 直接用 smoother 的属性
-        self.smooth_buffer_x = self._smoother.smooth_buffer_x
-        self.smooth_buffer_y = self._smoother.smooth_buffer_y
-        self.pos_history = self._smoother.pos_history
-        self.SMOOTH_BUFFER_SIZE = CoordSmoother.SMOOTH_BUFFER_SIZE
+        self.pos_history = self._smoother.pos_history  # 公开属性，server.py 等外部代码使用
         self._display_x: int | None = None
         self._display_y: int | None = None
 
@@ -124,28 +111,6 @@ class MapTrackerWeb:
         )
         self._worker_thread.start()
         print("  ⚡ SIFT 后台处理线程已启动")
-
-    # ========== 坐标平滑（代理到 CoordSmoother）==========
-
-    def _smooth_coord(self, raw_x, raw_y, is_inertial=False, arrow_stopped=True):
-        return self._smoother._render_ema(raw_x, raw_y, is_inertial, arrow_stopped)
-
-    def _load_smooth_buffer(self):
-        pass  # CoordSmoother __init__ 自动加载
-
-    def _save_smooth_buffer(self):
-        pass  # CoordSmoother 自动持久化
-
-    # ========== 卡尔曼滤波器（代理到 CoordSmoother）==========
-
-    def _kalman_update(self, cx, cy, quality=1.0):
-        return self._smoother._kalman_update(cx, cy, quality)
-
-    def _kalman_predict(self):
-        return self._smoother._kalman_predict()
-
-    def _kalman_reset(self, cx, cy):
-        self._smoother._kalman_reset(cx, cy)
 
     # ========== 场景切换检测 ==========
 
@@ -256,7 +221,7 @@ class MapTrackerWeb:
                 ref_x = sorted(h[0] for h in hist)[len(hist)//2]
                 ref_y = sorted(h[1] for h in hist)[len(hist)//2]
                 dist = math.sqrt((last_x - ref_x) ** 2 + (last_y - ref_y) ** 2)
-                if dist > POS_OUTLIER_THRESHOLD:
+                if dist > CoordSmoother.POS_OUTLIER_THRESHOLD:
                     is_outlier = True
             if not is_outlier:
                 self.pos_history.append((last_x, last_y))
@@ -349,7 +314,7 @@ class MapTrackerWeb:
                 return True, display_crop, 'SCENE_CHANGE', 0, sx, sy
 
             # 无冻结坐标 → 尝试 Kalman 预测
-            predicted = self._kalman_predict()
+            predicted = self._smoother._kalman_predict()
             if predicted is not None:
                 sx, sy = predicted
                 display_crop, status_state = self._render_sift_crop(
@@ -400,14 +365,14 @@ class MapTrackerWeb:
         # === 卡尔曼滤波（替代线性外推+中位数平滑）===
         if found and cx is not None and not is_inertial:
             # 真实匹配: 用质量分调整卡尔曼观测噪声
-            smooth_x, smooth_y = self._kalman_update(cx, cy, quality=match_quality)
+            smooth_x, smooth_y = self._smoother._kalman_update(cx, cy, quality=match_quality)
         elif is_inertial:
             # 惯性帧: 用卡尔曼预测（比重复上一坐标准确）
-            predicted = self._kalman_predict()
+            predicted = self._smoother._kalman_predict()
             if predicted is not None:
                 smooth_x, smooth_y = predicted
-                # 用预测值更新卡尔曼状态，保持速度估计活性
-                self._kalman_update(smooth_x, smooth_y, quality=0.3)
+                # 用预测値更新卡尔曼状态，保持速度估计活性
+                self._smoother._kalman_update(smooth_x, smooth_y, quality=0.3)
             else:
                 smooth_x, smooth_y = cx or 0, cy or 0
         else:
@@ -416,10 +381,10 @@ class MapTrackerWeb:
 
         # 持久化（保留 smooth_buffer 用于恢复）
         if smooth_x and smooth_y:
-            self.smooth_buffer_x.append(smooth_x)
-            self.smooth_buffer_y.append(smooth_y)
-            if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
-                self._save_smooth_buffer()
+            self._smoother.smooth_buffer_x.append(smooth_x)
+            self._smoother.smooth_buffer_y.append(smooth_y)
+            if len(self._smoother.smooth_buffer_x) >= CoordSmoother.SMOOTH_BUFFER_SIZE:
+                self._smoother._save_smooth_buffer()
 
         # === 传送检测：候选聚类确认 ===
         # 来源1: 真实匹配帧的卡尔曼输出超跳变阈值（原有逻辑）
@@ -468,9 +433,9 @@ class MapTrackerWeb:
                 print(f"[传送检测] 聚类确认 scatter={_scatter:.0f}px → "
                       f"立即重置到 ({_med_x},{_med_y})")
                 self.pos_history.clear()
-                self.smooth_buffer_x.clear()
-                self.smooth_buffer_y.clear()
-                self._kalman_reset(_med_x, _med_y)
+                self._smoother.smooth_buffer_x.clear()
+                self._smoother.smooth_buffer_y.clear()
+                self._smoother._kalman_reset(_med_x, _med_y)
                 self._linear_filter_consecutive = 0
                 self._display_x = _med_x
                 self._display_y = _med_y
