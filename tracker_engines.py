@@ -899,9 +899,11 @@ class SIFTMapTracker:
                             match_quality = 0.3
 
         # ---- 冷启动低纹理场景兜底（海洋/大片裸地）----
-        # 触发条件：完全丢失跟踪（last_x=None）且小地图自身为低纹理
-        # 适用于：首次启动在海洋、传送后落在海洋等场景
-        # 候选已过滤 10<mean<200，不会匹配到地图黑白边框或暂停UI
+        # 触发条件：完全丢失跟踪（last_x=None）且小地图自身为低纹理（texture_std<45）
+        # 适用场景：首次启动在海洋、传送后落在海洋等所有 SIFT/LK/ECC 均无法定位的情况
+        # 候选已过滤 10<mean<200，不会误匹配地图黑白边框或暂停UI
+        # ★ 兜底后恢复：cold_result 作为普通 found 结果进入状态更新，
+        #   last_x/last_y 随即被赋值，下一帧 LK 光流 + SIFT 自动接管，无需额外处理
         if not found and self.last_x is None and texture_std < 45:
             cold_result = self._ocean_cold_start(minimap_gray_raw)
             if cold_result is not None:
