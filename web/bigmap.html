@@ -48,11 +48,11 @@
         #mw{position:absolute;transform-origin:0 0;will-change:transform}
         #mi{display:block}
         #dot{
-            position:absolute;width:18px;height:18px;border-radius:50%;
+            position:absolute;left:0;top:0;width:18px;height:18px;border-radius:50%;
             background:#ff1744;border:2px solid #fff;
             box-shadow:0 0 10px rgba(255,23,68,.9),0 0 30px rgba(255,23,68,.4);
-            transform:translate(-50%,-50%);pointer-events:none;z-index:10;
-            transition:left .05s linear,top .05s linear,opacity .15s,background .15s;
+            pointer-events:none;z-index:10;will-change:transform;
+            transition:opacity .15s,background .15s;
         }
         #dot.inertial{background:#ffab00;box-shadow:0 0 10px rgba(255,171,0,.9),0 0 30px rgba(255,171,0,.4)}
         #dot.lost{background:#555;border-color:#888;box-shadow:none;opacity:.4}
@@ -261,7 +261,7 @@
         <svg id="routeLayer" xmlns="http://www.w3.org/2000/svg"></svg>
     </div>
     <!-- 红点和准星放在 mc 下，与 mw 同级，避免受到地图变换影响 -->
-    <svg id="ch" width="44" height="44" viewBox="0 0 44 44" style="position:absolute;pointer-events:none;z-index:9;transform:translate(-50%,-50%);transition:left .05s linear,top .05s linear,opacity .15s;opacity:.25;">
+    <svg id="ch" width="44" height="44" viewBox="0 0 44 44" style="position:absolute;left:0;top:0;pointer-events:none;z-index:9;will-change:transform;transition:opacity .15s;opacity:.25;">
         <line x1="22" y1="0" x2="22" y2="16" stroke="#00d4ff" stroke-width="1"/>
         <line x1="22" y1="28" x2="22" y2="44" stroke="#00d4ff" stroke-width="1"/>
         <line x1="0" y1="22" x2="16" y2="22" stroke="#00d4ff" stroke-width="1"/>
@@ -269,6 +269,15 @@
         <circle cx="22" cy="22" r="10" stroke="#00d4ff" stroke-width="1" fill="none" opacity=".5"/>
     </svg>
     <div id="dot"></div>
+    <!-- 方向箭头指示器 -->
+    <svg id="arrowDir" width="40" height="40" viewBox="0 0 40 40"
+         style="position:absolute;left:0;top:0;pointer-events:none;z-index:11;
+                will-change:transform;transition:opacity .15s;opacity:0;">
+        <polygon id="arrowPoly" points="20,2 14,16 26,16" fill="#FFC448" stroke="#fff" stroke-width="1.2"
+                 opacity=".85"/>
+        <circle id="arrowCircle" cx="20" cy="20" r="7" fill="#FFC448" stroke="#fff" stroke-width="1.2"
+                opacity=".85" display="none"/>
+    </svg>
 </div>
 
 <!-- 悬浮输入面板 (和 index 一致的风格) -->
@@ -279,8 +288,8 @@
     <div class="float-body" id="floatBody">
         <!-- 模式切换 -->
         <div class="mode-toggle">
-            <button class="mode-btn active" id="mf" onclick="setIM('file')">文件上传</button>
-            <button class="mode-btn" id="ms" onclick="startSC()">屏幕捕获</button>
+            <button class="mode-btn active" id="mf" data-conn-mode="file" onclick="setIM('file')">文件上传</button>
+            <button class="mode-btn" id="ms" data-conn-mode="screen" onclick="startSC()">屏幕捕获</button>
         </div>
 
         <!-- 预览区 -->
@@ -335,7 +344,7 @@
 <script src="js/tracker-core.js"></script>
 <script>
 var $ = function(id){ return document.getElementById(id); };
-var MC=$('mc'), MW=$('mw'), MI=$('mi'), DOT=$('dot'), CH=$('ch');
+var MC=$('mc'), MW=$('mw'), MI=$('mi'), DOT=$('dot'), CH=$('ch'), ARWD=$('arrowDir');
 var SX=$('sx'), SY=$('sy'), SS=$('ss'), ZL=$('zl');
 
 var mapInfo=null;
@@ -344,8 +353,81 @@ var dragging=false, dsx=0, dsy=0, dox=0, doy=0;
 var lx=null, ly=null, lf=false;
 var autoRun=false, autoT=null;
 var sending=false;
+var lAngle=0; // 最新箭头角度
+var lStopped=true; // 是否静止
+
+function setButtonAvailability(buttons, enabled, title) {
+    Array.prototype.forEach.call(buttons || [], function(btn) {
+        if (!btn) return;
+        btn.disabled = !enabled;
+        btn.title = title || '';
+        if (enabled) {
+            btn.style.opacity = '';
+            btn.style.cursor = '';
+        } else {
+            btn.style.opacity = '0.55';
+            btn.style.cursor = 'not-allowed';
+            btn.classList.remove('active');
+        }
+    });
+}
+
+function applyCompatibilityGuards() {
+    var report = TC.getConnectionDiagnostics();
+    setButtonAvailability(
+        document.querySelectorAll('[data-conn-mode="screen"]'),
+        report.screenCapture,
+        report.screenCapture ? '开始屏幕捕获' : '当前浏览器不支持屏幕捕获，请改用 Chrome / Edge / Firefox 新版'
+    );
+}
+
+function logCompatibilityReport() {
+    var report = TC.getConnectionDiagnostics();
+    var parts = [
+        'HTTP上传' + (report.httpUpload ? '✅' : '❌'),
+        '屏幕捕获' + (report.screenCapture ? '✅' : '❌'),
+        '触屏拖拽' + ('ontouchstart' in window ? '✅' : '⚪')
+    ];
+    TC.log('兼容检测：' + parts.join(' | '));
+}
+
+// === 静止死区：上次被接受的地图坐标，用于过滤 SIFT 微小随机抖动 ===
+var _lastDotMapX = null, _lastDotMapY = null, _lastDotAngle = null;
+var DOT_POS_DEADZONE = 2;   // 地图坐标单位，低于此距离视为静止不触发 lerp
+var DOT_ANGLE_DEADZONE = 2; // 度，低于此角度变化不触发 lerp
 
 const MIN_S=.08, MAX_S=15;
+
+// ========== rAF 插值 ==========
+var _lerp = { tx:0, ty:0, cx:0, cy:0, tAngle:0, cAngle:0, running:false };
+var LERP_FACTOR = 0.25; // 每帧趋近 25%（位置）
+var ANGLE_LERP_FACTOR = 0.5; // 角度每帧趋近 50%（独立系数，更灵敏）
+
+function _angDiff(a, b) { var d=(a-b)%360; return d>180?d-360:d<-180?d+360:d; }
+
+function _lerpTick() {
+    var dx = _lerp.tx - _lerp.cx;
+    var dy = _lerp.ty - _lerp.cy;
+    var da = _angDiff(_lerp.tAngle, _lerp.cAngle);
+    if (Math.abs(dx) < 0.3 && Math.abs(dy) < 0.3 && Math.abs(da) < 0.5) {
+        _lerp.cx = _lerp.tx; _lerp.cy = _lerp.ty; _lerp.cAngle = _lerp.tAngle;
+        _applyDotPos(_lerp.cx, _lerp.cy, _lerp.cAngle);
+        _lerp.running = false;
+        return;
+    }
+    _lerp.cx += dx * LERP_FACTOR;
+    _lerp.cy += dy * LERP_FACTOR;
+    _lerp.cAngle += da * ANGLE_LERP_FACTOR;
+    _applyDotPos(_lerp.cx, _lerp.cy, _lerp.cAngle);
+    requestAnimationFrame(_lerpTick);
+}
+
+function _applyDotPos(sx, sy, angle) {
+    var pos = 'translate(' + sx + 'px,' + sy + 'px)';
+    DOT.style.transform = pos + ' translate(-50%,-50%)';
+    CH.style.transform = pos + ' translate(-50%,-50%)';
+    ARWD.style.transform = pos + ' translate(-50%,-50%) rotate(' + angle + 'deg)';
+}
 
 // ========== 初始化 ==========
 TC.init({
@@ -358,7 +440,9 @@ TC.init({
             lx = result.status.position.x;
             ly = result.status.position.y;
             lf = !!result.status.found;
-            setDot(lx, ly, result.status.state || '', lf);
+            lAngle = result.status.arrow_angle || 0;
+            lStopped = !!result.status.arrow_stopped;
+            setDot(lx, ly, result.status.state || '', lf, lAngle, lStopped);
             updUIBig(result);
             if (autoRun && lf) ensureVis(lx, ly);
             // 路线: 用玩家坐标更新进度
@@ -379,6 +463,13 @@ async function init() {
     setTimeout(function(){ $('ldMask').classList.add('hide'); },300);
     bindEv();
     TC.log('就绪 - ' + mapInfo.map_width + 'x' + mapInfo.map_height);
+    // 自动连接 WebSocket（大地图使用 coords-only 模式，带宽极低）
+    TC.connectWS().then(function(){
+        TC.log('\ud83d\udcf6 WebSocket \u5df2\u5c31\u7eea\uff08coords \u6a21\u5f0f\uff09');
+    }).catch(function(e){
+        TC.log('\u26a0\ufe0f WS\u8fde\u63a5\u5931\u8d25\uff0c\u5c06\u4f7f\u7528HTTP\u6a21\u5f0f');
+        useWSMode=false;
+    });
 }
 
 function fitMap() {
@@ -389,18 +480,70 @@ function fitMap() {
     oy=(ch-mapInfo.map_height*sc)/2;
     applyT();
 }
-function applyT() { MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')'; ZL.textContent=Math.round(sc*100)+'%'; }
+function applyT() {
+    MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')';
+    ZL.textContent=Math.round(sc*100)+'%';
+    // 缩放/平移后立即同步点位屏幕坐标，防止点位漂移到错误位置
+    if (lx !== null) {
+        var _sx = lx * sc + ox, _sy = ly * sc + oy;
+        _lerp.tx = _sx; _lerp.ty = _sy;
+        _lerp.cx = _sx; _lerp.cy = _sy;
+        _applyDotPos(_sx, _sy, _lerp.cAngle);
+    }
+}
 
 // ========== 红点 & UI 更新 ==========
-function setDot(x,y,state,found){
-    // #dot 和 #ch 现在在 #mc 下与 #mw 同级，需要使用屏幕坐标
+function setDot(x, y, state, found, angle, stopped){
+    // 地图坐标 → 屏幕坐标
     var screenX = x * sc + ox;
     var screenY = y * sc + oy;
-    DOT.style.left=screenX+'px';DOT.style.top=screenY+'px';
-    CH.style.left=screenX+'px';CH.style.top=screenY+'px';
+    angle = angle || 0;
+    stopped = !!stopped;
+
+    // 箭头/圆形切换
+    var ap = document.getElementById('arrowPoly');
+    var ac = document.getElementById('arrowCircle');
+    if (ap && ac) {
+        ap.setAttribute('display', stopped ? 'none' : '');
+        ac.setAttribute('display', stopped ? '' : 'none');
+    }
+
+    // === 静止死区过滤：位置和角度变化量均低于阈值时跳过 lerp，消除静止抖动 ===
+    if (_lastDotMapX !== null) {
+        var _dp = Math.sqrt((x-_lastDotMapX)*(x-_lastDotMapX)+(y-_lastDotMapY)*(y-_lastDotMapY));
+        var _da = Math.abs(_angDiff(angle, _lastDotAngle));
+        if (_dp < DOT_POS_DEADZONE && _da < DOT_ANGLE_DEADZONE) {
+            // 仅更新状态样式与坐标显示，不触发新的 lerp 动画
+            DOT.classList.remove('inertial','lost');
+            if(!found){ DOT.classList.add('lost'); ARWD.style.opacity='0'; }
+            else {
+                if(state==='INERTIAL') DOT.classList.add('inertial');
+                ARWD.style.opacity='.85';
+            }
+            CH.style.opacity=found?'.25':'0';
+            SX.textContent=Math.round(x); SY.textContent=Math.round(y);
+            return;
+        }
+    }
+    _lastDotMapX = x; _lastDotMapY = y; _lastDotAngle = angle;
+
+    // 更新 lerp 目标
+    if (_lerp.cx === 0 && _lerp.cy === 0) {
+        // 首次定位：直接跳转
+        _lerp.cx = screenX; _lerp.cy = screenY; _lerp.cAngle = angle;
+    }
+    _lerp.tx = screenX; _lerp.ty = screenY; _lerp.tAngle = angle;
+    if (!_lerp.running) {
+        _lerp.running = true;
+        requestAnimationFrame(_lerpTick);
+    }
+
     DOT.classList.remove('inertial','lost');
-    if(!found)DOT.classList.add('lost');
-    else if(state==='INERTIAL')DOT.classList.add('inertial');
+    if(!found){ DOT.classList.add('lost'); ARWD.style.opacity='0'; }
+    else {
+        if(state==='INERTIAL') DOT.classList.add('inertial');
+        ARWD.style.opacity='.85';
+    }
     CH.style.opacity=found?'.25':'0';
     SX.textContent=Math.round(x);SY.textContent=Math.round(y);
 }
@@ -539,45 +682,97 @@ function setupRegionDrag() {
 }
 
 // ========== 分析逻辑 (升级: WS 优先 + 圆形选区保存) ==========
-var useWSMode=true;
 async function analyzeOnce(){
     var data=TC.imageData;
     if(!data&&TC.mode==='screen'){data=TC.captureScreenImg();}
     if(!data){TC.log('\u8bf7\u5148\u9009\u62e9\u56fe\u7246\u6216\u5f00\u542c\u5c4f\u5e55\u6355\u83b7');return}
     await saveCircleState();
     TC.log('\u6b63\u5728\u5206\u6790...');
-    // 优先 WS 二进制模式
+    // 优先 WS coords-only 模式
     if(useWSMode && TC.wsConnected){
         try{
             var blob=await new Promise(function(res){
                 var img=new Image();img.onload=function(){
                     var c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;
                     var ctx=c.getContext('2d');ctx.drawImage(img,0,0);
-                    c.toBlob(res,'image/png',.95);
+                    c.toBlob(res,'image/jpeg',.85);
                 };img.src=data;
             });
-            if(blob){await TC.sendViaWS(blob);return;}
-        }catch(e){useWSMode=false;TC.log('WS \u56de送 HTTP \u6a21式');}
+            if(blob){TC.sendCoordsViaWS(blob);return;}
+        }catch(e){useWSMode=false;TC.log('WS \u56de\u9000 HTTP \u6a21\u5f0f');}
     }
     try{await TC.sendAndDisplay(data);}catch(err){TC.log('\u9519\u8bef: '+err.message);}
 }
 
 
-// ========== 自动追踪 ==========
-function toggleAuto(){
+// ========== 自动追踪 (WS coords-only 优先，HTTP 回退) ==========
+var useWSMode = true;
+var wsReconnectAt = 0;
+var nullBlobWarnAt = 0;
+var S_nullBlobCount = 0;
+
+async function toggleAuto(){
     autoRun=!autoRun;
     var btn=$('autoBtn');
-    if(autoRun){btn.textContent='\u6682\u505c\u8ffd\u8e2a';btn.className='ba';TC.log('\u81ea\u52a8\u8ffd\u8e2a\u5df2\u542f\u52a8');loopAuto();}
+    if(autoRun){
+        btn.textContent='\u6682\u505c\u8ffd\u8e2a';btn.className='ba';
+        await saveCircleState();
+        // 确保 WS 已连接
+        if(useWSMode && !TC.wsConnected){
+            try{
+                await TC.connectWS();
+            }catch(e){
+                TC.log('\u26a0\ufe0f WS\u8fde\u63a5\u5931\u8d25\uff0c\u4f7f\u7528HTTP\u6a21\u5f0f');
+                useWSMode=false;
+            }
+        }
+        var modeLabel=useWSMode&&TC.wsConnected?'WS coords':'HTTP';
+        TC.log('\u81ea\u52a8\u8ffd\u8e2a\u5df2\u542f\u52a8 ('+modeLabel+')');
+        loopAuto();
+    }
     else{btn.textContent='\u81ea\u52a8\u8ffd\u8e2a';btn.className='bs';TC.log('\u5df2\u6682\u505c');if(autoT){clearTimeout(autoT);autoT=null}}
 }
 function loopAuto(){
     if(!autoRun)return;
     captureAndSend();
-    autoT=setTimeout(function(){requestAnimationFrame(loopAuto);},50);}
+    autoT=setTimeout(function(){requestAnimationFrame(loopAuto);},80);
+}
 async function captureAndSend(){
     if(TC.mode!=='screen'||sending||!TC.isScreenActive)return;
     sending=true;
-    try{var d=TC.captureScreenImg();if(d)await TC.sendAndDisplay(d);}catch(e){console.error(e)}finally{sending=false}
+    try{
+        if(useWSMode && TC.wsConnected){
+            // WS 二进制 coords-only 模式：仅返回坐标，无图片，带宽极低
+            var blob=await TC.captureScreenImgBlob();
+            if(blob){
+                S_nullBlobCount=0;
+                TC.sendCoordsViaWS(blob);
+            } else {
+                S_nullBlobCount++;
+                if(S_nullBlobCount>=5 && Date.now()>=nullBlobWarnAt){
+                    nullBlobWarnAt=Date.now()+5000;
+                    TC.log('\u26a0\ufe0f \u622a\u56fe\u8fde\u7eed\u5931\u8d25('+S_nullBlobCount+'\u5e27)');
+                }
+            }
+        } else if(useWSMode && !TC.wsConnected){
+            // WS 断开：本帧走 HTTP，后台尝试重连
+            var d=TC.captureScreenImg();
+            if(d) await TC.sendAndDisplay(d);
+            var now=Date.now();
+            if(now>=wsReconnectAt){
+                wsReconnectAt=now+3000;
+                TC.log('\ud83d\udd04 WS\u65ad\u5f00\uff0c\u5c1d\u8bd5\u91cd\u8fde...');
+                TC.connectWS().then(function(){
+                    TC.log('\ud83d\udcf6 WS\u91cd\u8fde\u6210\u529f');
+                }).catch(function(){});
+            }
+        } else {
+            // HTTP 模式
+            var d=TC.captureScreenImg();
+            if(d) await TC.sendAndDisplay(d);
+        }
+    }catch(e){console.error(e)}
+    finally{sending=false}
 }
 
 // ========== 屏幕捕获 (包装 TC) ==========
@@ -606,7 +801,7 @@ function stopSC(){
 function setIM(m){
     TC.mode=m;
     var btns=document.querySelectorAll('#floatBody .mode-btn');
-    btns.forEach(function(b){b.classList.remove('active');});
+    Array.prototype.forEach.call(btns, function(b){b.classList.remove('active');});
     $(m==='file'?'mf':'ms').classList.add('active');
 }
 
@@ -661,7 +856,7 @@ var RouteModule = (function(){
         updateBtnState();
         // 取消选中状态
         var items = document.querySelectorAll('#routeList .rp-item');
-        items.forEach(function(el){ el.classList.remove('selected'); });
+        Array.prototype.forEach.call(items, function(el){ el.classList.remove('selected'); });
     }
 
     /** 切换可见性 */
@@ -917,7 +1112,7 @@ async function selectRoute(liEl){
     if(!filename) return;
 
     // UI 选中效果
-    document.querySelectorAll('#routeList .rp-item').forEach(function(e){e.classList.remove('selected');});
+    Array.prototype.forEach.call(document.querySelectorAll('#routeList .rp-item'), function(e){e.classList.remove('selected');});
     liEl.classList.add('selected');
 
     try{
@@ -1064,6 +1259,8 @@ TC.loadTestImages('testGrid').then(function(imgs){
     if(imgs.length>0) $('testImagesArea').classList.add('show');
 });
 TC.checkEngines();
+applyCompatibilityGuards();
+logCompatibilityReport();
 function escapeHtml(str){
     var d=document.createElement('div');d.textContent=str;return d.innerHTML;
 }
