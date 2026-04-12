@@ -42,7 +42,134 @@ const TrackerCore = (() => {
         selCircle: { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) },
         wsSocket: null,
         wsConnected: false,
+        wsTransportName: '',
+        wsConnecting: null,    // 连接中的 Promise（防止重复创建 socket）
+        wsManualClose: false,  // 标记是否为手动断开（抑制重复日志）
         captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
+        lastWasUpdate: false, // logUpdate 状态标记
+        nullBlobCount: 0,     // 连续 null blob 计数，用于检测视频流问题
+    };
+
+    // ==================== 内部工具 ====================
+    /**
+     * 构建状态行文本（给 logUpdate 使用）
+     * @param {object} st  result.status 对象
+     * @param {string|null} kbStr  流量字符串，如 '12.3'，HTTP 模式传 null
+     */
+    var _fmtResult = function(st, kbStr) {
+        var state = st.state || '';
+        var icon, tag;
+        if (state === 'SCENE_CHANGE') {
+            icon = '🔄'; tag = '切场';
+        } else if (state === 'GLOBAL_SCAN' && !st.found) {
+            icon = '🔍'; tag = '全扫';
+        } else if (!st.found) {
+            icon = '❌'; tag = '丢失';
+        } else if (state === 'INERTIAL') {
+            icon = '⚠️'; tag = '惯性';
+        } else if (state === 'GLOBAL_SCAN') {
+            icon = '🔍'; tag = '全扫';
+        } else {
+            icon = '✅'; tag = '';
+        }
+        // 坐标：切场/找到时显示，否则 --
+        var pos = (st.found || state === 'SCENE_CHANGE')
+            ? '(' + st.position.x + ',' + st.position.y + ')'
+            : '--';
+        // 品质：有意义时才显示
+        var q = (st.match_quality != null && st.match_quality > 0)
+            ? ' ' + Math.round(st.match_quality * 100) + '%' : '';
+        // 附加标志
+        var extras = [];
+        if (st.coord_lock)  extras.push('🔒');
+        if (st.hybrid_busy) extras.push('AI↑');
+        // 拼装
+        var line = icon + (tag ? ' [' + tag + ']' : '') + ' ' + pos
+                 + ' | ' + st.matches + '匹' + q;
+        if (kbStr)        line += ' | ' + kbStr + 'KB';
+        if (extras.length) line += ' | ' + extras.join(' ');
+        return line;
+    };
+
+    var _forEachNode = function(nodes, handler) {
+        Array.prototype.forEach.call(nodes || [], handler);
+    };
+
+    var _createCustomEvent = function(name, detail) {
+        if (typeof window.CustomEvent === 'function') {
+            return new CustomEvent(name, { detail: detail });
+        }
+        var evt = document.createEvent('CustomEvent');
+        evt.initCustomEvent(name, false, false, detail);
+        return evt;
+    };
+
+    var _decodeUtf8 = function(bytes) {
+        if (typeof TextDecoder !== 'undefined') {
+            try { return new TextDecoder('utf-8').decode(bytes); } catch (e) {}
+        }
+
+        var out = '';
+        var i = 0;
+        while (i < bytes.length) {
+            var c = bytes[i++];
+            if (c < 128) {
+                out += String.fromCharCode(c);
+            } else if (c > 191 && c < 224 && i < bytes.length) {
+                var c2 = bytes[i++];
+                out += String.fromCharCode(((c & 31) << 6) | (c2 & 63));
+            } else if (i + 1 < bytes.length) {
+                var c3 = bytes[i++];
+                var c4 = bytes[i++];
+                out += String.fromCharCode(((c & 15) << 12) | ((c3 & 63) << 6) | (c4 & 63));
+            }
+        }
+        return out;
+    };
+
+    var _dataURLToBlob = function(dataURL) {
+        var parts = (dataURL || '').split(',');
+        if (parts.length < 2) return null;
+
+        var header = parts[0];
+        var b64 = parts[1];
+        var mimeMatch = header.match(/data:([^;]+)/);
+        var mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+        var bin = atob(b64);
+        var len = bin.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+        return new Blob([bytes], { type: mime });
+    };
+
+    var _getDisplayMediaImpl = function() {
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
+            return function(options) { return navigator.mediaDevices.getDisplayMedia(options); };
+        }
+        if (typeof navigator.getDisplayMedia === 'function') {
+            return function(options) { return navigator.getDisplayMedia(options); };
+        }
+        return null;
+    };
+
+    var _getSocketTransportName = function(sock) {
+        try {
+            return (sock && sock.io && sock.io.engine && sock.io.engine.transport && sock.io.engine.transport.name) || 'socket.io';
+        } catch (e) {
+            return 'socket.io';
+        }
+    };
+
+    var _bindSocketTransportEvents = function(sock, self) {
+        if (!sock || sock.__tcTransportEventsBound) return;
+        if (!sock.io || !sock.io.engine || typeof sock.io.engine.on !== 'function') return;
+
+        sock.__tcTransportEventsBound = true;
+        sock.io.engine.on('upgrade', function(transport) {
+            var name = transport && transport.name ? transport.name : 'websocket';
+            S.wsTransportName = name;
+            self.log('🚀 Socket.IO 已升级到 ' + name);
+        });
     };
 
     let opts = {
@@ -68,32 +195,72 @@ const TrackerCore = (() => {
         set selCircle(v) { Object.assign(S.selCircle, v); },
         get isScreenActive() { return !!S.screenStream; },
         get wsConnected() { return S.wsConnected; },
+        get wsTransportName() { return S.wsTransportName; },
 
         // ========== 日志 ==========
         log(msg) {
+            S.lastWasUpdate = false;
             let el = opts.logEl;
             if (typeof el === 'string') el = document.getElementById(el);
             if (!el) return;
             const time = new Date().toLocaleTimeString();
             el.textContent += `[${time}] ${msg}\n`;
-            var MAX = parseInt(el.dataset.maxLen || '5000', 10);
-            var TRIM = parseInt(el.dataset.trimLen || '4000', 10);
+            var MAX = parseInt(el.dataset.maxLen || '3000', 10);
+            var TRIM = parseInt(el.dataset.trimLen || '2000', 10);
             if (el.textContent.length > MAX) el.textContent = el.textContent.slice(-TRIM);
+            el.scrollTop = el.scrollHeight;
+        },
+
+        /** 覆盖式日志：高频状态行原地刷新，不堆积 */
+        logUpdate(msg) {
+            let el = opts.logEl;
+            if (typeof el === 'string') el = document.getElementById(el);
+            if (!el) return;
+            const time = new Date().toLocaleTimeString();
+            const line = `[${time}] ${msg}\n`;
+            if (S.lastWasUpdate) {
+                // 替换最后一行（找倒数第二个换行符）
+                var text = el.textContent;
+                var end = text.length - 1; // 跳过末尾 \n
+                var prev = text.lastIndexOf('\n', end - 1);
+                el.textContent = (prev >= 0 ? text.slice(0, prev + 1) : '') + line;
+            } else {
+                S.lastWasUpdate = true;
+                el.textContent += line;
+                var MAX = parseInt(el.dataset.maxLen || '3000', 10);
+                var TRIM = parseInt(el.dataset.trimLen || '2000', 10);
+                if (el.textContent.length > MAX) el.textContent = el.textContent.slice(-TRIM);
+            }
             el.scrollTop = el.scrollHeight;
         },
 
         // ========== 工具 ==========
         clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); },
 
+        getConnectionDiagnostics() {
+            var canvas = document.createElement('canvas');
+            return {
+                httpUpload: typeof fetch === 'function' && typeof FormData !== 'undefined' && typeof JSON !== 'undefined',
+                socketIO: typeof io === 'function',
+                websocket: typeof WebSocket !== 'undefined',
+                binaryFrames: typeof Blob !== 'undefined' && typeof ArrayBuffer !== 'undefined',
+                screenCapture: !!_getDisplayMediaImpl(),
+                customEvent: typeof window.CustomEvent === 'function',
+                textDecoder: typeof TextDecoder !== 'undefined',
+                canvasStream: !!canvas.captureStream,
+            };
+        },
+
         // ========== 状态格式化 ==========
         formatStatus(status) {
             var text = '--', cls = 'green', label = '';
+            var found = status.found != null ? status.found : !!status.f;  // 兼容 found / f 两种字段名
             if (status.mode === 'sift') {
                 if (status.state === 'SCENE_CHANGE') {
                     text = '切场'; cls = 'yellow'; label = '场景切换';
-                } else if (!status.f) {
+                } else if (!found) {
                     text = '丢失'; cls = 'red'; label = '未找到';
-                } else if (status.state === 'INERTIAL' || status.is_inertial) {
+                } else if (status.state === 'INERTIAL') {
                     text = '惯性'; cls = 'yellow'; label = '惯性导航';
                 } else {
                     text = '正常'; cls = 'green'; label = 'SIFT追踪';
@@ -101,7 +268,7 @@ const TrackerCore = (() => {
             } else {
                 if (status.state === 'GLOBAL_SCAN') {
                     text = '扫描'; cls = 'red'; label = '全局扫描';
-                } else if (status.f) {
+                } else if (found) {
                     text = '正常'; cls = 'green'; label = '局部追踪';
                 } else {
                     text = '丢失'; cls = 'red'; label = '目标丢失';
@@ -136,8 +303,9 @@ const TrackerCore = (() => {
             if (xe && status.position) xe.textContent = status.position.x;
             if (ye && status.position) ye.textContent = status.position.y;
             if (fe) {
-                fe.textContent = status.f ? '\u2705 \u662f' : '\u274c \u5426';
-                fe.className = 'status-value ' + (status.f ? 'found-yes' : 'found-no');
+                var isFound = status.found != null ? status.found : !!status.f;
+                fe.textContent = isFound ? '\u2705 \u662f' : '\u274c \u5426';
+                fe.className = 'status-value ' + (isFound ? 'found-yes' : 'found-no');
             }
             if (mche) mche.textContent = status.matches;
 
@@ -211,8 +379,14 @@ const TrackerCore = (() => {
         startScreenCapture(o) {
             o = o || {};
             var self = this;
+            var getDisplayMedia = _getDisplayMediaImpl();
 
-            return navigator.mediaDevices.getDisplayMedia({
+            if (!getDisplayMedia) {
+                self.log('当前浏览器不支持屏幕捕获，请改用 Chrome / Edge / Firefox 新版');
+                return Promise.resolve(false);
+            }
+
+            return getDisplayMedia({
                 video: { cursor: 'always', displaySurface: 'monitor' },
                 audio: false,
             }).then(function(strm) {
@@ -288,6 +462,14 @@ const TrackerCore = (() => {
             var c = S.captureCanvas;
             if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
+            if (!ctx) {
+                // context 丢失（内存压力等），强制重建 canvas
+                S.captureCanvas = document.createElement('canvas');
+                c = S.captureCanvas;
+                c.width = sz; c.height = sz;
+                ctx = c.getContext('2d');
+                if (!ctx) return null;
+            }
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
             return c.toDataURL('image/jpeg', 0.80);
         },
@@ -317,10 +499,26 @@ const TrackerCore = (() => {
             var c = S.captureCanvas;
             if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
+            if (!ctx) {
+                // context 丢失，强制重建
+                S.captureCanvas = document.createElement('canvas');
+                c = S.captureCanvas;
+                c.width = sz; c.height = sz;
+                ctx = c.getContext('2d');
+                if (!ctx) return Promise.resolve(null);
+            }
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
 
             return new Promise(function(resolve) {
-                c.toBlob(function(blob) { resolve(blob); }, 'image/jpeg', 0.82);
+                if (typeof c.toBlob === 'function') {
+                    c.toBlob(function(blob) { resolve(blob); }, 'image/jpeg', 0.82);
+                    return;
+                }
+                try {
+                    resolve(_dataURLToBlob(c.toDataURL('image/jpeg', 0.82)));
+                } catch (e) {
+                    resolve(null);
+                }
             });
         },
 
@@ -334,21 +532,22 @@ const TrackerCore = (() => {
                 headers: { 'Content-Type': 'application/json' }
             }).then(function(resp) {
                 if (resp.ok) return resp.json();
-                // fallback: FormData
+                // fallback: FormData（兼容部分反向代理对 JSON body 的限制）
                 return fetch(imageDataURL).then(function(r) { return r.blob(); }).then(function(blob) {
                     var fd = new FormData(); fd.append('image', blob, 'minimap.png');
                     return fetch('/api/upload_minimap', { method: 'POST', body: fd }).then(function(r2) { return r2.json(); });
                 });
             }).then(function(result) {
-                if (result.status) {
-                    self.log('\u5206\u6790\u5b8c\u6210 | ' +
-                        (result.status.found ? '\u2705 \u627e\u5230\u4f4d\u7f6e' : '\u274c \u672a\u627e\u5230') +
-                        ' (' + result.status.matches + ' \u5339\u914d\u70b9)');
-                } else {
-                    self.log('\u5206\u6790\u5b8c\u6210\uff0c\u4f46\u672a\u8fd4\u56de\u72b6\u6001\u4fe1\u606f');
+                if (result && result.error) {
+                    self.logUpdate('⚠️ ' + result.error);
+                } else if (result && result.status) {
+                    self.logUpdate(_fmtResult(result.status, null));
                 }
                 if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                 return result;
+            }).catch(function(e) {
+                self.log('❌ HTTP 请求失败: ' + e.message);
+                throw e;
             });
         },
 
@@ -361,56 +560,124 @@ const TrackerCore = (() => {
         connectWS() {
             var self = this;
             if (S.wsSocket && S.wsConnected) return Promise.resolve(true);
-            return new Promise(function(resolve, reject) {
+            if (typeof io !== 'function') {
+                var missingErr = new Error('当前页面未加载 Socket.IO 客户端');
+                self.log('❌ Socket.IO 客户端未加载，无法建立实时连接');
+                return Promise.reject(missingErr);
+            }
+            // 连接中则复用同一个 Promise，避免并发调用创建多个 socket
+            if (S.wsConnecting) return S.wsConnecting;
+            S.wsConnecting = new Promise(function(resolve, reject) {
+
                 try {
                     var sock = io({
-                        transports: ['websocket'],
+                        transports: ['polling', 'websocket'],
+                        upgrade: true,
+                        rememberUpgrade: true,
+                        timeout: 5000,
                         forceNew: true,
                     });
                     S.wsSocket = sock;
 
                     sock.on('connect', function() {
                         S.wsConnected = true;
-                        self.log('\ud83d\udcf6 Socket.IO 已连接（二进制模式）');
+                        S.wsTransportName = _getSocketTransportName(sock);
+                        S.wsConnecting = null;
+                        _bindSocketTransportEvents(sock, self);
+                        self.log('📶 Socket.IO 已连接（' + S.wsTransportName + '）');
                         resolve(true);
                     });
 
-                    sock.on('disconnect', function() {
+                    sock.on('disconnect', function(reason) {
                         S.wsConnected = false;
-                        self.log('\ud83d\udcf5 Socket.IO 已断开');
+                        S.wsTransportName = '';
+                        S.wsConnecting = null;
+                        // 手动断开时已在 disconnectWS 记录日志，此处不重复打印
+                        if (!S.wsManualClose) {
+                            self.log('📵 Socket.IO 已断开' + (reason ? ' (' + reason + ')' : ''));
+                        }
+                        S.wsManualClose = false;
                     });
 
                     sock.on('connect_error', function(err) {
                         S.wsConnected = false;
+                        S.wsTransportName = '';
+                        S.wsConnecting = null;
                         console.error('SIO error:', err);
-                        self.log('\u274c Socket.IO 连接失败: ' + err.message);
+                        self.log('❌ Socket.IO 连接失败: ' + err.message + '（已尝试 polling / websocket）');
                         reject(err);
                     });
 
                     // 接收后端二进制响应: [4字节大端JSON长度][JSON][JPEG图片]
-                    sock.on('result', function(data) {
-                        if (!(data instanceof ArrayBuffer)) return;
-                        var view = new DataView(data);
+                    var _processResultBuf = function(buf, byteLen) {
+                        var view = new DataView(buf);
                         if (view.byteLength < 4) return;
                         var jsonLen = view.getUint32(0, false);
                         if (view.byteLength < 4 + jsonLen) return;
-                        var jsonBytes = new Uint8Array(data, 4, jsonLen);
-                        var jsonStr = new TextDecoder().decode(jsonBytes);
+                        var jsonBytes = new Uint8Array(buf, 4, jsonLen);
+                        var jsonStr = _decodeUtf8(jsonBytes);
                         var status;
                         try { status = JSON.parse(jsonStr); } catch(e) { return; }
 
-                        if (status.error) {
-                            self.log('\u274c 解码失败');
-                            return;
-                        }
+                        if (status.error) { self.log('\u274c 解码失败'); return; }
 
                         var jpegStart = 4 + jsonLen;
-                        var jpegBytes = data.slice(jpegStart);
+                        var jpegBytes = buf.slice(jpegStart);
                         if (jpegBytes.byteLength > 2) {
                             var b64 = _arrayBufferToBase64(jpegBytes);
+                            var result = {
+                                success: true,
+                                image: b64,
+                                status: {
+                                    mode: status.m,
+                                    state: status.s,
+                                    position: { x: status.x, y: status.y },
+                                    found: !!status.f,
+                                    matches: status.c,
+                                    match_quality: status.q || 0,
+                                    arrow_angle: status.a || 0,
+                                    arrow_stopped: !!status.as,
+                                    coord_lock: !!status.l,
+                                    hybrid: !!status.hy,
+                                    hybrid_busy: !!status.h,
+                                }
+                            };
+                            self.logUpdate(_fmtResult(result.status, (byteLen / 1024).toFixed(1)));
+                            if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                        }
+                    };
+
+                    sock.on('result', function(data) {
+                        // 标准化为 ArrayBuffer：兼容 ArrayBuffer / TypedArray / Blob
+                        if (data instanceof ArrayBuffer) {
+                            _processResultBuf(data, data.byteLength);
+                        } else if (ArrayBuffer.isView(data)) {
+                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                            _processResultBuf(buf, data.byteLength);
+                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                            // polling 升级过程中 Socket.IO 某些版本可能传 Blob
+                            var blobSize = data.size;
+                            data.arrayBuffer().then(function(ab) { _processResultBuf(ab, blobSize); });
+                        } else {
+                            console.warn('[WS] result: 未知数据类型', typeof data, data);
+                            return;
+                        }
+                    });
+
+                    // 接收后端 coords 响应（仅坐标，无 JPEG 图片，适合大地图页面）
+                    var _processCoordsResult = function(buf) {
+                        if (!buf || buf.byteLength < 4) return;
+                        var view = new DataView(buf);
+                        var jsonLen = view.getUint32(0, false);
+                        if (buf.byteLength < 4 + jsonLen) return;
+                        var jsonBytes = new Uint8Array(buf, 4, jsonLen);
+                        var jsonStr = _decodeUtf8(jsonBytes);
+                        var status;
+                        try { status = JSON.parse(jsonStr); } catch(e) { return; }
+                        if (status.error) { self.log('\u274c coords 解码失败'); return; }
                         var result = {
                             success: true,
-                            image: b64,
+                            image: null,
                             status: {
                                 mode: status.m,
                                 state: status.s,
@@ -421,10 +688,22 @@ const TrackerCore = (() => {
                                 arrow_angle: status.a || 0,
                                 arrow_stopped: !!status.as,
                                 coord_lock: !!status.l,
+                                hybrid: !!status.hy,
                                 hybrid_busy: !!status.h,
                             }
                         };
-                            if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                        self.logUpdate(_fmtResult(result.status, (buf.byteLength / 1024).toFixed(1)));
+                        if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                    };
+
+                    sock.on('coords', function(data) {
+                        if (data instanceof ArrayBuffer) {
+                            _processCoordsResult(data);
+                        } else if (ArrayBuffer.isView(data)) {
+                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                            _processCoordsResult(buf);
+                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                            data.arrayBuffer().then(function(ab) { _processCoordsResult(ab); });
                         }
                     });
 
@@ -432,14 +711,18 @@ const TrackerCore = (() => {
                     reject(e);
                 }
             });
+            return S.wsConnecting;
         },
 
         disconnectWS() {
+            S.wsManualClose = true;
             if (S.wsSocket && typeof S.wsSocket.disconnect === 'function') {
                 try { S.wsSocket.disconnect(); } catch(e) {}
             }
             S.wsSocket = null;
             S.wsConnected = false;
+            S.wsTransportName = '';
+            S.wsConnecting = null;
             this.log('Socket.IO 已手动断开');
         },
 
@@ -454,6 +737,19 @@ const TrackerCore = (() => {
             }
             S.wsSocket.emit('frame', blob);
             // 不在此处逐帧打日志，避免每帧触发 DOM 重排（scrollTop）
+            return Promise.resolve();
+        },
+
+        /**
+         * 通过 Socket.IO emit 发送二进制帧（仅返回坐标，无图片，适合大地图页面）
+         * 事件名 'frame_coords' 匹配后端 @socketio.on('frame_coords')
+         */
+        sendCoordsViaWS(blob) {
+            if (!S.wsSocket || !S.wsConnected) {
+                this.log('Socket.IO 未连接，请先连接！');
+                return Promise.reject(new Error('WS not connected'));
+            }
+            S.wsSocket.emit('frame_coords', blob);
             return Promise.resolve();
         },
 
@@ -495,9 +791,9 @@ const TrackerCore = (() => {
                     var img = document.createElement('img');
                     img.src = src; img.className = 'test-item'; img.title = src;
                     img.onclick = function() {
-                        grid.querySelectorAll('.test-item').forEach(function(i) { i.classList.remove('selected'); });
+                        _forEachNode(grid.querySelectorAll('.test-item'), function(i) { i.classList.remove('selected'); });
                         img.classList.add('selected');
-                        var evt = new CustomEvent('testimage:selected', { detail: { src: src, imgEl: img } });
+                        var evt = _createCustomEvent('testimage:selected', { src: src, imgEl: img });
                         document.dispatchEvent(evt);
                     };
                     grid.appendChild(img);

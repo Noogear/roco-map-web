@@ -466,6 +466,7 @@ def ws_receive_frame(raw_bytes):
             'as': int(status.get('arrow_stopped', True)),
             'l': int(tracker.sift_engine.coord_lock_enabled),
             'h': int(status.get('hybrid_busy', False)),
+            'hy': int(status.get('hybrid', False)),
         }, separators=(',', ':')).encode('utf-8')
 
         emit('result',
@@ -501,6 +502,7 @@ def ws_frame_coords(raw_bytes):
             'as': int(status.get('arrow_stopped', True)),
             'l': int(tracker.sift_engine.coord_lock_enabled),
             'h': int(status.get('hybrid_busy', False)),
+            'hy': int(status.get('hybrid', False)),
         }, separators=(',', ':')).encode('utf-8')
 
         emit('coords',

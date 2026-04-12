@@ -155,6 +155,11 @@ class AIMapTrackerWeb:
         # 线性过滤器：连续丢弃帧计数器（防死锁）
         self._linear_filter_consecutive = 0
 
+        # === 传送检测：候选聚类确认缓冲（防误判）===
+        # 连续 TP_CONFIRM_FRAMES 帧 SIFT 稳定匹配到同一远处新位置才视为传送，
+        # 随机噪声帧在空间上分散，不会通过聚类校验，因此不会误触。
+        self._tp_candidate_buffer = deque(maxlen=getattr(config, 'TP_CONFIRM_FRAMES', 3))
+
         # === 圆形小地图检测器 (方形截取 + HoughCircles 自动校准) ===
         self._circle_cal = _CircleCalibrator()
 
@@ -651,6 +656,47 @@ class AIMapTrackerWeb:
             if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
                 self._save_smooth_buffer()
 
+        # === 传送检测：候选聚类确认 ===
+        # 条件：真实匹配帧 + 当前显示位置已初始化 + 卡尔曼输出距显示位置超过阈值
+        if (found and not is_inertial and cx is not None
+                and self._display_x is not None):
+            _tp_jump = math.sqrt(
+                (smooth_x - self._display_x) ** 2 + (smooth_y - self._display_y) ** 2
+            )
+            _tp_thresh = getattr(config, 'TP_JUMP_THRESHOLD', 300)
+            if _tp_jump > _tp_thresh:
+                # 大幅跳变：放入候选缓冲
+                self._tp_candidate_buffer.append((smooth_x, smooth_y))
+                _tp_confirm = getattr(config, 'TP_CONFIRM_FRAMES', 3)
+                _tp_radius = getattr(config, 'TP_CLUSTER_RADIUS', 150)
+                if len(self._tp_candidate_buffer) >= _tp_confirm:
+                    # 检查候选点是否空间聚集（聚集 = 传送，分散 = 噪声）
+                    _cands = list(self._tp_candidate_buffer)
+                    _med_x = sorted(c[0] for c in _cands)[len(_cands) // 2]
+                    _med_y = sorted(c[1] for c in _cands)[len(_cands) // 2]
+                    _scatter = max(
+                        math.sqrt((c[0] - _med_x) ** 2 + (c[1] - _med_y) ** 2)
+                        for c in _cands
+                    )
+                    if _scatter <= _tp_radius:
+                        # 聚类确认：立即重置所有过滤器到新位置，消除延迟
+                        print(f"[传送检测] 聚类确认 scatter={_scatter:.0f}px → "
+                              f"立即重置到 ({_med_x},{_med_y})")
+                        self.pos_history.clear()
+                        self.smooth_buffer_x.clear()
+                        self.smooth_buffer_y.clear()
+                        self._kalman_reset(_med_x, _med_y)
+                        self._linear_filter_consecutive = 0
+                        self._display_x = _med_x   # 关键：跳过 EMA，立即跳到新位置
+                        self._display_y = _med_y
+                        self._tp_candidate_buffer.clear()
+                        smooth_x, smooth_y = _med_x, _med_y
+                    # else: 候选点分散 → 噪声，不处理，等待更多帧
+            else:
+                # 跳变量正常 → 是正常移动，清除候选缓冲
+                if self._tp_candidate_buffer:
+                    self._tp_candidate_buffer.clear()
+
         # === 渲染平滑防抖：静止死区 + 移动 EMA ===
         still_threshold = getattr(config, 'RENDER_STILL_THRESHOLD', 2)
         ema_alpha = getattr(config, 'RENDER_EMA_ALPHA', 0.45)
@@ -686,6 +732,10 @@ class AIMapTrackerWeb:
         match_count = 0
         last_x = smooth_x
         last_y = smooth_y
+
+        # 取出 SIFT 引擎返回的实际匹配内点数
+        if found and not is_inertial:
+            match_count = result.get('match_count', 0)
 
         # === 混合引擎：SIFT 惯性/丢失/混乱时触发后台 LoFTR ===
         if self._hybrid_enabled:
