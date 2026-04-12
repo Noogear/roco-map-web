@@ -48,11 +48,11 @@
         #mw{position:absolute;transform-origin:0 0;will-change:transform}
         #mi{display:block}
         #dot{
-            position:absolute;width:18px;height:18px;border-radius:50%;
+            position:absolute;left:0;top:0;width:18px;height:18px;border-radius:50%;
             background:#ff1744;border:2px solid #fff;
             box-shadow:0 0 10px rgba(255,23,68,.9),0 0 30px rgba(255,23,68,.4);
-            transform:translate(-50%,-50%);pointer-events:none;z-index:10;
-            transition:left .05s linear,top .05s linear,opacity .15s,background .15s;
+            pointer-events:none;z-index:10;will-change:transform;
+            transition:opacity .15s,background .15s;
         }
         #dot.inertial{background:#ffab00;box-shadow:0 0 10px rgba(255,171,0,.9),0 0 30px rgba(255,171,0,.4)}
         #dot.lost{background:#555;border-color:#888;box-shadow:none;opacity:.4}
@@ -261,7 +261,7 @@
         <svg id="routeLayer" xmlns="http://www.w3.org/2000/svg"></svg>
     </div>
     <!-- 红点和准星放在 mc 下，与 mw 同级，避免受到地图变换影响 -->
-    <svg id="ch" width="44" height="44" viewBox="0 0 44 44" style="position:absolute;pointer-events:none;z-index:9;transform:translate(-50%,-50%);transition:left .05s linear,top .05s linear,opacity .15s;opacity:.25;">
+    <svg id="ch" width="44" height="44" viewBox="0 0 44 44" style="position:absolute;left:0;top:0;pointer-events:none;z-index:9;will-change:transform;transition:opacity .15s;opacity:.25;">
         <line x1="22" y1="0" x2="22" y2="16" stroke="#00d4ff" stroke-width="1"/>
         <line x1="22" y1="28" x2="22" y2="44" stroke="#00d4ff" stroke-width="1"/>
         <line x1="0" y1="22" x2="16" y2="22" stroke="#00d4ff" stroke-width="1"/>
@@ -269,6 +269,15 @@
         <circle cx="22" cy="22" r="10" stroke="#00d4ff" stroke-width="1" fill="none" opacity=".5"/>
     </svg>
     <div id="dot"></div>
+    <!-- 方向箭头指示器 -->
+    <svg id="arrowDir" width="40" height="40" viewBox="0 0 40 40"
+         style="position:absolute;left:0;top:0;pointer-events:none;z-index:11;
+                will-change:transform;transition:opacity .15s;opacity:0;">
+        <polygon id="arrowPoly" points="20,2 14,16 26,16" fill="#FFC448" stroke="#fff" stroke-width="1.2"
+                 opacity=".85"/>
+        <circle id="arrowCircle" cx="20" cy="20" r="7" fill="#FFC448" stroke="#fff" stroke-width="1.2"
+                opacity=".85" display="none"/>
+    </svg>
 </div>
 
 <!-- 悬浮输入面板 (和 index 一致的风格) -->
@@ -335,7 +344,7 @@
 <script src="js/tracker-core.js"></script>
 <script>
 var $ = function(id){ return document.getElementById(id); };
-var MC=$('mc'), MW=$('mw'), MI=$('mi'), DOT=$('dot'), CH=$('ch');
+var MC=$('mc'), MW=$('mw'), MI=$('mi'), DOT=$('dot'), CH=$('ch'), ARWD=$('arrowDir');
 var SX=$('sx'), SY=$('sy'), SS=$('ss'), ZL=$('zl');
 
 var mapInfo=null;
@@ -344,8 +353,46 @@ var dragging=false, dsx=0, dsy=0, dox=0, doy=0;
 var lx=null, ly=null, lf=false;
 var autoRun=false, autoT=null;
 var sending=false;
+var lAngle=0; // 最新箭头角度
+var lStopped=true; // 是否静止
+
+// === 静止死区：上次被接受的地图坐标，用于过滤 SIFT 微小随机抖动 ===
+var _lastDotMapX = null, _lastDotMapY = null, _lastDotAngle = null;
+var DOT_POS_DEADZONE = 2;   // 地图坐标单位，低于此距离视为静止不触发 lerp
+var DOT_ANGLE_DEADZONE = 2; // 度，低于此角度变化不触发 lerp
 
 const MIN_S=.08, MAX_S=15;
+
+// ========== rAF 插值 ==========
+var _lerp = { tx:0, ty:0, cx:0, cy:0, tAngle:0, cAngle:0, running:false };
+var LERP_FACTOR = 0.25; // 每帧趋近 25%（位置）
+var ANGLE_LERP_FACTOR = 0.5; // 角度每帧趋近 50%（独立系数，更灵敏）
+
+function _angDiff(a, b) { var d=(a-b)%360; return d>180?d-360:d<-180?d+360:d; }
+
+function _lerpTick() {
+    var dx = _lerp.tx - _lerp.cx;
+    var dy = _lerp.ty - _lerp.cy;
+    var da = _angDiff(_lerp.tAngle, _lerp.cAngle);
+    if (Math.abs(dx) < 0.3 && Math.abs(dy) < 0.3 && Math.abs(da) < 0.5) {
+        _lerp.cx = _lerp.tx; _lerp.cy = _lerp.ty; _lerp.cAngle = _lerp.tAngle;
+        _applyDotPos(_lerp.cx, _lerp.cy, _lerp.cAngle);
+        _lerp.running = false;
+        return;
+    }
+    _lerp.cx += dx * LERP_FACTOR;
+    _lerp.cy += dy * LERP_FACTOR;
+    _lerp.cAngle += da * ANGLE_LERP_FACTOR;
+    _applyDotPos(_lerp.cx, _lerp.cy, _lerp.cAngle);
+    requestAnimationFrame(_lerpTick);
+}
+
+function _applyDotPos(sx, sy, angle) {
+    var pos = 'translate(' + sx + 'px,' + sy + 'px)';
+    DOT.style.transform = pos + ' translate(-50%,-50%)';
+    CH.style.transform = pos + ' translate(-50%,-50%)';
+    ARWD.style.transform = pos + ' translate(-50%,-50%) rotate(' + angle + 'deg)';
+}
 
 // ========== 初始化 ==========
 TC.init({
@@ -358,7 +405,9 @@ TC.init({
             lx = result.status.position.x;
             ly = result.status.position.y;
             lf = !!result.status.found;
-            setDot(lx, ly, result.status.state || '', lf);
+            lAngle = result.status.arrow_angle || 0;
+            lStopped = !!result.status.arrow_stopped;
+            setDot(lx, ly, result.status.state || '', lf, lAngle, lStopped);
             updUIBig(result);
             if (autoRun && lf) ensureVis(lx, ly);
             // 路线: 用玩家坐标更新进度
@@ -389,18 +438,70 @@ function fitMap() {
     oy=(ch-mapInfo.map_height*sc)/2;
     applyT();
 }
-function applyT() { MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')'; ZL.textContent=Math.round(sc*100)+'%'; }
+function applyT() {
+    MW.style.transform='translate('+ox+'px,'+oy+'px) scale('+sc+')';
+    ZL.textContent=Math.round(sc*100)+'%';
+    // 缩放/平移后立即同步点位屏幕坐标，防止点位漂移到错误位置
+    if (lx !== null) {
+        var _sx = lx * sc + ox, _sy = ly * sc + oy;
+        _lerp.tx = _sx; _lerp.ty = _sy;
+        _lerp.cx = _sx; _lerp.cy = _sy;
+        _applyDotPos(_sx, _sy, _lerp.cAngle);
+    }
+}
 
 // ========== 红点 & UI 更新 ==========
-function setDot(x,y,state,found){
-    // #dot 和 #ch 现在在 #mc 下与 #mw 同级，需要使用屏幕坐标
+function setDot(x, y, state, found, angle, stopped){
+    // 地图坐标 → 屏幕坐标
     var screenX = x * sc + ox;
     var screenY = y * sc + oy;
-    DOT.style.left=screenX+'px';DOT.style.top=screenY+'px';
-    CH.style.left=screenX+'px';CH.style.top=screenY+'px';
+    angle = angle || 0;
+    stopped = !!stopped;
+
+    // 箭头/圆形切换
+    var ap = document.getElementById('arrowPoly');
+    var ac = document.getElementById('arrowCircle');
+    if (ap && ac) {
+        ap.setAttribute('display', stopped ? 'none' : '');
+        ac.setAttribute('display', stopped ? '' : 'none');
+    }
+
+    // === 静止死区过滤：位置和角度变化量均低于阈值时跳过 lerp，消除静止抖动 ===
+    if (_lastDotMapX !== null) {
+        var _dp = Math.sqrt((x-_lastDotMapX)*(x-_lastDotMapX)+(y-_lastDotMapY)*(y-_lastDotMapY));
+        var _da = Math.abs(_angDiff(angle, _lastDotAngle));
+        if (_dp < DOT_POS_DEADZONE && _da < DOT_ANGLE_DEADZONE) {
+            // 仅更新状态样式与坐标显示，不触发新的 lerp 动画
+            DOT.classList.remove('inertial','lost');
+            if(!found){ DOT.classList.add('lost'); ARWD.style.opacity='0'; }
+            else {
+                if(state==='INERTIAL') DOT.classList.add('inertial');
+                ARWD.style.opacity='.85';
+            }
+            CH.style.opacity=found?'.25':'0';
+            SX.textContent=Math.round(x); SY.textContent=Math.round(y);
+            return;
+        }
+    }
+    _lastDotMapX = x; _lastDotMapY = y; _lastDotAngle = angle;
+
+    // 更新 lerp 目标
+    if (_lerp.cx === 0 && _lerp.cy === 0) {
+        // 首次定位：直接跳转
+        _lerp.cx = screenX; _lerp.cy = screenY; _lerp.cAngle = angle;
+    }
+    _lerp.tx = screenX; _lerp.ty = screenY; _lerp.tAngle = angle;
+    if (!_lerp.running) {
+        _lerp.running = true;
+        requestAnimationFrame(_lerpTick);
+    }
+
     DOT.classList.remove('inertial','lost');
-    if(!found)DOT.classList.add('lost');
-    else if(state==='INERTIAL')DOT.classList.add('inertial');
+    if(!found){ DOT.classList.add('lost'); ARWD.style.opacity='0'; }
+    else {
+        if(state==='INERTIAL') DOT.classList.add('inertial');
+        ARWD.style.opacity='.85';
+    }
     CH.style.opacity=found?'.25':'0';
     SX.textContent=Math.round(x);SY.textContent=Math.round(y);
 }

@@ -395,6 +395,14 @@
                     <div class="status-label">锁定</div>
                     <div class="status-value" id="statusLock">--</div>
                 </div>
+                <div class="status-item" id="hybridStatusItem" style="display:none;">
+                    <div class="status-label">AI辅助</div>
+                    <div class="status-value" id="statusHybrid">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">质量</div>
+                    <div class="status-value" id="statusQuality">--</div>
+                </div>
                 <div class="status-item" style="display:none;">
                     <div class="status-label">是否找到</div>
                     <div class="status-value found-no" id="statusFound">--</div>
@@ -472,7 +480,11 @@ TC.init({
     onAnalyzeResult: function(result) {
         if (result.image) {
             var ri = document.getElementById('resultImg');
-            ri.src = 'data:image/png;base64,' + result.image;
+            var imgSrc = result.image;
+            if (imgSrc && imgSrc.indexOf('data:') !== 0) {
+                imgSrc = 'data:image/jpeg;base64,' + imgSrc;
+            }
+            ri.src = imgSrc;
             // 自动同步到画中画
             updatePiPCanvas();
         }
@@ -492,6 +504,21 @@ TC.init({
                 coordLockEnabled = result.status.coord_lock;
                 updateLockButton();
             }
+            // 更新混合引擎状态显示
+            var hybridEl = document.getElementById('statusHybrid');
+            var hybridItem = document.getElementById('hybridStatusItem');
+            if (hybridEl && result.status.hybrid !== undefined) {
+                if (result.status.hybrid) {
+                    hybridItem.style.display = '';
+                    if (result.status.hybrid_busy) {
+                        hybridEl.textContent = '🔍定位中';
+                        hybridEl.style.color = '#ffa726';
+                    } else {
+                        hybridEl.textContent = '✅就绪';
+                        hybridEl.style.color = '#66bb6a';
+                    }
+                }
+            }
         }
     },
     onScreenStart: function() {
@@ -508,7 +535,7 @@ TC.init({
         document.getElementById('regionInfo').style.display = '';
     },
     onScreenStop: function() {
-        if (screenAutoId) { cancelAnimationFrame(screenAutoId); screenAutoId = null; }
+        if (screenAutoId) { clearTimeout(screenAutoId); screenAutoId = null; }
         screenRunning = false;
         document.getElementById('screenVideoContainer').style.display = 'none';
         document.getElementById('stopScreenBtn').style.display = 'none';
@@ -607,7 +634,10 @@ function initRegionBox(videoEl) {
 }
 
 var dragState = { active: false, type: '', startX: 0, startY: 0, startCircle: null };
+var _regionDragSetup = false;  // 防止多次调用累积全局监听器
 function setupRegionDrag(videoEl) {
+    if (_regionDragSetup) return;
+    _regionDragSetup = true;
     var box = document.getElementById('regionBox');
     var overlay = document.getElementById('regionOverlay');
     var handle = box.querySelector('.region-handle');
@@ -645,7 +675,7 @@ async function captureAndSendScreenFrame() {
     screenSending = true;
     try {
         if (useWSMode && TC.wsConnected) {
-            // WS 二进制模式: PNG 无损 + 零 base64 开销
+            // WS 二进制模式: JPEG 压缩 + 零 base64 开销（上传体积减少约 90%）
             var blob = await TC.captureScreenImgBlob();
             if (blob) { await TC.sendViaWS(blob); }
         } else {

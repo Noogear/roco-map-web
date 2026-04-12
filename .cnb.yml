@@ -2,6 +2,9 @@ $:
   web_trigger_vscode:
     - docker:
         image: docker.cnb.cool/wss/ai/mlsharp:latest
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 6
       services:
         - vscode
         - docker
@@ -12,7 +15,8 @@ $:
     - docker:
         image: docker.cnb.cool/wss/ai/mlsharp:latest
       runner:
-       cpus: 6
+        tags: cnb:arch:amd64
+        cpus: 6
       services:
         - name: vscode
           options:

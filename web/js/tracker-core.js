@@ -42,6 +42,7 @@ const TrackerCore = (() => {
         selCircle: { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) },
         wsSocket: null,
         wsConnected: false,
+        captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
     };
 
     let opts = {
@@ -86,13 +87,11 @@ const TrackerCore = (() => {
 
         // ========== 状态格式化 ==========
         formatStatus(status) {
-            // 状态颜色逻辑：
-            // 绿色 = 正常匹配 (found=true, 非惯性)
-            // 黄色 = 惯性/线性过滤/偏离 (found=true but inertial/filtered)
-            // 红色 = 丢失/未找到 (found=false) 或 连续多次异常
             var text = '--', cls = 'green', label = '';
             if (status.mode === 'sift') {
-                if (!status.f) {
+                if (status.state === 'SCENE_CHANGE') {
+                    text = '切场'; cls = 'yellow'; label = '场景切换';
+                } else if (!status.f) {
                     text = '丢失'; cls = 'red'; label = '未找到';
                 } else if (status.state === 'INERTIAL' || status.is_inertial) {
                     text = '惯性'; cls = 'yellow'; label = '惯性导航';
@@ -141,6 +140,20 @@ const TrackerCore = (() => {
                 fe.className = 'status-value ' + (status.f ? 'found-yes' : 'found-no');
             }
             if (mche) mche.textContent = status.matches;
+
+            // 匹配质量显示
+            var qe = document.getElementById(ids.quality || 'statusQuality');
+            if (qe) {
+                var q = status.match_quality || 0;
+                qe.textContent = (q * 100).toFixed(0) + '%';
+                qe.style.color = q >= 0.7 ? '#4caf50' : q >= 0.4 ? '#ffa726' : '#ff5252';
+            }
+
+            // 混合引擎状态
+            var he = document.getElementById(ids.hybrid || 'hybridStatusItem');
+            if (he) {
+                he.style.display = status.hybrid_busy ? '' : 'none';
+            }
         },
 
 
@@ -251,7 +264,8 @@ const TrackerCore = (() => {
         },
 
         /**
-         * 从屏幕流截取圆形选区图片 (JPEG dataURL，用于 HTTP 模式)
+         * 从屏幕流截取方形选区图片 (JPEG dataURL，用于 HTTP 模式)
+         * 方形截取 + 后端 HoughCircles 圆检测，自动判断小地图是否存在
          * @returns {string|null} dataURL 或 null
          */
         captureScreenImg() {
@@ -265,19 +279,22 @@ const TrackerCore = (() => {
             var sc = S.selCircle;
             var bs = Math.min(vw, vh);
             var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
-            var sz = Math.max(10, Math.round(r * 2));
-            var rx = Math.round(cx - r), ry = Math.round(cy - r);
+            var margin = 1.4;
+            var sz = Math.max(10, Math.round(r * 2 * margin));
+            var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
 
-            var c = document.createElement('canvas');
-            c.width = sz; c.height = sz;
+            // 复用 canvas 避免每帧创建新元素导致 GPU 内存堆积
+            if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
+            var c = S.captureCanvas;
+            if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
-            ctx.beginPath(); ctx.arc(sz / 2, sz / 2, sz / 2, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
             return c.toDataURL('image/jpeg', 0.80);
         },
 
         /**
-         * 从屏幕流截取圆形选区图片 (PNG Blob，用于 Socket.IO 二进制模式)
+         * 从屏幕流截取方形选区图片 (JPEG Blob，用于 Socket.IO 二进制模式)
+         * 方形截取 + 后端 HoughCircles 圆检测，自动判断小地图是否存在
          * @returns {Promise<Blob|null>}
          */
         captureScreenImgBlob() {
@@ -291,17 +308,19 @@ const TrackerCore = (() => {
             var sc = S.selCircle;
             var bs = Math.min(vw, vh);
             var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
-            var sz = Math.max(10, Math.round(r * 2));
-            var rx = Math.round(cx - r), ry = Math.round(cy - r);
+            var margin = 1.4;
+            var sz = Math.max(10, Math.round(r * 2 * margin));
+            var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
 
-            var c = document.createElement('canvas');
-            c.width = sz; c.height = sz;
+            // 复用 canvas 避免每帧创建新元素导致 GPU 内存堆积
+            if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
+            var c = S.captureCanvas;
+            if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
-            ctx.beginPath(); ctx.arc(sz / 2, sz / 2, sz / 2, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
 
             return new Promise(function(resolve) {
-                c.toBlob(function(blob) { resolve(blob); }, 'image/png');
+                c.toBlob(function(blob) { resolve(blob); }, 'image/jpeg', 0.82);
             });
         },
 
@@ -398,7 +417,11 @@ const TrackerCore = (() => {
                                 position: { x: status.x, y: status.y },
                                 found: !!status.f,
                                 matches: status.c,
+                                match_quality: status.q || 0,
+                                arrow_angle: status.a || 0,
+                                arrow_stopped: !!status.as,
                                 coord_lock: !!status.l,
+                                hybrid_busy: !!status.h,
                             }
                         };
                             if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
@@ -430,7 +453,7 @@ const TrackerCore = (() => {
                 return Promise.reject(new Error('WS not connected'));
             }
             S.wsSocket.emit('frame', blob);
-            this.log('\u5df2发送二进制帧 (' + Math.round(blob.size / 1024) + ' KB)');
+            // 不在此处逐帧打日志，避免每帧触发 DOM 重排（scrollTop）
             return Promise.resolve();
         },
 
@@ -495,12 +518,14 @@ var TC = TrackerCore;
 
 /**
  * ArrayBuffer 转 Base64 (用于 Socket.IO 二进制响应的 JPEG 图片)
+ * 分块调用 apply 避免大 buffer 时的字符串拼接性能问题
  */
 function _arrayBufferToBase64(buffer) {
     var bytes = new Uint8Array(buffer);
-    var binary = '';
-    for (var i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    var chunkSize = 8192;
+    var chunks = [];
+    for (var i = 0; i < bytes.length; i += chunkSize) {
+        chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
     }
-    return btoa(binary);
+    return btoa(chunks.join(''));
 }
