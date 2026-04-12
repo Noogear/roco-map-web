@@ -42,6 +42,8 @@ const TrackerCore = (() => {
         selCircle: { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) },
         wsSocket: null,
         wsConnected: false,
+        wsConnecting: null,    // 连接中的 Promise（防止重复创建 socket）
+        wsManualClose: false,  // 标记是否为手动断开（抑制重复日志）
         captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
         lastWasUpdate: false, // logUpdate 状态标记
     };
@@ -400,19 +402,22 @@ const TrackerCore = (() => {
                 headers: { 'Content-Type': 'application/json' }
             }).then(function(resp) {
                 if (resp.ok) return resp.json();
-                // fallback: FormData
+                // fallback: FormData（兼容部分反向代理对 JSON body 的限制）
                 return fetch(imageDataURL).then(function(r) { return r.blob(); }).then(function(blob) {
                     var fd = new FormData(); fd.append('image', blob, 'minimap.png');
                     return fetch('/api/upload_minimap', { method: 'POST', body: fd }).then(function(r2) { return r2.json(); });
                 });
             }).then(function(result) {
-                if (result.status) {
+                if (result && result.error) {
+                    self.logUpdate('⚠️ ' + result.error);
+                } else if (result && result.status) {
                     self.logUpdate(_fmtResult(result.status, null));
-                } else {
-                    self.logUpdate('分析完成，无状态');
                 }
                 if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                 return result;
+            }).catch(function(e) {
+                self.log('❌ HTTP 请求失败: ' + e.message);
+                throw e;
             });
         },
 
@@ -425,7 +430,9 @@ const TrackerCore = (() => {
         connectWS() {
             var self = this;
             if (S.wsSocket && S.wsConnected) return Promise.resolve(true);
-            return new Promise(function(resolve, reject) {
+            // 连接中则复用同一个 Promise，避免并发调用创建多个 socket
+            if (S.wsConnecting) return S.wsConnecting;
+            S.wsConnecting = new Promise(function(resolve, reject) {
                 try {
                     var sock = io({
                         transports: ['websocket'],
@@ -435,17 +442,22 @@ const TrackerCore = (() => {
 
                     sock.on('connect', function() {
                         S.wsConnected = true;
+                        S.wsConnecting = null;
                         self.log('\ud83d\udcf6 Socket.IO 已连接（二进制模式）');
                         resolve(true);
                     });
 
                     sock.on('disconnect', function() {
                         S.wsConnected = false;
-                        self.log('\ud83d\udcf5 Socket.IO 已断开');
+                        S.wsConnecting = null;
+                        // 手动断开时已在 disconnectWS 记录日志，此处不重复打印
+                        if (!S.wsManualClose) self.log('\ud83d\udcf5 Socket.IO 已断开');
+                        S.wsManualClose = false;
                     });
 
                     sock.on('connect_error', function(err) {
                         S.wsConnected = false;
+                        S.wsConnecting = null;
                         console.error('SIO error:', err);
                         self.log('\u274c Socket.IO 连接失败: ' + err.message);
                         reject(err);
@@ -453,12 +465,21 @@ const TrackerCore = (() => {
 
                     // 接收后端二进制响应: [4字节大端JSON长度][JSON][JPEG图片]
                     sock.on('result', function(data) {
-                        if (!(data instanceof ArrayBuffer)) return;
-                        var view = new DataView(data);
+                        // 标准化为 ArrayBuffer：Socket.IO 不同版本/浏览器可能给 ArrayBuffer 或 Uint8Array
+                        var buf;
+                        if (data instanceof ArrayBuffer) {
+                            buf = data;
+                        } else if (ArrayBuffer.isView(data)) {
+                            buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                        } else {
+                            console.warn('[WS] result: 未知数据类型', typeof data);
+                            return;
+                        }
+                        var view = new DataView(buf);
                         if (view.byteLength < 4) return;
                         var jsonLen = view.getUint32(0, false);
                         if (view.byteLength < 4 + jsonLen) return;
-                        var jsonBytes = new Uint8Array(data, 4, jsonLen);
+                        var jsonBytes = new Uint8Array(buf, 4, jsonLen);
                         var jsonStr = new TextDecoder().decode(jsonBytes);
                         var status;
                         try { status = JSON.parse(jsonStr); } catch(e) { return; }
@@ -469,7 +490,7 @@ const TrackerCore = (() => {
                         }
 
                         var jpegStart = 4 + jsonLen;
-                        var jpegBytes = data.slice(jpegStart);
+                        var jpegBytes = buf.slice(jpegStart);
                         if (jpegBytes.byteLength > 2) {
                             var b64 = _arrayBufferToBase64(jpegBytes);
                             var result = {
@@ -503,11 +524,13 @@ const TrackerCore = (() => {
         },
 
         disconnectWS() {
+            S.wsManualClose = true;
             if (S.wsSocket && typeof S.wsSocket.disconnect === 'function') {
                 try { S.wsSocket.disconnect(); } catch(e) {}
             }
             S.wsSocket = null;
             S.wsConnected = false;
+            S.wsConnecting = null;
             this.log('Socket.IO 已手动断开');
         },
 
