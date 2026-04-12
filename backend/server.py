@@ -186,26 +186,186 @@ def list_test_images():
     return jsonify(images)
 
 
-@app.route('/api/upload_minimap', methods=['POST'])
-def upload_minimap():
-    """接收前端上传的小地图图片（支持 FormData 和 JSON base64 两种格式）"""
-    img = None
-
+def _decode_image_from_request():
+    """从当前请求中解析图片（支持 FormData 与 JSON base64），失败返回 None。"""
     # 方式1: FormData 文件上传
     if 'image' in request.files:
         file = request.files['image']
         nparr = np.frombuffer(file.read(), np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     # 方式2: JSON base64 上传
-    elif request.is_json:
-        data = request.get_json()
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
         b64_data = data.get('image', '')
+        if not b64_data:
+            return None
         if ',' in b64_data:
-            b64_data = b64_data.split(',')[1]
-        img_bytes = base64.b64decode(b64_data)
+            b64_data = b64_data.split(',', 1)[1]
+        try:
+            img_bytes = base64.b64decode(b64_data)
+        except Exception:
+            return None
         nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    return None
+
+
+def _auto_detect_minimap_circle(img_bgr: np.ndarray):
+    """
+    在整帧截图中自动定位小地图圆。
+
+    策略：
+      1) 优先扫描右上 ROI（主流游戏小地图布局）
+      2) 失败时回退全图扫描
+      3) 对候选按“右上角贴近度 + 半径合理性”打分
+
+    Returns:
+      dict: {
+        cx, cy, r,          # 归一化坐标（前端 selCircle）
+        px, py, pr,         # 原图像素坐标
+        confidence          # 0..1 置信度
+      }
+      或 None
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return None
+
+    h0, w0 = img_bgr.shape[:2]
+    if h0 < 32 or w0 < 32:
+        return None
+
+    # 大图先缩放，降低 Hough 开销
+    max_side = max(h0, w0)
+    scale = 1.0
+    work = img_bgr
+    if max_side > 1280:
+        scale = 1280.0 / max_side
+        nw = max(1, int(round(w0 * scale)))
+        nh = max(1, int(round(h0 * scale)))
+        work = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    h, w = work.shape[:2]
+
+    def _find_in_region(x1, y1, x2, y2, mode: str):
+        roi = work[y1:y2, x1:x2]
+        if roi.size == 0:
+            return []
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (9, 9), 2)
+
+        base = min(h, w)
+        min_r = max(14, int(base * 0.035))
+        max_r = max(min_r + 8, int(base * 0.16))
+
+        # ROI 更严格，全图更宽松
+        param2 = 24 if mode == 'roi' else 20
+        circles = cv2.HoughCircles(
+            gray,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=max(20, min(roi.shape[:2]) // 4),
+            param1=90,
+            param2=param2,
+            minRadius=min_r,
+            maxRadius=max_r,
+        )
+        if circles is None:
+            return []
+
+        out = []
+        for c in np.round(circles[0, :]).astype(int):
+            cx, cy, r = int(c[0]) + x1, int(c[1]) + y1, int(c[2])
+            if r <= 0:
+                continue
+            out.append((cx, cy, r))
+        return out
+
+    # 1) 右上 ROI 优先
+    roi_candidates = _find_in_region(int(w * 0.52), 0, w, int(h * 0.50), mode='roi')
+    # 2) 回退全图
+    full_candidates = _find_in_region(0, 0, w, h, mode='full') if not roi_candidates else []
+    candidates = roi_candidates + full_candidates
+    if not candidates:
+        return None
+
+    # 按位置和半径评分：越靠右上越优，半径太小惩罚
+    best = None
+    best_score = -1.0
+    base = float(min(h, w))
+    for cx, cy, r in candidates:
+        # 右上贴近度
+        right_closeness = 1.0 - min(1.0, (w - cx) / max(w, 1))
+        top_closeness = 1.0 - min(1.0, cy / max(h, 1))
+        pos_score = 0.6 * right_closeness + 0.4 * top_closeness
+
+        # 半径合理性（常见范围 ~ 4% - 14% 的短边）
+        r_ratio = r / max(base, 1.0)
+        size_score = 1.0 - min(1.0, abs(r_ratio - 0.08) / 0.08)
+        score = 0.7 * pos_score + 0.3 * size_score
+
+        if score > best_score:
+            best_score = score
+            best = (cx, cy, r)
+
+    if best is None:
+        return None
+
+    cx_s, cy_s, r_s = best
+    # 回映射到原始分辨率
+    px = int(round(cx_s / scale))
+    py = int(round(cy_s / scale))
+    pr = int(round(r_s / scale))
+
+    # 归一化为前端 selCircle 使用的比例
+    cx = float(px / max(w0, 1))
+    cy = float(py / max(h0, 1))
+    rr = float(pr / max(min(w0, h0), 1))
+
+    # 边界钳制
+    cx = max(0.0, min(1.0, cx))
+    cy = max(0.0, min(1.0, cy))
+    rr = max(0.02, min(0.49, rr))
+
+    return {
+        'cx': cx,
+        'cy': cy,
+        'r': rr,
+        'px': px,
+        'py': py,
+        'pr': pr,
+        'confidence': round(max(0.0, min(1.0, best_score)), 3),
+    }
+
+
+@app.route('/api/autodetect_circle', methods=['POST'])
+def api_autodetect_circle():
+    """Web 智能校准：从整帧截图自动定位小地图圆心与半径。"""
+    img = _decode_image_from_request()
+    if img is None:
+        return jsonify({'error': 'Invalid image'}), 400
+
+    det = _auto_detect_minimap_circle(img)
+    if det is None:
+        return jsonify({'error': 'Circle not found'}), 404
+
+    saved = save_circle_state(_CIRCLE_STATE_FILE, det['cx'], det['cy'], det['r'])
+    return jsonify({
+        'success': True,
+        'cx': det['cx'],
+        'cy': det['cy'],
+        'r': det['r'],
+        'pixel': {'x': det['px'], 'y': det['py'], 'r': det['pr']},
+        'confidence': det['confidence'],
+        'saved': bool(saved),
+    })
+
+
+@app.route('/api/upload_minimap', methods=['POST'])
+def upload_minimap():
+    """接收前端上传的小地图图片（支持 FormData 和 JSON base64 两种格式）"""
+    img = _decode_image_from_request()
 
     if img is not None:
         tracker.set_minimap(img)
@@ -278,18 +438,10 @@ def api_coord_lock():
 
 @app.route('/api/reset_history', methods=['POST'])
 def api_reset_history():
-    """清空坐标历史 + 关闭锁定 + 重置线性过滤器"""
-    engine = tracker.sift_engine
-    cleared = len(tracker.pos_history)
+    """清空坐标历史 + 关闭锁定"""
+    cleared, was_locked = tracker.reset_history()
 
-    tracker.pos_history.clear()
-
-    was_locked = engine.coord_lock_enabled
-    engine.set_coord_lock(False)
-
-    tracker._linear_filter_consecutive = 0
-
-    print(f"🗑 历史已重置: 清除{cleared}条记录, 锁定{'已关闭' if was_locked else '未开启'}, 线性过滤器已重置")
+    print(f"🗑 历史已重置: 清除{cleared}条记录, 锁定{'已关闭' if was_locked else '未开启'}")
     return jsonify({
         'success': True,
         'cleared_count': cleared,
@@ -440,13 +592,7 @@ def ws_coord_lock(data):
 @socketio.on('reset_history')
 def ws_reset_history():
     """通过 WS 重置坐标历史"""
-    engine = tracker.sift_engine
-    cleared = len(tracker.pos_history)
-
-    tracker.pos_history.clear()
-    was_locked = engine.coord_lock_enabled
-    engine.set_coord_lock(False)
-    tracker._linear_filter_consecutive = 0
+    cleared, was_locked = tracker.reset_history()
 
     print(f"🗑 [WS] 历史已重置: 清除{cleared}条, 锁定{'已关闭' if was_locked else '未开启'}")
     emit('reset_result', {

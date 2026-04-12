@@ -12,15 +12,12 @@ tracker_core.py - 追踪器编排层（无 Web 框架依赖）
 可被 Flask/Tornado/CLI 等任何前端复用。
 """
 
-import math
 import os
-import time
 
 import cv2
 import numpy as np
 import base64
 from threading import Lock, Thread, Event
-from collections import deque
 
 from backend import config
 from backend.tracker_engines import SIFTMapTracker
@@ -59,13 +56,9 @@ class MapTrackerWeb:
         self._latest_result_image_revision = -1
         self._latest_result_jpeg_revision = -1
 
-        # 线性过滤器：连续丢弃帧计数器（防死锁）
-        self._linear_filter_consecutive = 0
+        # 线性过滤器连续丢弃帧计数器已迁至 CoordSmoother
 
-        # === 传送检测：候选聚类确认缓冲（防误判）===
-        # 连续 TP_CONFIRM_FRAMES 帧 SIFT 稳定匹配到同一远处新位置才视为传送，
-        # 随机噪声帧在空间上分散，不会通过聚类校验，因此不会误触。
-        self._tp_candidate_buffer = deque(maxlen=getattr(config, 'TP_CONFIRM_FRAMES', 3))
+        # 传送确认标记（由 CoordSmoother.update 返回）
         self._tp_just_confirmed = False  # 当帧传送聚类确认成功，通知前端直接跳位
 
         # === SCENE_CHANGE 防抖：挂机时单帧检测失败不立即进入冻结状态 ===
@@ -82,8 +75,6 @@ class MapTrackerWeb:
         self._smooth_file = os.path.join(_base_dir, '.smooth_coords.json')
         self._smoother = CoordSmoother(smooth_buffer_path=self._smooth_file)
         self.pos_history = self._smoother.pos_history  # 公开属性，server.py 等外部代码使用
-        self._display_x: int | None = None
-        self._display_y: int | None = None
 
         self.latest_status = {
             'mode': 'sift',
@@ -117,43 +108,6 @@ class MapTrackerWeb:
     def _detect_and_extract_minimap(self, square_bgr):
         return detect_and_extract(square_bgr, self._circle_cal, self.sift_engine.frozen)
 
-    # ========== 线性速度一致性过滤 ==========
-
-    def _linear_filter(self, cx, cy):
-        window = getattr(config, 'LINEAR_FILTER_WINDOW', 10)
-        max_dev = getattr(config, 'LINEAR_FILTER_MAX_DEVIATION', 300)
-        max_consecutive = getattr(config, 'LINEAR_FILTER_MAX_CONSECUTIVE', 5)
-
-        if len(self.pos_history) < window:
-            self._linear_filter_consecutive = 0
-            return cx, cy
-
-        recent = list(self.pos_history)[-window:]
-        n = len(recent)
-        vx = sum(recent[i][0] - recent[i - 1][0] for i in range(1, n)) / (n - 1)
-        vy = sum(recent[i][1] - recent[i - 1][1] for i in range(1, n)) / (n - 1)
-
-        last_x, last_y = recent[-1]
-        pred_x = last_x + vx
-        pred_y = last_y + vy
-
-        dev = math.sqrt((cx - pred_x) ** 2 + (cy - pred_y) ** 2)
-
-        if dev > max_dev:
-            self._linear_filter_consecutive += 1
-            if self._linear_filter_consecutive >= max_consecutive:
-                self._linear_filter_consecutive = 0
-                print(f"[线性过滤] 连续{max_consecutive}帧超差(偏差{dev:.0f}px)，"
-                      f"强制接受真实坐标({cx},{cy})，重置速度模型")
-                return cx, cy
-            print(f"[线性过滤] 偏差={dev:.0f}px > {max_dev}px → 丢弃 "
-                  f"({cx},{cy}) → 用惯性 ({int(pred_x)},{int(pred_y)}) "
-                  f"[第{self._linear_filter_consecutive}/{max_consecutive}次]")
-            return int(pred_x), int(pred_y)
-
-        self._linear_filter_consecutive = 0
-        return cx, cy
-
     # ========== 公开 API ==========
 
     def set_minimap(self, minimap_bgr):
@@ -186,6 +140,16 @@ class MapTrackerWeb:
         """模式切换（仅支持 sift）"""
         return mode == 'sift'
 
+    def reset_history(self):
+        """清空平滑/历史状态并关闭坐标锁定，返回 (cleared_count, was_locked)。"""
+        engine = self.sift_engine
+        cleared = len(self.pos_history)
+        was_locked = engine.coord_lock_enabled
+
+        self._smoother.clear_state()
+        engine.set_coord_lock(False)
+        return cleared, was_locked
+
     def process_frame(self, need_base64=True, need_jpeg=True):
         """
         处理当前帧，返回 (img_base64, jpeg_bytes) 或 None。
@@ -214,22 +178,7 @@ class MapTrackerWeb:
         found, display_crop, status_state, match_count, last_x, last_y = result
 
         # ====== 坐标异常值过滤（欧氏距离，避免对角线方向失衡） ======
-        if found and (last_x or last_y):
-            is_outlier = False
-            if len(self.pos_history) >= 3:
-                hist = list(self.pos_history)
-                ref_x = sorted(h[0] for h in hist)[len(hist)//2]
-                ref_y = sorted(h[1] for h in hist)[len(hist)//2]
-                dist = math.sqrt((last_x - ref_x) ** 2 + (last_y - ref_y) ** 2)
-                if dist > CoordSmoother.POS_OUTLIER_THRESHOLD:
-                    is_outlier = True
-            if not is_outlier:
-                self.pos_history.append((last_x, last_y))
-            else:
-                last_x = self.pos_history[-1][0]
-                last_y = self.pos_history[-1][1]
-        elif found:
-            self.pos_history.append((last_x, last_y))
+        # CoordSmoother.update() 已在内部完成异常值过滤并维护 pos_history，此处无需重复
 
         final_bgr = self._compose_output_frame(display_crop, half_view)
 
@@ -362,138 +311,19 @@ class MapTrackerWeb:
         match_quality = result.get('match_quality', 1.0 if found and not is_inertial else 0.0)
         self._last_match_quality = match_quality
 
-        # === 卡尔曼滤波（替代线性外推+中位数平滑）===
-        if found and cx is not None and not is_inertial:
-            # 真实匹配: 用质量分调整卡尔曼观测噪声
-            smooth_x, smooth_y = self._smoother._kalman_update(cx, cy, quality=match_quality)
-        elif is_inertial:
-            # 惯性帧: 用卡尔曼预测（比重复上一坐标准确）
-            predicted = self._smoother._kalman_predict()
-            if predicted is not None:
-                smooth_x, smooth_y = predicted
-                # 用预测値更新卡尔曼状态，保持速度估计活性
-                self._smoother._kalman_update(smooth_x, smooth_y, quality=0.3)
-            else:
-                smooth_x, smooth_y = cx or 0, cy or 0
-        else:
-            # 完全丢失
-            smooth_x, smooth_y = cx or 0, cy or 0
-
-        # 持久化（保留 smooth_buffer 用于恢复）
-        if smooth_x and smooth_y:
-            self._smoother.smooth_buffer_x.append(smooth_x)
-            self._smoother.smooth_buffer_y.append(smooth_y)
-            if len(self._smoother.smooth_buffer_x) >= CoordSmoother.SMOOTH_BUFFER_SIZE:
-                self._smoother._save_smooth_buffer()
-
-        # === 传送检测：候选聚类确认 ===
-        # 来源1: 真实匹配帧的卡尔曼输出超跳变阈值（原有逻辑）
-        # 来源2: SIFT 引擎全局搜索发现远处高质量匹配但被跳变过滤丢弃（新增）
-        _tp_thresh = getattr(config, 'TP_JUMP_THRESHOLD', 300)
-        _tp_new_entry = False  # 本帧是否有新的传送候选进入缓冲
-
-        # 来源2：引擎传回的远距离候选（绕过了 JUMP_THRESHOLD 但质量达标）
-        _far_cand = result.get('_tp_far_candidate')
-        if _far_cand is not None and self._display_x is not None:
-            _fc_x, _fc_y, _fc_q = _far_cand
-            _fc_jump = math.sqrt(
-                (_fc_x - self._display_x) ** 2 + (_fc_y - self._display_y) ** 2
-            )
-            if _fc_jump > _tp_thresh:
-                self._tp_candidate_buffer.append((_fc_x, _fc_y))
-                _tp_new_entry = True
-
-        # 来源1: 真实匹配帧的卡尔曼输出超跳变阈值
-        if (found and not is_inertial and cx is not None
-                and self._display_x is not None):
-            _tp_jump = math.sqrt(
-                (smooth_x - self._display_x) ** 2 + (smooth_y - self._display_y) ** 2
-            )
-            if _tp_jump > _tp_thresh:
-                self._tp_candidate_buffer.append((smooth_x, smooth_y))
-                _tp_new_entry = True
-            else:
-                # 跳变量正常 → 是正常移动，清除候选缓冲
-                if self._tp_candidate_buffer:
-                    self._tp_candidate_buffer.clear()
-
-        # 聚类确认（不限制必须在 found+非惯性帧内，来源2的候选也能触发）
-        _tp_confirm = getattr(config, 'TP_CONFIRM_FRAMES', 3)
-        _tp_radius = getattr(config, 'TP_CLUSTER_RADIUS', 150)
-        if _tp_new_entry and len(self._tp_candidate_buffer) >= _tp_confirm:
-            _cands = list(self._tp_candidate_buffer)
-            _med_x = sorted(c[0] for c in _cands)[len(_cands) // 2]
-            _med_y = sorted(c[1] for c in _cands)[len(_cands) // 2]
-            _scatter = max(
-                math.sqrt((c[0] - _med_x) ** 2 + (c[1] - _med_y) ** 2)
-                for c in _cands
-            )
-            if _scatter <= _tp_radius:
-                # 聚类确认：立即重置所有过滤器到新位置，消除延迟
-                print(f"[传送检测] 聚类确认 scatter={_scatter:.0f}px → "
-                      f"立即重置到 ({_med_x},{_med_y})")
-                self.pos_history.clear()
-                self._smoother.smooth_buffer_x.clear()
-                self._smoother.smooth_buffer_y.clear()
-                self._smoother._kalman_reset(_med_x, _med_y)
-                self._linear_filter_consecutive = 0
-                self._display_x = _med_x
-                self._display_y = _med_y
-                self._tp_candidate_buffer.clear()
-                self._tp_just_confirmed = True
-                smooth_x, smooth_y = _med_x, _med_y
-                # 同步 SIFT 引擎位置，让后续帧立即在新位置局部搜索
-                with self.sift_engine._lock:
-                    self.sift_engine.last_x = _med_x
-                    self.sift_engine.last_y = _med_y
-                    self.sift_engine.lost_frames = 0
-                    self.sift_engine._switch_to_local(_med_x, _med_y)
-
-        # === 渲染平滑防抖：静止死区 + 速度自适应 EMA ===
-        # alpha 随速度线性增大：慢速平滑抗抖，快速立即跟随避免视觉滞后
-        #   dist ≤ still_threshold → 静止死区（不动）
-        #   dist ≤ ema_slow_dist  → alpha = ema_alpha_min（最平滑）
-        #   dist ≥ ema_fast_dist  → alpha = ema_alpha_max（立即跟随）
-        #   中间线性插值
-        still_threshold = getattr(config, 'RENDER_STILL_THRESHOLD', 2)
-        ema_alpha_min = getattr(config, 'RENDER_EMA_ALPHA', 0.35)     # 慢速最低 alpha
-        ema_alpha_max = getattr(config, 'RENDER_EMA_ALPHA_MAX', 0.92) # 快速最高 alpha
-        ema_slow_dist = getattr(config, 'RENDER_EMA_SLOW_DIST', 6)    # 低于此速度用 min
-        ema_fast_dist = getattr(config, 'RENDER_EMA_FAST_DIST', 45)   # 高于此速度用 max
-        # 玩家确认停止时（箭头方向系统判定为静止），扩大静止死区：
-        # SIFT 单帧噪声约 ±3-5px，死区扩大到 10px 可完全吸收，防止挂机地图漂移
-        if arrow_stopped and found and not is_inertial:
-            still_threshold = getattr(config, 'RENDER_STOPPED_STILL_THRESHOLD', 10)
-        if found and smooth_x and smooth_y:
-            if self._display_x is None:
-                # 首帧直接初始化
-                self._display_x = smooth_x
-                self._display_y = smooth_y
-            elif not is_inertial:
-                ddx = smooth_x - self._display_x
-                ddy = smooth_y - self._display_y
-                dist = math.sqrt(ddx * ddx + ddy * ddy)
-                if dist <= still_threshold:
-                    # 静止死区：保持不动
-                    pass
-                else:
-                    # 速度自适应 alpha：慢→平滑，快→立即跟随
-                    t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
-                    adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
-                    self._display_x = int(self._display_x + adaptive_alpha * ddx)
-                    self._display_y = int(self._display_y + adaptive_alpha * ddy)
-            else:
-                # 惯性帧（卡尔曼预测）：同样速度自适应，预测值不应锁死
-                # 传送候选积累中时冻结渲染坐标，防止速度外推漂向错误方向
-                if not self._tp_candidate_buffer:
-                    ddx = smooth_x - self._display_x
-                    ddy = smooth_y - self._display_y
-                    dist = math.sqrt(ddx * ddx + ddy * ddy)
-                    t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
-                    adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
-                    self._display_x = int(self._display_x + adaptive_alpha * ddx)
-                    self._display_y = int(self._display_y + adaptive_alpha * ddy)
-            smooth_x, smooth_y = self._display_x, self._display_y
+        # === 坐标平滑 + 传送检测（统一由 CoordSmoother 处理）===
+        smooth_x, smooth_y, tp_confirmed = self._smoother.update(
+            cx, cy, found, is_inertial, match_quality, arrow_stopped,
+            tp_far_candidate=result.get('_tp_far_candidate'),
+        )
+        if tp_confirmed:
+            self._tp_just_confirmed = True
+            # 同步 SIFT 引擎位置，让后续帧立即在新位置局部搜索
+            with self.sift_engine._lock:
+                self.sift_engine.last_x = smooth_x
+                self.sift_engine.last_y = smooth_y
+                self.sift_engine.lost_frames = 0
+                self.sift_engine._switch_to_local(smooth_x, smooth_y)
 
         # 渲染裁剪区域 + 画点
         display_crop, status_state = self._render_sift_crop(

@@ -8,7 +8,8 @@ tracking/smoother.py - 坐标平滑器
   4. 渲染 EMA 防抖（静止死区 + 速度自适应 alpha）
 
 外部只需调用：
-  update(cx, cy, is_inertial, match_quality, arrow_stopped) → (display_x, display_y)
+  update(cx, cy, found, is_inertial, match_quality, arrow_stopped,
+         tp_far_candidate=None) → (display_x, display_y, tp_confirmed)
 """
 
 from __future__ import annotations
@@ -58,9 +59,6 @@ class CoordSmoother:
         # 传送检测候选缓冲
         self._tp_candidate_buffer: deque[tuple[int, int]] = deque(maxlen=10)
 
-        # 线性速度一致性过滤（线性フィルタ）
-        self._linear_filter_consecutive: int = 0
-
     # ------------------------------------------------------------------
     # 公开主接口
     # ------------------------------------------------------------------
@@ -73,13 +71,15 @@ class CoordSmoother:
         is_inertial: bool,
         match_quality: float,
         arrow_stopped: bool,
-    ) -> tuple[int, int]:
+        tp_far_candidate: tuple[int, int, float] | None = None,
+    ) -> tuple[int, int, bool]:
         """
-        接收一帧坐标，返回最终平滑显示坐标 (display_x, display_y)。
-        found=False 时直接返回 (0, 0)（外层判断 found 再用）。
+        接收一帧坐标，经过完整流水线处理后返回 (display_x, display_y, tp_confirmed)。
+        tp_confirmed=True 时 display_x/y 即为传送确认后的新位置（供调用方同步引擎）。
+        found=False 时直接返回 (0, 0, False)。
         """
         if not found or cx is None:
-            return 0, 0
+            return 0, 0, False
 
         # ① 异常值过滤
         if not is_inertial:
@@ -113,42 +113,44 @@ class CoordSmoother:
         if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
             self._save_smooth_buffer()
 
-        # ④ 渲染 EMA 防抖
-        smooth_x, smooth_y = self._render_ema(smooth_x, smooth_y, is_inertial, arrow_stopped)
-
-        return smooth_x, smooth_y
-
-    # ------------------------------------------------------------------
-    # 传送检测（供外部 tracker 调用）
-    # ------------------------------------------------------------------
-
-    def push_tp_candidate(self, x: int, y: int) -> bool:
-        """
-        添加传送候选点，若聚类确认则立即重置并返回 True，同时返回新坐标。
-        需外层配合调用 reset_to(x, y) 同步 SIFT 引擎。
-        """
-        self._tp_candidate_buffer.append((x, y))
-        return self._check_tp_confirm()
-
-    def clear_tp_candidates(self) -> None:
-        self._tp_candidate_buffer.clear()
-
-    def get_confirmed_tp(self) -> tuple[int, int] | None:
-        """若传送已确认（聚类），返回 (med_x, med_y)，否则 None。"""
+        # ④ 传送检测（来源1: Kalman 跳变 / 来源2: 引擎远距离候选）
+        _tp_thresh = getattr(config, 'TP_JUMP_THRESHOLD', 300)
         _tp_confirm = getattr(config, 'TP_CONFIRM_FRAMES', 3)
         _tp_radius = getattr(config, 'TP_CLUSTER_RADIUS', 150)
-        cands = list(self._tp_candidate_buffer)
-        if len(cands) < _tp_confirm:
-            return None
-        med_x = sorted(c[0] for c in cands)[len(cands) // 2]
-        med_y = sorted(c[1] for c in cands)[len(cands) // 2]
-        scatter = max(
-            math.sqrt((c[0] - med_x) ** 2 + (c[1] - med_y) ** 2)
-            for c in cands
-        )
-        if scatter <= _tp_radius:
-            return med_x, med_y
-        return None
+        _tp_new_entry = False
+
+        # 来源2：引擎传回的远距离候选（绕过了 JUMP_THRESHOLD 但质量达标）
+        if tp_far_candidate is not None and self._display_x is not None:
+            fc_x, fc_y, _ = tp_far_candidate
+            if math.sqrt((fc_x - self._display_x) ** 2 + (fc_y - self._display_y) ** 2) > _tp_thresh:
+                self._tp_candidate_buffer.append((fc_x, fc_y))
+                _tp_new_entry = True
+
+        # 来源1：真实匹配帧的卡尔曼输出超跳变阈值
+        if not is_inertial and self._display_x is not None:
+            jump = math.sqrt((smooth_x - self._display_x) ** 2 + (smooth_y - self._display_y) ** 2)
+            if jump > _tp_thresh:
+                self._tp_candidate_buffer.append((smooth_x, smooth_y))
+                _tp_new_entry = True
+            else:
+                # 跳变量正常 → 正常移动，清除候选缓冲
+                self._tp_candidate_buffer.clear()
+
+        if _tp_new_entry and len(self._tp_candidate_buffer) >= _tp_confirm:
+            cands = list(self._tp_candidate_buffer)
+            med_x = sorted(c[0] for c in cands)[len(cands) // 2]
+            med_y = sorted(c[1] for c in cands)[len(cands) // 2]
+            scatter = max(
+                math.sqrt((c[0] - med_x) ** 2 + (c[1] - med_y) ** 2) for c in cands
+            )
+            if scatter <= _tp_radius:
+                print(f"[传送检测] 聚类确认 scatter={scatter:.0f}px → 立即重置到 ({med_x},{med_y})")
+                self.reset_to(med_x, med_y)
+                return med_x, med_y, True
+
+        # ⑤ 渲染 EMA 防抖
+        display_x, display_y = self._render_ema(smooth_x, smooth_y, is_inertial, arrow_stopped)
+        return display_x, display_y, False
 
     def reset_to(self, x: int, y: int) -> None:
         """传送确认后立即重置所有过滤器到新位置。"""
@@ -156,13 +158,20 @@ class CoordSmoother:
         self.smooth_buffer_x.clear()
         self.smooth_buffer_y.clear()
         self._kalman_reset(x, y)
-        self._linear_filter_consecutive = 0
         self._display_x = x
         self._display_y = y
         self._tp_candidate_buffer.clear()
 
-    def _check_tp_confirm(self) -> bool:
-        return self.get_confirmed_tp() is not None
+    def clear_state(self) -> None:
+        """清空所有平滑状态（历史/缓冲/Kalman/EMA/传送候选）。"""
+        self.pos_history.clear()
+        self.smooth_buffer_x.clear()
+        self.smooth_buffer_y.clear()
+        self._kalman = self._create_kalman_filter()
+        self._kalman_initialized = False
+        self._display_x = None
+        self._display_y = None
+        self._tp_candidate_buffer.clear()
 
     # ------------------------------------------------------------------
     # Kalman 内部方法
@@ -238,6 +247,10 @@ class CoordSmoother:
             self._display_y = smooth_y
             return smooth_x, smooth_y
 
+        # 惯性帧 + TP 候选积累中：冻结渲染坐标，防止速度外推漂向错误方向
+        if is_inertial and self._tp_candidate_buffer:
+            return self._display_x, self._display_y
+
         ddx = smooth_x - self._display_x
         ddy = smooth_y - self._display_y
         dist = math.sqrt(ddx * ddx + ddy * ddy)
@@ -262,8 +275,8 @@ class CoordSmoother:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            xs = data.get('smooth_x', data.get('x', []))  # 兼容旧格式 {'x': ...}
-            ys = data.get('smooth_y', data.get('y', []))
+            xs = data.get('smooth_x', [])
+            ys = data.get('smooth_y', [])
             for x, y in zip(xs, ys):
                 self.smooth_buffer_x.append(int(x))
                 self.smooth_buffer_y.append(int(y))
