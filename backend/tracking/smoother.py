@@ -191,7 +191,7 @@ class CoordSmoother:
     def _kalman_update(self, cx: int, cy: int, quality: float = 1.0) -> tuple[int, int]:
         measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
         # 原观测噪声 * (1/quality)，质量低 → 噪声大 → 更信任预测
-        noise = max(1.0, 20.0 * (1.0 - quality))
+        noise = max(1.0, 50.0 * (1.0 - quality))
         self._kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * noise
         if not self._kalman_initialized:
             self._kalman.statePre = np.array(
@@ -262,8 +262,8 @@ class CoordSmoother:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            xs = data.get('smooth_x', [])
-            ys = data.get('smooth_y', [])
+            xs = data.get('smooth_x', data.get('x', []))  # 兼容旧格式 {'x': ...}
+            ys = data.get('smooth_y', data.get('y', []))
             for x, y in zip(xs, ys):
                 self.smooth_buffer_x.append(int(x))
                 self.smooth_buffer_y.append(int(y))
