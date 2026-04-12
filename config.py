@@ -9,7 +9,6 @@ MINIMAP = {"top": 292, "left": 1853, "width": 150, "height": 150}
 # --- UI ---
 WINDOW_GEOMETRY = "400x400+1500+100"
 VIEW_SIZE = 400
-JPEG_PAD = 40   # JPEG 模式扩边像素（单边），前端用此余量做亚帧微平移
 
 # --- 地图文件 ---
 LOGIC_MAP_PATH = "web/big_map.png"
