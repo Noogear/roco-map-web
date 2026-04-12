@@ -733,6 +733,10 @@ class AIMapTrackerWeb:
         last_x = smooth_x
         last_y = smooth_y
 
+        # 取出 SIFT 引擎返回的实际匹配内点数
+        if found and not is_inertial:
+            match_count = result.get('match_count', 0)
+
         # === 混合引擎：SIFT 惯性/丢失/混乱时触发后台 LoFTR ===
         if self._hybrid_enabled:
             sift_confused = getattr(self.sift_engine, '_sift_confused', False)

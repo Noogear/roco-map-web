@@ -46,6 +46,47 @@ const TrackerCore = (() => {
         lastWasUpdate: false, // logUpdate 状态标记
     };
 
+    // ==================== 内部工具 ====================
+    /**
+     * 构建状态行文本（给 logUpdate 使用）
+     * @param {object} st  result.status 对象
+     * @param {string|null} kbStr  流量字符串，如 '12.3'，HTTP 模式传 null
+     */
+    var _fmtResult = function(st, kbStr) {
+        var state = st.state || '';
+        var icon, tag;
+        if (state === 'SCENE_CHANGE') {
+            icon = '🔄'; tag = '切场';
+        } else if (state === 'GLOBAL_SCAN' && !st.found) {
+            icon = '🔍'; tag = '全扫';
+        } else if (!st.found) {
+            icon = '❌'; tag = '丢失';
+        } else if (state === 'INERTIAL') {
+            icon = '⚠️'; tag = '惯性';
+        } else if (state === 'GLOBAL_SCAN') {
+            icon = '🔍'; tag = '全扫';
+        } else {
+            icon = '✅'; tag = '';
+        }
+        // 坐标：切场/找到时显示，否则 --
+        var pos = (st.found || state === 'SCENE_CHANGE')
+            ? '(' + st.position.x + ',' + st.position.y + ')'
+            : '--';
+        // 品质：有意义时才显示
+        var q = (st.match_quality != null && st.match_quality > 0)
+            ? ' ' + Math.round(st.match_quality * 100) + '%' : '';
+        // 附加标志
+        var extras = [];
+        if (st.coord_lock)  extras.push('🔒');
+        if (st.hybrid_busy) extras.push('AI↑');
+        // 拼装
+        var line = icon + (tag ? ' [' + tag + ']' : '') + ' ' + pos
+                 + ' | ' + st.matches + '匹' + q;
+        if (kbStr)        line += ' | ' + kbStr + 'KB';
+        if (extras.length) line += ' | ' + extras.join(' ');
+        return line;
+    };
+
     let opts = {
         logEl: null,
         canvasSize: 300,
@@ -366,12 +407,9 @@ const TrackerCore = (() => {
                 });
             }).then(function(result) {
                 if (result.status) {
-                    var st = result.status;
-                    var icon = st.found ? '\u2705' : '\u274c';
-                    var pos = st.found ? ' (' + st.position.x + ', ' + st.position.y + ')' : '';
-                    self.logUpdate(icon + ' ' + (st.found ? '\u627e\u5230' : '\u672a\u627e\u5230') + pos + ' | ' + st.matches + '\u5339');
+                    self.logUpdate(_fmtResult(result.status, null));
                 } else {
-                    self.logUpdate('\u5206\u6790\u5b8c\u6210\uff0c\u65e0\u72b6\u6001');
+                    self.logUpdate('分析完成，无状态');
                 }
                 if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                 return result;
@@ -434,27 +472,26 @@ const TrackerCore = (() => {
                         var jpegBytes = data.slice(jpegStart);
                         if (jpegBytes.byteLength > 2) {
                             var b64 = _arrayBufferToBase64(jpegBytes);
-                        var result = {
-                            success: true,
-                            image: b64,
-                            status: {
-                                mode: status.m,
-                                state: status.s,
-                                position: { x: status.x, y: status.y },
-                                found: !!status.f,
-                                matches: status.c,
-                                match_quality: status.q || 0,
-                                arrow_angle: status.a || 0,
-                                arrow_stopped: !!status.as,
-                                coord_lock: !!status.l,
-                                hybrid: !!status.hy,
-                                hybrid_busy: !!status.h,
-                            }
-                        };
+                            var result = {
+                                success: true,
+                                image: b64,
+                                status: {
+                                    mode: status.m,
+                                    state: status.s,
+                                    position: { x: status.x, y: status.y },
+                                    found: !!status.f,
+                                    matches: status.c,
+                                    match_quality: status.q || 0,
+                                    arrow_angle: status.a || 0,
+                                    arrow_stopped: !!status.as,
+                                    coord_lock: !!status.l,
+                                    hybrid: !!status.hy,
+                                    hybrid_busy: !!status.h,
+                                }
+                            };
                             var rs = result.status;
-                            var icon = rs.found ? '\u2705' : '\u274c';
-                            var pos = rs.found ? ' (' + rs.position.x + ', ' + rs.position.y + ')' : '';
-                            self.logUpdate(icon + ' ' + (rs.found ? '\u627e\u5230' : '\u672a\u627e\u5230') + pos + ' | ' + rs.matches + '\u5339');
+                            var kb = (data.byteLength / 1024).toFixed(1);
+                            self.logUpdate(_fmtResult(rs, kb));
                             if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                         }
                     });

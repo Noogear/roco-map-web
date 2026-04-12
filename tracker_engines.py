@@ -858,7 +858,7 @@ class SIFTMapTracker:
             'arrow_angle': arrow_angle,
             'arrow_stopped': arrow_stopped,
             'is_inertial': is_inertial,
-            'match_count': 0,
+            'match_count': inlier_count,
             'match_quality': match_quality,
             'map_width': self.map_width,
             'map_height': self.map_height,
