@@ -471,7 +471,7 @@ def ws_receive_frame(raw_bytes):
 
         emit('result',
              struct.pack('>I', len(status_json)) + status_json + jpeg_result,
-             binary=True, broadcast=True)
+             binary=True)
     else:
         err = b'{"error":"decode_fail"}'
         emit('error', struct.pack('>I', len(err)) + err, binary=True)
@@ -507,7 +507,7 @@ def ws_frame_coords(raw_bytes):
 
         emit('coords',
              struct.pack('>I', len(status_json)) + status_json,
-             binary=True, broadcast=True)
+             binary=True)
     else:
         err = b'{"error":"decode_fail"}'
         emit('error', struct.pack('>I', len(err)) + err, binary=True)
