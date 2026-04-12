@@ -94,6 +94,13 @@ tracker = AIMapTrackerWeb(sift_only=_SIFT_ONLY)
 # 无此类客户端时 _push_jpeg=False，后台线程跳过 cv2.imencode 节省 10-15ms/帧。
 _frame_clients: set = set()
 
+# JPEG 节流：记录上次发送 JPEG 时的地图坐标。
+# 当新坐标偏移 < JPEG_PAD - JPEG_THROTTLE_MARGIN 时只发 coords，节省 80-200KB/次。
+import math as _math
+_last_jpeg_x: float = 0.0
+_last_jpeg_y: float = 0.0
+_JPEG_THROTTLE_MARGIN = 8   # 保留 8px 缓冲，pan 超出前 8px 就发新图
+
 # Web 目录路径
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
 
@@ -449,7 +456,10 @@ def ws_receive_frame(raw_bytes):
     SIFT 匹配运行在后台线程，WebSocket 接收延迟降至解码耗时（1-2ms）。
     协议: 客户端发送原始 JPEG bytes → 服务端返回 [JSON头(4字节长度) + JPEG图片]
     Plan B: 注册该客户端为 JPEG 消费者，确保后台线程生成 JPEG。
+    JPEG 节流: 只在位移超出 pan 余量时才发新 JPEG，否则只发 coords 节省带宽。
     """
+    global _last_jpeg_x, _last_jpeg_y
+
     # Plan B: 记录该 sid 需要 JPEG，后台线程保持编码开启
     if request.sid not in _frame_clients:
         _frame_clients.add(request.sid)
@@ -461,12 +471,10 @@ def ws_receive_frame(raw_bytes):
     if img is not None:
         tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程，立即返回
 
-        # 返回上一帧缓存的 JPEG 结果（后台线程异步处理当前帧）
-        jpeg_result = tracker.latest_result_jpeg
-        if not jpeg_result:
-            return  # 启动后第一帧尚无缓存，静默等待
-
         status = tracker.latest_status
+        if status.get('state') == '--':
+            return  # 启动后尚无任何结果
+
         status_json = json.dumps({
             'm': tracker.current_mode,
             's': status['state'],
@@ -481,14 +489,29 @@ def ws_receive_frame(raw_bytes):
             'h': int(status.get('hybrid_busy', False)),
             'hy': int(status.get('hybrid', False)),
         }, separators=(',', ':')).encode('utf-8')
+        header = struct.pack('>I', len(status_json))
 
-        # 仅向发送方返回含 JPEG 的完整结果，避免广播大图数据导致 captureStream 闪烁
-        emit('result',
-             struct.pack('>I', len(status_json)) + status_json + jpeg_result,
-             binary=True)
+        # JPEG 节流：计算位移，超出 pan 余量才发新 JPEG
+        pad = getattr(__import__('config'), 'JPEG_PAD', 40)
+        budget = pad - _JPEG_THROTTLE_MARGIN
+        cx, cy = status['position']['x'], status['position']['y']
+        dist = _math.sqrt((cx - _last_jpeg_x) ** 2 + (cy - _last_jpeg_y) ** 2)
+        jpeg_result = tracker.latest_result_jpeg
+
+        if dist >= budget or not jpeg_result:
+            # 位移超出余量 OR 还没有任何 JPEG：发完整图
+            if jpeg_result:
+                _last_jpeg_x, _last_jpeg_y = cx, cy
+                emit('result', header + status_json + jpeg_result, binary=True)
+            else:
+                # 尚无 JPEG 但有坐标：降级发 coords
+                emit('coords', header + status_json, binary=True)
+        else:
+            # 位移在余量内：只发轻量坐标，前端 pan 消化
+            emit('coords', header + status_json, binary=True)
+
         # 向其他监听客户端（如 bigmap.html）广播仅坐标的轻量更新
-        emit('coords',
-             struct.pack('>I', len(status_json)) + status_json,
+        emit('coords', header + status_json,
              broadcast=True, include_self=False, binary=True)
     else:
         err = b'{"error":"decode_fail"}'
