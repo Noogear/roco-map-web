@@ -151,8 +151,8 @@ const TrackerCore = (() => {
 
             // 混合引擎状态
             var he = document.getElementById(ids.hybrid || 'hybridStatusItem');
-            if (he) {
-                he.style.display = status.hybrid_busy ? '' : 'none';
+            if (he && status.hybrid !== undefined) {
+                he.style.display = (status.hybrid && status.hybrid_busy) ? '' : 'none';
             }
         },
 

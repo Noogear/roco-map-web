@@ -636,6 +636,8 @@ class AIMapTrackerWeb:
             predicted = self._kalman_predict()
             if predicted is not None:
                 smooth_x, smooth_y = predicted
+                # 用预测值更新卡尔曼状态，保持速度估计活性
+                self._kalman_update(smooth_x, smooth_y, quality=0.3)
             else:
                 smooth_x, smooth_y = cx or 0, cy or 0
         else:

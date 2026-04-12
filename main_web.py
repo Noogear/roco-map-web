@@ -450,7 +450,7 @@ def ws_receive_frame(raw_bytes):
 
         # 返回上一帧缓存的 JPEG 结果（后台线程异步处理当前帧）
         jpeg_result = tracker.latest_result_jpeg
-        if jpeg_result is None:
+        if not jpeg_result:
             return  # 启动后第一帧尚无缓存，静默等待
 
         status = tracker.latest_status
@@ -470,10 +470,10 @@ def ws_receive_frame(raw_bytes):
 
         emit('result',
              struct.pack('>I', len(status_json)) + status_json + jpeg_result,
-             binary=True, broadcast=True)
+             binary=True, broadcast=True, skip_sid=request.sid)
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True)
+        emit('error', struct.pack('>I', len(err)) + err, binary=True, broadcast=True, skip_sid=request.sid)
 
 
 @socketio.on('frame_coords')
@@ -485,7 +485,7 @@ def ws_frame_coords(raw_bytes):
     if img is not None:
         tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程
 
-        if tracker.latest_result_jpeg is None:
+        if not tracker.latest_result_jpeg:
             return  # 首帧尚无缓存，静默等待
 
         status = tracker.latest_status
@@ -505,10 +505,10 @@ def ws_frame_coords(raw_bytes):
 
         emit('coords',
              struct.pack('>I', len(status_json)) + status_json,
-             binary=True, broadcast=True)
+             binary=True, broadcast=True, skip_sid=request.sid)
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True)
+        emit('error', struct.pack('>I', len(err)) + err, binary=True, broadcast=True, skip_sid=request.sid)
 
 
 # ==================== 启动入口 ====================
