@@ -90,6 +90,10 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_SOCKETIO_ASYNC_MO
 # 全局追踪器实例
 tracker = AIMapTrackerWeb(sift_only=_SIFT_ONLY)
 
+# Plan B: 记录当前有哪些客户端在使用 'frame' 事件（需要 JPEG）
+# 无此类客户端时 _push_jpeg=False，后台线程跳过 cv2.imencode 节省 10-15ms/帧。
+_frame_clients: set = set()
+
 # Web 目录路径
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
 
@@ -378,6 +382,9 @@ def ws_connect():
 
 @socketio.on('disconnect')
 def ws_disconnect():
+    # Plan B: 客户端断开时从 frame_clients 移除，若没有 JPEG 消费者则关闭编码
+    _frame_clients.discard(request.sid)
+    tracker._push_jpeg = bool(_frame_clients)
     print(f"WebSocket 客户端断开: {request.sid}")
 
 
@@ -441,7 +448,13 @@ def ws_receive_frame(raw_bytes):
     接收二进制 JPEG 帧，存帧并立即返回上一帧缓存结果（非阻塞）。
     SIFT 匹配运行在后台线程，WebSocket 接收延迟降至解码耗时（1-2ms）。
     协议: 客户端发送原始 JPEG bytes → 服务端返回 [JSON头(4字节长度) + JPEG图片]
+    Plan B: 注册该客户端为 JPEG 消费者，确保后台线程生成 JPEG。
     """
+    # Plan B: 记录该 sid 需要 JPEG，后台线程保持编码开启
+    if request.sid not in _frame_clients:
+        _frame_clients.add(request.sid)
+        tracker._push_jpeg = True
+
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -484,15 +497,22 @@ def ws_receive_frame(raw_bytes):
 
 @socketio.on('frame_coords')
 def ws_frame_coords(raw_bytes):
-    """接收帧并存帧（后台处理），立即返回上一帧缓存坐标。大幅减少带宽。"""
+    """
+    接收帧并存帧（后台处理），立即返回上一帧缓存坐标。大幅减少带宽。
+    Plan B: 无 'frame' 客户端时设 _push_jpeg=False，后台线程跳过 JPEG 编码。
+    """
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
+        # Plan B: 当前无 JPEG 消费者时关闭编码，节省 10-15ms/帧
+        if not _frame_clients:
+            tracker._push_jpeg = False
+
         tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程
 
-        if not tracker.latest_result_jpeg:
-            return  # 首帧尚无缓存，静默等待
+        if tracker.latest_status.get('state') == '--':
+            return  # 尚无任何处理结果（首帧），静默等待
 
         status = tracker.latest_status
         status_json = json.dumps({

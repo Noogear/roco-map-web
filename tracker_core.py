@@ -211,6 +211,9 @@ class AIMapTrackerWeb:
         # SIFT 匹配运行在独立线程，WebSocket handler 可立即返回上一帧缓存结果。
         # 自动跳帧：若处理跟不上帧率，Event 被多次 set() 后只唤醒一次，
         # 每次 wait() 后取到的是最新的 current_frame_bgr（旧帧自动丢弃）。
+        # Plan B: _push_jpeg=False 时跳过 cv2.imencode，节省 10-15ms/帧。
+        # 由 main_web.py 根据客户端类型（frame / frame_coords）动态切换。
+        self._push_jpeg = True
         self._new_frame_event = Event()
         self._worker_thread = Thread(
             target=self._background_processor,
@@ -445,7 +448,7 @@ class AIMapTrackerWeb:
             self._new_frame_event.wait()
             self._new_frame_event.clear()
             try:
-                self.process_frame(need_base64=False, need_jpeg=True)
+                self.process_frame(need_base64=False, need_jpeg=self._push_jpeg)
             except Exception as e:
                 print(f"[sift-worker] 处理异常: {e}")
 
