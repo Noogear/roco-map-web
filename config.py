@@ -39,6 +39,15 @@ LOCAL_FAIL_LIMIT = 3
 SIFT_JUMP_THRESHOLD = 500
 NEARBY_SEARCH_RADIUS = 600            # 匹配失败时邻近搜索范围
 
+# --- LK 光流加速（每帧 ~2ms，降低 SIFT 调用频率）---
+LK_ENABLED = True
+LK_SIFT_INTERVAL = 4                  # 每 N 帧强制跑一次 SIFT 做漂移校正
+LK_MIN_CONFIDENCE = 0.5               # 光流跟踪点中至少有此比例有效才采信
+
+# --- ECC 低纹理兜底 ---
+ECC_ENABLED = True
+ECC_MIN_CORRELATION = 0.25            # findTransformECC 结果低于此阈值则放弃
+
 # --- 状态冻结 ---
 FREEZE_TIMEOUT = 30.0
 
