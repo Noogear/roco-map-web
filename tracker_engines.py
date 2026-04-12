@@ -183,7 +183,7 @@ class SIFTMapTracker:
         # ECC 低纹理兜底
         self._ecc_enabled = getattr(config, 'ECC_ENABLED', True)
         self._ecc_min_cc = getattr(config, 'ECC_MIN_CORRELATION', 0.25)
-        self._last_sift_scale = None   # 最近一次 SIFT 成功的 Homography scale
+        self._last_sift_scale = self._lk_map_scale  # 默认与 LK scale 一致，进海洋后 ECC 可立即工作
 
         # 附近搜索 FLANN 缓存（按网格桶缓存，避免每帧重建）
         self._nearby_flann_cache = {}
@@ -796,8 +796,8 @@ class SIFTMapTracker:
                             found, center_x, center_y = True, *orb_result
                             match_quality = 0.4
 
-                    # ---- ECC 像素级兜底（低纹理专用）----
-                    if not found and texture_std < 30:
+                    # ---- ECC 像素级兜底（低/中纹理均可，海洋必备）----
+                    if not found:
                         ecc_result = self._ecc_nearby_match(
                             minimap_gray, self.last_x, self.last_y)
                         if ecc_result is not None:
