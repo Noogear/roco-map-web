@@ -57,12 +57,12 @@
             height: 300px;
             object-fit: contain;
         }
-        #resultImg {
+        #resultCanvas {
             width: 100%;
             height: auto;
             max-width: min(80vmin, 700px);
             aspect-ratio: 1 / 1;
-            object-fit: contain;
+            background: #111;
         }
         .status-bar {
             display: grid;
@@ -344,7 +344,7 @@
         }
 
         @media (max-width: 900px) {
-            #resultImg { width: 350px; height: 350px; }
+            #resultCanvas { width: 350px; height: 350px; }
         }
     </style>
 </head>
@@ -366,8 +366,15 @@
         <!-- 右侧：结果输出（独占） -->
         <div class="panel" style="max-width:700px;">
             <div class="panel-title" style="display:none;">🗺️ 地图追踪结果</div>
-            <div class="preview-area">
-                <img id="resultImg" src="" alt="等待分析...">
+            <div class="preview-area" style="position:relative;">
+                <canvas id="resultCanvas" width="400" height="400"></canvas>
+                <!-- 渲染模式切换按钮（右上角浮层）-->
+                <button id="renderModeBtn" onclick="toggleRenderMode()"
+                    title="全图模式：下载一次大地图，60fps 平滑裁切无边界&#10;JPEG模式：后端直接发图，轻量低流量"
+                    style="position:absolute;top:6px;right:6px;padding:4px 12px;
+                           background:#0f3460;border:1px solid #00d4ff88;
+                           color:#00d4ff;border-radius:6px;cursor:pointer;font-size:0.75em;
+                           box-shadow:0 2px 8px rgba(0,0,0,0.6);white-space:nowrap;">🗺️ 全图</button>
             </div>
             <div class="status-bar">
                 <div class="status-item" style="display:none;">
@@ -478,15 +485,34 @@
 TC.init({
     logEl: 'logArea',
     onAnalyzeResult: function(result) {
+        // 将后端坐标+箭头更新到前端 canvas 插值系统
+        if (result.status && result.status.position) {
+            var st = result.status;
+            _mapStatePrev = _mapState;
+            _mapState = {
+                x: st.position.x || 0,
+                y: st.position.y || 0,
+                angle: st.arrow_angle || 0,
+                stopped: !!st.arrow_stopped,
+                found: !!st.found,
+                isInertial: st.state === 'INERTIAL',
+                isSceneChange: st.state === 'SCENE_CHANGE',
+                ts: performance.now(),
+            };
+            _mapHistory.push(_mapState);
+            if (_mapHistory.length > 4) _mapHistory.shift();
+            _startMapRAF();
+        }
+        // JPEG 模式：缓存最新后端图片（全图模式也缓存，以便随时切换不黑屏）
         if (result.image) {
-            var ri = document.getElementById('resultImg');
             var imgSrc = result.image;
             if (imgSrc && imgSrc.indexOf('data:') !== 0) {
                 imgSrc = 'data:image/jpeg;base64,' + imgSrc;
             }
-            ri.src = imgSrc;
-            // 自动同步到画中画
-            updatePiPCanvas();
+            // 必须在同步阶段捕获坐标，onload 是异步的，届时 _mapState 已被新帧覆盖
+            var img = new Image();
+            img.onload = function() { _lastJpegImg = img; };
+            img.src = imgSrc;
         }
         if (result.status) {
             TC.updateStatusDOM(result.status);
@@ -862,11 +888,255 @@ async function saveCircleState() {
     }
 }
 
+// ========== 前端地图 Canvas 平滑渲染（60fps 速度外推）==========
+// 后端每次推送坐标时更新 _mapState，RAF 循环在两次更新之间用速度外推填充帧，
+// 使地图在匀速行走时呈现真正匀速滚动，而不是 10fps 跳帧。
+var resultCanvas = document.getElementById('resultCanvas');
+var _displayMap = null;          // 展示用大地图 Image 对象
+var _mapState = null;            // 最新一帧后端状态 {x,y,angle,stopped,found,isInertial,ts}
+var _mapStatePrev = null;        // 上一帧后端状态
+var _mapHistory = [];            // 最近4帧历史，供 Catmull-Rom 样条使用
+var _mapRAFActive = false;
+var _mapRAFId = null;
+// JPEG 模式专用状态
+var _renderMode = 'bigmap';       // 'bigmap' | 'jpeg'
+var _lastJpegImg = null;          // 上一帧 JPEG decode 后的 Image 对象
+var _renderPos = null;            // 渲染平滑位置（EMA，消除新后端帧到来时的回弹）
+
+// 加载展示地图（用 fetch 取进度，失败自动降级 JPEG 模式）
+var _mapLoadProgress = 0;  // 0..1，1 = 完成
+_displayMap = new Image();
+_displayMap.onerror = function() {
+    TC.log('⚠️ 全图加载失败，已自动切换到 JPEG 模式');
+    _renderMode = 'jpeg';
+    _updateRenderModeBtn();
+};
+// 延迟 3 秒再下载大图：给 socket.io 时间从 HTTP polling 升级到 WebSocket，
+// 避免 33MB 流式下载占满 HTTP 连接池导致 polling 超时断线。
+setTimeout(function _loadMapWithProgress() {
+    fetch('/big_map-1.png').then(function(resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var total = parseInt(resp.headers.get('content-length') || '0', 10);
+        var loaded = 0;
+        var reader = resp.body.getReader();
+        var chunks = [];
+        function pump() {
+            return reader.read().then(function(ref) {
+                if (ref.done) {
+                    var blob = new Blob(chunks, { type: 'image/png' });
+                    _displayMap.src = URL.createObjectURL(blob);
+                    _mapLoadProgress = 1;
+                    return;
+                }
+                chunks.push(ref.value);
+                loaded += ref.value.length;
+                _mapLoadProgress = total ? loaded / total : 0.5;
+                return pump();
+            });
+        }
+        return pump();
+    }).catch(function(e) {
+        TC.log('⚠️ 全图加载失败(' + e.message + ')，切换到 JPEG 模式');
+        _renderMode = 'jpeg';
+        _updateRenderModeBtn();
+    });
+}, 3000);
+
+function _updateRenderModeBtn() {
+    var btn = document.getElementById('renderModeBtn');
+    if (!btn) return;
+    if (_renderMode === 'bigmap') {
+        btn.textContent = '🗺️ 全图';
+        btn.title = '当前：全图模式（60fps平滑，无边界）\n点击切换到 JPEG 模式（轻量低流量）';
+    } else {
+        btn.textContent = '📸 JPEG';
+        btn.title = '当前：JPEG 模式（轻量低流量）\n点击切换到全图模式（60fps平滑，无边界）';
+    }
+}
+
+function toggleRenderMode() {
+    _renderMode = _renderMode === 'bigmap' ? 'jpeg' : 'bigmap';
+    _updateRenderModeBtn();
+    TC.log(_renderMode === 'bigmap'
+        ? '🗺️ 已切换到全图平滑模式（首次加载 33MB，之后零开销）'
+        : '📸 已切换到 JPEG 模式（低流量，边缘稍有黑边）');
+}
+
+/** Catmull-Rom 样条基函数：t∈[0,1] 对应 p1→p2 段 */
+function _catmullRom(p0, p1, p2, p3, t) {
+    var t2 = t * t, t3 = t2 * t;
+    return 0.5 * ((2 * p1) +
+        (-p0 + p2) * t +
+        (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+        (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+}
+
+/** 位置插值：Catmull-Rom（4帧）→ 边界样条（3帧）→ 线性（2帧），绝不外推。
+ *  "延迟-1帧显示"：refTime = now - interval，t 永远 ∈ [0,1]，零回弹。
+ *  代价是约 100ms 显示延迟，但完全消除抖动。
+ */
+function _getExtrapolatedPos() {
+    if (!_mapState) return null;
+    if (!_mapState.found) return _mapState;  // SCENE_CHANGE: 用最后坐标
+
+    var h = _mapHistory;
+    if (h.length < 2) return _mapState;
+
+    var prev = h[h.length - 2], curr = h[h.length - 1];
+    var interval = curr.ts - prev.ts;
+    if (interval < 10) return curr;
+
+    // 传送检测：跳变超过 400px 直接吸附
+    var jdx = curr.x - prev.x, jdy = curr.y - prev.y;
+    if (jdx * jdx + jdy * jdy > 400 * 400) return curr;
+
+    // 延迟一帧：refTime 始终落在 [prev.ts, curr.ts] 区间，t ∈ [0,1]，永不外推
+    var refTime = performance.now() - interval;
+    var t = (refTime - prev.ts) / interval;
+    t = Math.min(Math.max(t, 0), 1);
+
+    var rx, ry;
+    if (h.length >= 4) {
+        var p0 = h[h.length - 4], p1 = h[h.length - 3];
+        rx = _catmullRom(p0.x, p1.x, prev.x, curr.x, t);
+        ry = _catmullRom(p0.y, p1.y, prev.y, curr.y, t);
+    } else if (h.length >= 3) {
+        var p0b = h[h.length - 3];
+        rx = _catmullRom(p0b.x, p0b.x, prev.x, curr.x, t);
+        ry = _catmullRom(p0b.y, p0b.y, prev.y, curr.y, t);
+    } else {
+        rx = prev.x + t * jdx;
+        ry = prev.y + t * jdy;
+    }
+
+    return {
+        x: rx, y: ry,
+        angle: curr.angle, stopped: curr.stopped,
+        found: curr.found, isInertial: curr.isInertial,
+        isSceneChange: curr.isSceneChange,
+    };
+}
+
+/** 在 canvas ctx 上画箭头（angle=0 朝北，顺时针） */
+function _drawArrowOnCanvas(ctx, cx, cy, angle, stopped) {
+    var size = 12;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((angle || 0) * Math.PI / 180);
+    if (stopped) {
+        ctx.fillStyle = 'rgba(48,182,254,0.85)';
+        ctx.beginPath(); ctx.arc(0, 0, Math.round(size * 0.6), 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+    } else {
+        ctx.fillStyle = 'rgba(48,182,254,0.85)';
+        ctx.beginPath();
+        ctx.moveTo(0, -size);
+        ctx.lineTo(-size * 0.6, size * 0.7);
+        ctx.lineTo(size * 0.6, size * 0.7);
+        ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    ctx.restore();
+}
+
+/** 主渲染：根据 _renderMode 选择全图裁切或 JPEG 位移 */
+function _renderMapCanvas() {
+    if (!resultCanvas) return;
+    var ctx = resultCanvas.getContext('2d');
+    var vSize = 400, half = 200;
+    var extPos = _getExtrapolatedPos();
+
+    // ---- 全图模式（Plan A）----
+    if (_renderMode === 'bigmap') {
+        // 完全没有坐标时才显示占位画面（地图未加载或尚未收到任何帧）
+        if (!extPos || !_displayMap || !_displayMap.complete || !_displayMap.naturalWidth) {
+            _renderPos = null;
+            ctx.fillStyle = '#111'; ctx.fillRect(0, 0, vSize, vSize);
+            if (_mapLoadProgress > 0 && _mapLoadProgress < 1) {
+                var barW = Math.round(vSize * 0.7);
+                var barH = 8;
+                var bx = (vSize - barW) / 2, by = half - 20;
+                ctx.fillStyle = '#333'; ctx.fillRect(bx, by, barW, barH);
+                ctx.fillStyle = '#00d4ff'; ctx.fillRect(bx, by, Math.round(barW * _mapLoadProgress), barH);
+                ctx.fillStyle = '#aaa'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText('地图加载中 ' + Math.round(_mapLoadProgress * 100) + '%', half, by + barH + 18);
+            } else {
+                ctx.fillStyle = '#555'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText(_mapState ? '定位中...' : '等待分析...', half, half);
+            }
+            return;
+        }
+        // 有坐标就继续渲染地图（包括 found=false 的 SCENE_CHANGE 状态）
+        // _renderPos 用轻量 EMA（α=0.4）吸收亚像素抖动；
+        // isSceneChange 或传送时立即吸附（不拖尾）
+        if (!_renderPos || extPos.isSceneChange) {
+            _renderPos = { x: extPos.x, y: extPos.y };
+        } else {
+            _renderPos.x += 0.4 * (extPos.x - _renderPos.x);
+            _renderPos.y += 0.4 * (extPos.y - _renderPos.y);
+        }
+        var pos = { x: _renderPos.x, y: _renderPos.y, angle: extPos.angle,
+                    stopped: extPos.stopped, isInertial: extPos.isInertial,
+                    isSceneChange: extPos.isSceneChange };
+        var mapW = _displayMap.naturalWidth, mapH = _displayMap.naturalHeight;
+        var sx = Math.max(0, Math.min(Math.round(pos.x - half), mapW - vSize));
+        var sy = Math.max(0, Math.min(Math.round(pos.y - half), mapH - vSize));
+        var localX = Math.round(pos.x - sx);
+        var localY = Math.round(pos.y - sy);
+        ctx.drawImage(_displayMap, sx, sy, vSize, vSize, 0, 0, vSize, vSize);
+        // 位置标记点
+        var dotY = localY + 6;
+        ctx.fillStyle = pos.isInertial ? '#ffff00' : '#00ff00';
+        ctx.beginPath(); ctx.arc(localX, dotY, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(localX, dotY, 7, 0, Math.PI * 2); ctx.stroke();
+        _drawArrowOnCanvas(ctx, localX, localY, pos.angle, pos.stopped);
+        // SCENE_CHANGE 状态：左上角显示重定位提示，不冻住地图
+        if (pos.isSceneChange) {
+            ctx.fillStyle = 'rgba(0,0,0,0.45)';
+            ctx.fillRect(0, 0, vSize, 24);
+            ctx.fillStyle = '#ffcc44'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';
+            ctx.fillText('这个区域重定位中...', 8, 16);
+        }
+        return;
+    }
+
+    // ---- JPEG 模式（Plan B）----
+    // 后端已将玩家居中裁切到 400×400，直接绘制即可，无需额外偏移
+    // （偏移会引入黑边和回弹，因为 JPEG 仅 400px，平移后超界露底色）
+    if (!_lastJpegImg || !_lastJpegImg.complete) {
+        ctx.fillStyle = '#111'; ctx.fillRect(0, 0, vSize, vSize);
+        ctx.fillStyle = '#555'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(_mapState ? '定位中...' : '等待分析...', half, half);
+        return;
+    }
+    ctx.drawImage(_lastJpegImg, 0, 0, vSize, vSize);
+}
+
+function _mapRAFLoop() {
+    if (!_mapRAFActive) { _mapRAFId = null; return; }
+    // 用 try-catch 保护：渲染异常不能杀死 RAF 循环
+    try { _renderMapCanvas(); } catch(e) { console.error('[mapRAF] 渲染异常:', e); }
+    // 若 PiP 激活，由此循环顺序驱动 PiP 更新（确保 canvas → pipCanvas 顺序一致）
+    if (pipRAFActive) {
+        try { updatePiPCanvas(); } catch(e) { console.error('[mapRAF] PiP异常:', e); }
+    }
+    _mapRAFId = requestAnimationFrame(_mapRAFLoop);
+}
+
+function _startMapRAF() {
+    if (_mapRAFActive) return;
+    _mapRAFActive = true;
+    _mapRAFLoop();
+}
+
+// 启动时先渲染一帧占位画面
+_renderMapCanvas();
+
 // ========== 纯原生浏览器画中画 ==========
 const pipCanvas = document.getElementById('pipCanvas');
 const pipVideo = document.getElementById('pipVideo');
 const pipBtn = document.getElementById('pipBtn');
-const resultImg = document.getElementById('resultImg');
 let pipTimer = null;
 let pipEventsBound = false;
 let pipRAFActive = false;
@@ -875,25 +1145,11 @@ let pipRAFActive = false;
 pipCanvas.width = 400;
 pipCanvas.height = 400;
 
-// 更新画中画画面（双缓冲防闪黑）
-var _pipBackBuf = null;
-function _getPipBackBuffer() {
-    if (!_pipBackBuf) { _pipBackBuf = document.createElement('canvas'); _pipBackBuf.width = 400; _pipBackBuf.height = 400; }
-    return _pipBackBuf;
-}
+// 更新画中画画面：直接从 resultCanvas 复制（canvas→canvas 无闪帧风险）
 function updatePiPCanvas() {
-    if (!resultImg.src || !resultImg.naturalWidth || !resultImg.naturalHeight) return;
-    const back = _getPipBackBuffer();
-    const bctx = back.getContext('2d');
-    bctx.clearRect(0, 0, 400, 400);
-    const scale = Math.min(400 / resultImg.naturalWidth, 400 / resultImg.naturalHeight);
-    const w = resultImg.naturalWidth * scale;
-    const h = resultImg.naturalHeight * scale;
-    bctx.drawImage(resultImg, (400 - w) / 2, (400 - h) / 2, w, h);
-
-    // 原子式一次性复制到前台画布，不做 clearRect 避免 captureStream 抓到空白帧
+    if (!resultCanvas) return;
     const ctx = pipCanvas.getContext('2d');
-    ctx.drawImage(back, 0, 0);
+    ctx.drawImage(resultCanvas, 0, 0, 400, 400);
 }
 
 function isNativePiPActive() {
@@ -908,7 +1164,8 @@ function stopPiPRefresh() {
 
 function pipRAFLoop() {
     if (!pipRAFActive) return;
-    updatePiPCanvas();
+    // 若地图 RAF 已激活，PiP 更新由 _mapRAFLoop 顺序驱动，此处跳过避免重复绘制
+    if (!_mapRAFActive) updatePiPCanvas();
     pipTimer = requestAnimationFrame(pipRAFLoop);
 }
 
@@ -977,7 +1234,7 @@ async function toggleNativePiP() {
     }
 
     // 没有图片则无法开启
-    if (!resultImg.src) {
+    if (!_mapState) {
         TC.log('请先分析一张图片再开启画中画！');
         return;
     }
