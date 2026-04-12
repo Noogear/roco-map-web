@@ -1,128 +1,99 @@
 # ==========================================
 # 游戏地图跟点助手 - 全局配置文件
 # ==========================================
-# --- 0. 服务器设置 ---
 PORT = 8686
 
-# --- 1. 屏幕截图区域 (Minimap Region) ---
-# 请根据你的显示器分辨率和游戏 UI 调整这些值
-# 可以通过微信/QQ截图工具查看具体像素坐标
-MINIMAP = {
-    "top": 292,
-    "left": 1853,
-    "width": 150,
-    "height": 150
-}
+# --- 屏幕截图区域 ---
+MINIMAP = {"top": 292, "left": 1853, "width": 150, "height": 150}
 
-# --- 2. 悬浮窗 UI 设置 ---
-WINDOW_GEOMETRY = "400x400+1500+100"  # 悬浮窗宽x高+X坐标+Y坐标
-VIEW_SIZE = 400                       # 悬浮窗内显示的地图视野大小
+# --- UI ---
+WINDOW_GEOMETRY = "400x400+1500+100"
+VIEW_SIZE = 400
 
-# --- 3. 地图文件路径 ---
-LOGIC_MAP_PATH = "web/big_map.png"        # 用于特征提取的纯净底图
-DISPLAY_MAP_PATH = "web/big_map-1.png"    # 用于显示的带标记 UI 图
+# --- 地图文件 ---
+LOGIC_MAP_PATH = "web/big_map.png"
+DISPLAY_MAP_PATH = "web/big_map-1.png"
 
-# --- 4. 惯性导航设置 (防跟丢兜底) ---
-MAX_LOST_FRAMES = 50                  # 最大容忍丢失帧数 (约 10 秒)
+# --- 惯性导航 ---
+MAX_LOST_FRAMES = 50
 
 # ==========================================
-# SIFT 传统视觉算法专属配置 (main_sift.py)
+# SIFT 引擎核心参数
 # ==========================================
-SIFT_REFRESH_RATE = 50                # 刷新延迟 (毫秒)，50ms 约等于 20fps
-SIFT_CLAHE_LIMIT = 3.0                # CLAHE 对比度增强极限 (用于榨取海水/草地纹理)
-SIFT_MATCH_RATIO = 0.82               # Lowe's Ratio 阈值 (越大越容易匹配，但错判率越高)
-SIFT_MIN_MATCH_COUNT = 5              # 判定成功所需的最低匹配点数
-SIFT_RANSAC_THRESHOLD = 8.0           # 允许的空间误差阈值
+SIFT_REFRESH_RATE = 50
+SIFT_MATCH_RATIO = 0.82               # Lowe's Ratio (标准纹理)
+SIFT_MIN_MATCH_COUNT = 5              # 最低匹配点数 (标准纹理)
+SIFT_RANSAC_THRESHOLD = 8.0
+SIFT_CONTRAST_THRESHOLD = 0.02        # SIFT 特征对比度 (越低越多弱纹理特征)
+SIFT_MAX_HOMOGRAPHY_SCALE = 8.0
 
-# === 局部优先搜索设置 (main123 优化) ===
-SEARCH_RADIUS = 400                  # 局部搜索半径（像素）
-LOCAL_FAIL_LIMIT = 3                 # 局部搜索连续失败 N 帧后回退全局
-SIFT_JUMP_THRESHOLD = 500            # 局部模式下坐标最大允许跳变距离（像素，全局回退用2x）
-SIFT_MAX_HOMOGRAPHY_SCALE = 8.0      # Homography 最大允许缩放 (防UI误匹配，正常≈1-3)
+# --- CLAHE 自适应 ---
+# 双档: 纹理 std < LOW_TEXTURE_THRESHOLD → 低纹理(海洋/草/雪), clip 自动插值
+CLAHE_LOW_TEXTURE_THRESHOLD = 30
+CLAHE_LIMIT_NORMAL = 3.0              # 标准纹理 clip
+CLAHE_LIMIT_LOW_TEXTURE = 6.0         # 低纹理 clip (连续插值到此)
 
-# === 自适应 CLAHE（按纹理复杂度切换增强档位）===
-CLAHE_LOW_TEXTURE_THRESHOLD = 30       # 灰度标准差 < 此值 → 低纹理（海水/草地）
-CLAHE_HIGH_TEXTURE_THRESHOLD = 60      # 灰度标准差 > 此值 → 高纹理（城镇/建筑）
-CLAHE_LIMIT_LOW_TEXTURE = 5.0          # 低纹理区域 CLAHE clip limit（更激进）
-CLAHE_LIMIT_HIGH_TEXTURE = 2.0         # 高纹理区域 CLAHE clip limit（更温和）
+# --- 搜索策略 ---
+SEARCH_RADIUS = 400
+LOCAL_FAIL_LIMIT = 3
+SIFT_JUMP_THRESHOLD = 500
+NEARBY_SEARCH_RADIUS = 600            # 匹配失败时邻近搜索范围
 
-# === 超低纹理（海洋/天空/开阔水域）增强 ===
-CLAHE_VERY_LOW_TEXTURE_THRESHOLD = 18  # 灰度标准差 < 此值 → 超低纹理（纯海面/天空）
-CLAHE_LIMIT_VERY_LOW_TEXTURE = 8.0     # 超低纹理 CLAHE clip limit（极致增强）
-SIFT_MIN_MATCH_LOW_TEXTURE = 3         # 低纹理场景最低匹配点数（放宽，默认5太严格）
-SIFT_MATCH_RATIO_LOW_TEXTURE = 0.88    # 低纹理场景 Lowe's ratio（放宽，默认0.82太严格）
+# --- 状态冻结 ---
+FREEZE_TIMEOUT = 30.0
 
-# === SIFT 检测参数 ===
-SIFT_CONTRAST_THRESHOLD = 0.02        # SIFT 特征对比度阈值（默认0.04，越低特征越多）
+# --- 小地图圆形检测 ---
+MINIMAP_CAPTURE_MARGIN = 1.4
+MINIMAP_CIRCLE_CALIBRATION_FRAMES = 8
+MINIMAP_CIRCLE_R_TOLERANCE = 8
+MINIMAP_CIRCLE_CENTER_TOLERANCE = 15
+MINIMAP_CIRCLE_RECALIBRATE_MISS = 30
 
-# === ORB 快速备份引擎 ===
-ORB_BACKUP_ENABLED = True              # SIFT 失败时启用 ORB 快速备份匹配
-ORB_NFEATURES = 500                    # ORB 特征数上限
+# --- 箭头方向 ---
+ARROW_ANGLE_SMOOTH_ALPHA = 0.35
+ARROW_MOVE_MIN_DISPLACEMENT = 6
+ARROW_POS_HISTORY_LEN = 4
+ARROW_STOPPED_DEBOUNCE = 20
+ARROW_SNAP_THRESHOLD = 90
 
-# === BLOCK 状态冻结 ===
-FREEZE_TIMEOUT = 30.0                  # 冻结状态超时（秒），超时后丢弃冻结数据
+# --- 坐标锁定 ---
+COORD_LOCK_ENABLED = False
+COORD_LOCK_HISTORY_SIZE = 10
+COORD_LOCK_SEARCH_RADIUS = 400
+COORD_LOCK_MAX_RETRIES = 5
+COORD_LOCK_MIN_HISTORY_TO_ACTIVATE = 10
 
-# === 小地图圆形检测 (方形截取模式) ===
-MINIMAP_CAPTURE_MARGIN = 1.4            # 浏览器方形截取扩展系数 (相对于圆直径)
-MINIMAP_CIRCLE_CALIBRATION_FRAMES = 8   # 自校准所需连续成功帧数
-MINIMAP_CIRCLE_R_TOLERANCE = 8          # 校准后允许半径偏差 (像素)
-MINIMAP_CIRCLE_CENTER_TOLERANCE = 15    # 校准后允许圆心偏移 (像素)
-MINIMAP_CIRCLE_RECALIBRATE_MISS = 30    # 连续多少帧未检测到圆 → 重新校准
+# --- 线性过滤 ---
+LINEAR_FILTER_ENABLED = True
+LINEAR_FILTER_WINDOW = 10
+LINEAR_FILTER_MAX_DEVIATION = 120
+LINEAR_FILTER_MAX_CONSECUTIVE = 10
+RENDER_OFFSET_X = 0
+RENDER_OFFSET_Y = 0
 
-# === 箭头方向系统 (纯坐标驱动) ===
-ARROW_ANGLE_SMOOTH_ALPHA = 0.35         # 角度 EMA 平滑系数 (0=强平滑, 1=无平滑)
-ARROW_MOVE_MIN_DISPLACEMENT = 6         # 判定移动的最小累积位移 (像素)
-ARROW_POS_HISTORY_LEN = 4              # 坐标历史帧数 (用于累积位移计算)
-ARROW_STOPPED_DEBOUNCE = 20            # 连续低位移多少帧后判定为静止（20fps ≈ 1秒）
-ARROW_SNAP_THRESHOLD = 90              # 角度差超此值时跳过平滑直接赋值（应付瞬间反向）
-
-# === 坐标锁定模式设置 ===
-COORD_LOCK_ENABLED = False             # 是否启用坐标锁定（运行时动态切换）
-COORD_LOCK_HISTORY_SIZE = 10           # 锚点计算：取最近 N 个历史坐标的平均值
-COORD_LOCK_SEARCH_RADIUS = 400         # 锁定后允许的搜索半径（像素）
-COORD_LOCK_MAX_RETRIES = 5             # 单帧最大重试次数
-COORD_LOCK_MIN_HISTORY_TO_ACTIVATE = 10   # 至少积累多少个历史坐标才允许开启锁定
-
-# === 线性速度一致性过滤（丢弃非线性跳变）===
-LINEAR_FILTER_ENABLED = True           # 是否启用线性过滤（锁定模式自动生效）
-LINEAR_FILTER_WINDOW = 10              # 取最近多少帧计算平均速度
-LINEAR_FILTER_MAX_DEVIATION = 120      # 允许偏离预测位置的最大距离（像素）
-LINEAR_FILTER_MAX_CONSECUTIVE = 10     # 连续丢弃多少帧后强制接受真实坐标（防死锁）
-# 正值 = 向右/下偏移，负值 = 向左/上偏移。用于微调定位点位置。
-RENDER_OFFSET_X = 0                  # 像素偏移（如果定位点偏左，改为正值如 +10）
-RENDER_OFFSET_Y = 0                  # 像素偏移
-
-# === 渲染平滑防抖 ===
-# 静止死区：渲染坐标变化量 ≤ 此阈值（像素）时保持不动，消除静止时的 SIFT 噪声抖动
-# 雪地/低纹理场景下 Kalman 输出仍有 3~5px 级别的噪声波动，调大至 5 可彻底消除
+# --- 渲染平滑 ---
 RENDER_STILL_THRESHOLD = 5
-# 移动 EMA 平滑系数：0=完全锁死(无跟随), 1=不平滑(直接跳变)，建议 0.3~0.45
-# 值越小越平滑但跟随延迟越大；值越大越接近原始坐标
 RENDER_EMA_ALPHA = 0.35
 
-# === 传送检测（聚类确认，防误判）===
-# 连续跳变帧在空间上聚集才确认为传送，随机噪声因分散不会触发
-TP_JUMP_THRESHOLD = 300   # 触发候选积累的最小跳变距离（像素），建议 250~400
-TP_CONFIRM_FRAMES = 3     # 候选缓冲需积满多少帧才做聚类判定，越大越稳越慢（建议 3~5）
-TP_CLUSTER_RADIUS = 150   # 候选点最大散布半径（像素），超过则视为噪声不触发（建议 100~200）
+# --- 传送检测 ---
+TP_JUMP_THRESHOLD = 300
+TP_CONFIRM_FRAMES = 3
+TP_CLUSTER_RADIUS = 150
 
 # ==========================================
-# LoFTR AI 深度学习算法专属配置 (main_ai.py)
+# LoFTR AI 引擎
 # ==========================================
-AI_REFRESH_RATE = 200                 # AI 推理耗时较高，建议 200ms (5fps)
-AI_CONFIDENCE_THRESHOLD = 0.25        # AI 置信度阈值 (越低越容易妥协)
-AI_MIN_MATCH_COUNT = 6                # 判定成功所需的最低匹配点数
-AI_RANSAC_THRESHOLD = 8.0             # 允许的空间误差阈值
-# 雷达扫描参数
-AI_SCAN_SIZE = 1600                   # 全局搜索时的区块大小
-AI_SCAN_STEP = 1400                   # 全局搜索的步长
-AI_TRACK_RADIUS = 500                 # 局部追踪时，向外扩展的半径 (400即截取800x800)
+AI_REFRESH_RATE = 200
+AI_CONFIDENCE_THRESHOLD = 0.25
+AI_MIN_MATCH_COUNT = 6
+AI_RANSAC_THRESHOLD = 8.0
+AI_SCAN_SIZE = 1600
+AI_SCAN_STEP = 1400
+AI_TRACK_RADIUS = 500
 
-# ==========================================
-# 混合引擎模式 (SIFT 主引擎 + LoFTR 后台重定位)
-# ==========================================
-HYBRID_ENABLED = True                  # 非 sift-only 模式下自动启用混合引擎
-HYBRID_TRIGGER_LOST_FRAMES = 5         # SIFT 连续惯性 N 帧后触发 LoFTR 重定位
+# --- 混合引擎 ---
+HYBRID_ENABLED = True
+HYBRID_TRIGGER_LOST_FRAMES = 5
 HYBRID_CONFUSED_IMMEDIATE = True       # SIFT 几何混乱时立即触发 LoFTR（不等 N 帧）
 HYBRID_COOLDOWN = 3.0                  # LoFTR 两次触发最小间隔（秒）
 HYBRID_COARSE_TILE = 400               # 粗扫阶段的 tile 目标尺寸（像素，缩放后）

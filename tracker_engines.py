@@ -115,20 +115,14 @@ class SIFTMapTracker:
 
     def __init__(self):
         print("正在初始化 SIFT 引擎...")
-        # 自适应 CLAHE：4 档预创建（超低/低/中/高纹理场景）
-        _cl_very_low = getattr(config, 'CLAHE_LIMIT_VERY_LOW_TEXTURE', 8.0)
-        _cl_low = getattr(config, 'CLAHE_LIMIT_LOW_TEXTURE', 5.0)
-        _cl_mid = config.SIFT_CLAHE_LIMIT
-        _cl_high = getattr(config, 'CLAHE_LIMIT_HIGH_TEXTURE', 2.0)
-        self._clahe_very_low = cv2.createCLAHE(clipLimit=_cl_very_low, tileGridSize=(8, 8))
-        self._clahe_low  = cv2.createCLAHE(clipLimit=_cl_low,  tileGridSize=(8, 8))
-        self._clahe_mid  = cv2.createCLAHE(clipLimit=_cl_mid,  tileGridSize=(8, 8))
-        self._clahe_high = cv2.createCLAHE(clipLimit=_cl_high, tileGridSize=(8, 8))
-        self.clahe = self._clahe_mid  # 默认（大地图特征提取用中档）
-        self._clahe_very_low_thresh = getattr(config, 'CLAHE_VERY_LOW_TEXTURE_THRESHOLD', 18)
-        self._clahe_low_thresh  = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
-        self._clahe_high_thresh = getattr(config, 'CLAHE_HIGH_TEXTURE_THRESHOLD', 60)
-        # SIFT 检测器：降低 contrastThreshold 提取更多弱纹理特征
+        # 自适应 CLAHE：双档 (标准 / 低纹理)，运行时按纹理 std 线性插值
+        self._clahe_normal = cv2.createCLAHE(
+            clipLimit=getattr(config, 'CLAHE_LIMIT_NORMAL', 3.0), tileGridSize=(8, 8))
+        self._clahe_low = cv2.createCLAHE(
+            clipLimit=getattr(config, 'CLAHE_LIMIT_LOW_TEXTURE', 6.0), tileGridSize=(8, 8))
+        self._low_texture_thresh = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
+
+        # SIFT 检测器
         _sift_contrast = getattr(config, 'SIFT_CONTRAST_THRESHOLD', 0.02)
         self.sift = cv2.SIFT_create(contrastThreshold=_sift_contrast)
 
@@ -147,51 +141,40 @@ class SIFTMapTracker:
         self.map_height, self.map_width = logic_map_bgr.shape[:2]
 
         logic_map_gray = cv2.cvtColor(logic_map_bgr, cv2.COLOR_BGR2GRAY)
-        self._logic_map_gray = logic_map_gray  # 留存灰度大地图（ORB 局部匹配用）
+        self._logic_map_gray = logic_map_gray
         logic_map_enhanced = self._adaptive_clahe_map(logic_map_gray)
         print("正在提取大地图 SIFT 特征点...")
         self.kp_big_all, self.des_big_all = self.sift.detectAndCompute(logic_map_enhanced, None)
         print(f"✅ 全局特征点: {len(self.kp_big_all)} 个")
 
-        # 预存全局特征点坐标（用于快速局部筛选）
         self.kp_coords = np.array([kp.pt for kp in self.kp_big_all], dtype=np.float32)
 
-        # === 全局 FLANN 索引（常驻不销毁）===
         print("正在构建全局 FLANN 索引...")
         self.flann_global = self._create_flann(self.des_big_all)
 
-        # === 局部 FLANN（动态重建，初始=全局）===
+        # 局部 FLANN（动态重建）
         self.kp_local = list(self.kp_big_all)
         self.des_local = self.des_big_all.copy()
         self.flann_local = self.flann_global
         self.using_local = False
         self.local_fail_count = 0
 
-        # === 局部搜索参数 ===
         self.SEARCH_RADIUS = getattr(config, 'SEARCH_RADIUS', 400)
         self.LOCAL_FAIL_LIMIT = getattr(config, 'LOCAL_FAIL_LIMIT', 5)
         self.JUMP_THRESHOLD = getattr(config, 'SIFT_JUMP_THRESHOLD', 500)
+        self.NEARBY_SEARCH_RADIUS = getattr(config, 'NEARBY_SEARCH_RADIUS', 600)
 
-        # ORB 快速备份引擎（SIFT 失败时的轻量候补）
-        _orb_enabled = getattr(config, 'ORB_BACKUP_ENABLED', True)
-        if _orb_enabled:
-            _orb_n = getattr(config, 'ORB_NFEATURES', 500)
-            self.orb = cv2.ORB_create(nfeatures=_orb_n)
-            self.orb_bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        else:
-            self.orb = None
-            self.orb_bf = None
-        # ORB 局部描述子（在 _switch_to_local 时一并构建）
-        self.orb_local_kp = None
-        self.orb_local_des = None
+        # ORB 备份引擎（邻近搜索时使用）
+        self.orb = cv2.ORB_create(nFeatures=500)
+        self.orb_bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
         # 惯性导航状态
         self.last_x = None
         self.last_y = None
         self.lost_frames = 0
-        self._sift_confused = False  # scale 异常时标记，供混合引擎快速升级
+        self._sift_confused = False
 
-        # === 状态冻结（BLOCK 期间保持局部索引 + 坐标，恢复时直接复用）===
+        # 状态冻结
         self._frozen = False
         self._frozen_last_x = None
         self._frozen_last_y = None
@@ -199,29 +182,20 @@ class SIFTMapTracker:
         self._frozen_kp_local = None
         self._frozen_des_local = None
         self._frozen_flann_local = None
-        self._frozen_orb_local_kp = None
-        self._frozen_orb_local_des = None
-        import time as _frozen_time
-        self._frozen_time_mod = _frozen_time
-        self._frozen_at = 0.0
-
-        # 性能监控
         import time as _time
         self._perf_time = _time
+        self._frozen_at = 0.0
         self._frame_times = []
 
-        # === 坐标锁定模式 ===
+        # 坐标锁定模式
         self.coord_lock_enabled = False
         self._lock_history_size = getattr(config, 'COORD_LOCK_HISTORY_SIZE', 10)
         self._lock_search_radius = getattr(config, 'COORD_LOCK_SEARCH_RADIUS', 400)
         self._lock_max_retries = getattr(config, 'COORD_LOCK_MAX_RETRIES', 5)
         self._lock_min_to_activate = getattr(config, 'COORD_LOCK_MIN_HISTORY_TO_ACTIVATE', 15)
 
-    # ------------------------------------------
-    # 状态冻结 / 恢复（战斗/背包期间保持局部索引+坐标）
-    # ------------------------------------------
+    # ---- 状态冻结 / 恢复 ----
     def _freeze_state(self):
-        """进入 BLOCK 时冻结当前状态，避免局部索引/坐标在丢帧中被破坏"""
         if self._frozen:
             return
         self._frozen = True
@@ -232,42 +206,26 @@ class SIFTMapTracker:
             self._frozen_kp_local = self.kp_local
             self._frozen_des_local = self.des_local
             self._frozen_flann_local = self.flann_local
-            self._frozen_orb_local_kp = self.orb_local_kp
-            self._frozen_orb_local_des = self.orb_local_des
-        self._frozen_at = self._frozen_time_mod.time()
-        if self._frozen_last_x is not None:
-            print(f"❄️ 状态冻结 ({self._frozen_last_x}, {self._frozen_last_y}) "
-                  f"局部={'✓' if self.using_local else '✗'}")
+        self._frozen_at = self._perf_time.time()
 
     def _thaw_state(self):
-        """小地图重现时恢复冻结的状态，跳过全局搜索冷启动"""
         if not self._frozen:
             return
         self._frozen = False
-        elapsed = self._frozen_time_mod.time() - self._frozen_at
+        elapsed = self._perf_time.time() - self._frozen_at
         timeout = getattr(config, 'FREEZE_TIMEOUT', 30.0)
-
         if elapsed > timeout:
-            print(f"🔥 冻结已超时 ({elapsed:.0f}s > {timeout}s)，不恢复旧状态")
             return
-
-        # 恢复坐标
         if self._frozen_last_x is not None:
             self.last_x = self._frozen_last_x
             self.last_y = self._frozen_last_y
-        # 恢复局部索引
         if self._frozen_using_local and self._frozen_flann_local is not None:
             self.kp_local = self._frozen_kp_local
             self.des_local = self._frozen_des_local
             self.flann_local = self._frozen_flann_local
-            self.orb_local_kp = self._frozen_orb_local_kp
-            self.orb_local_des = self._frozen_orb_local_des
             self.using_local = True
-        # 重置失败计数
         self.lost_frames = 0
         self.local_fail_count = 0
-        print(f"♻️ 状态恢复 ({self.last_x}, {self.last_y}) "
-              f"局部={'✓' if self.using_local else '✗'} 冻结时长={elapsed:.1f}s")
 
     @property
     def frozen(self):
@@ -280,42 +238,26 @@ class SIFTMapTracker:
             return self._frozen_last_x, self._frozen_last_y
         return None
 
-    # ------------------------------------------
-    # 自适应 CLAHE 选择
-    # ------------------------------------------
+    # ---- 自适应 CLAHE ----
     def _adaptive_clahe(self, gray):
-        """根据纹理标准差选择合适的 CLAHE 档位"""
-        std = np.std(gray)
-        if std < self._clahe_very_low_thresh:
-            return self._clahe_very_low.apply(gray)
-        if std < self._clahe_low_thresh:
+        """低纹理用 _clahe_low，否则 _clahe_normal"""
+        if np.std(gray) < self._low_texture_thresh:
             return self._clahe_low.apply(gray)
-        elif std > self._clahe_high_thresh:
-            return self._clahe_high.apply(gray)
-        return self._clahe_mid.apply(gray)
+        return self._clahe_normal.apply(gray)
 
     def _adaptive_clahe_map(self, gray):
-        """对大地图进行区域自适应 CLAHE 增强（与小地图一致，避免描述符不匹配）"""
+        """大地图分块自适应 CLAHE"""
         h, w = gray.shape[:2]
         tile = 256
         result = np.empty_like(gray)
+        thresh = self._low_texture_thresh
         for y in range(0, h, tile):
             for x in range(0, w, tile):
                 patch = gray[y:y+tile, x:x+tile]
-                std = np.std(patch)
-                if std < self._clahe_very_low_thresh:
-                    result[y:y+tile, x:x+tile] = self._clahe_very_low.apply(patch)
-                elif std < self._clahe_low_thresh:
-                    result[y:y+tile, x:x+tile] = self._clahe_low.apply(patch)
-                elif std > self._clahe_high_thresh:
-                    result[y:y+tile, x:x+tile] = self._clahe_high.apply(patch)
-                else:
-                    result[y:y+tile, x:x+tile] = self._clahe_mid.apply(patch)
+                clahe = self._clahe_low if np.std(patch) < thresh else self._clahe_normal
+                result[y:y+tile, x:x+tile] = clahe.apply(patch)
         return result
 
-    # ------------------------------------------
-    # 构建/重建 FLANN 索引
-    # ------------------------------------------
     @staticmethod
     def _create_flann(descriptors):
         index_params = dict(algorithm=1, trees=5)
@@ -325,12 +267,9 @@ class SIFTMapTracker:
         flann.train()
         return flann
 
-    # ------------------------------------------
-    # 切换到局部搜索模式
-    # ------------------------------------------
+    # ---- 局部/全局搜索切换 ----
     def _switch_to_local(self, cx, cy):
         """以 (cx, cy) 为中心，提取半径内的特征点，重建局部 FLANN"""
-        # 静止优化：中心未显著移动时跳过重建（节省 ~5-15ms/帧）
         if self.using_local and hasattr(self, '_local_center'):
             dx = abs(cx - self._local_center[0])
             dy = abs(cy - self._local_center[1])
@@ -341,10 +280,8 @@ class SIFTMapTracker:
         dy = np.abs(self.kp_coords[:, 1] - cy)
         mask = (dx < r) & (dy < r)
         indices = np.where(mask)[0]
-
-        if len(indices) < 20:   # 特征点太少不值得切局部
+        if len(indices) < 20:
             return
-
         self.kp_local = [self.kp_big_all[i] for i in indices]
         self.des_local = self.des_big_all[indices]
         self.flann_local = self._create_flann(self.des_local)
@@ -352,47 +289,18 @@ class SIFTMapTracker:
         self.local_fail_count = 0
         self._local_center = (cx, cy)
 
-        # 一并构建 ORB 局部描述子
-        if self.orb is not None:
-            try:
-                local_gray_kps = [cv2.KeyPoint(x=self.kp_coords[i][0], y=self.kp_coords[i][1], size=31)
-                                  for i in indices]
-                # ORB 在已知位置上 compute 描述子（用大地图灰度图的局部区域）
-                # 但大地图灰度图未持久化，改用 ORB detectAndCompute 在局部区域
-                # 简化方案：用 SIFT 局部关键点位置直接构建 ORB 的搜索空间标记
-                self.orb_local_kp = local_gray_kps
-                self.orb_local_des = None  # 延迟到实际 ORB 匹配时再计算
-            except Exception:
-                self.orb_local_kp = None
-                self.orb_local_des = None
-
-    # ------------------------------------------
-    # 回退到全局搜索模式
-    # ------------------------------------------
     def _switch_to_global(self):
-        """回退全局（全局 FLANN 常驻，无需重建）"""
         self.using_local = False
         self.local_fail_count = 0
         self._local_center = None
-        print(f"🌍 已切换到 全局 搜索模式 | 特征点: {len(self.kp_big_all)} | lost: {self.lost_frames}")
 
-    # ------------------------------------------
-    # 坐标锁定模式
-    # ------------------------------------------
+    # ---- 坐标锁定 ----
     def set_coord_lock(self, enabled):
-        """开启/关闭坐标锁定模式"""
-        if enabled:
-            if len(self.kp_coords) == 0:
-                return False
-            print(f"🔒 坐标锁定已启用 (历史{self._lock_history_size}均值±{self._lock_search_radius})")
-        else:
-            print(f"🔓 坐标锁定已关闭，恢复正常搜索")
         self.coord_lock_enabled = enabled
         return True
 
     @staticmethod
     def _compute_lock_anchor(pos_deque, n=10):
-        """从坐标历史 deque 计算最近 N 个坐标的平均值"""
         if pos_deque is None or len(pos_deque) < n:
             return None
         recent = list(pos_deque)[-n:]
@@ -401,123 +309,69 @@ class SIFTMapTracker:
         return int(ax), int(ay)
 
     def _match_locked(self, minimap_bgr, anchor_x, anchor_y):
-        """
-        锁定模式下的匹配：以 anchor 为中心，限定搜索范围 ±RADIUS。
-        失败则逐步放宽阈值重试，最多 MAX_RETRIES 次。
-        返回与 _match_impl 相同格式的 dict
-        """
+        """锁定模式匹配：复用 _sift_match_region，逐步放宽阈值"""
         t_start = self._perf_time.perf_counter()
         r = self._lock_search_radius
 
         minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
         minimap_gray = self._adaptive_clahe(minimap_gray)
-        h_mm, w_mm = minimap_gray.shape[:2]
-        circ_mask = self._get_circular_mask(h_mm, w_mm)
-        kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, circ_mask)
+        kp_mini, des_mini = self._extract_minimap_features(minimap_gray)
+        if des_mini is None:
+            return self._make_result(False, t_start=t_start, _locked_state="NO_FEATURES")
 
-        if des_mini is None or len(kp_mini) < 2:
-            return self._make_locked_result(False, None, None, t_start, "NO_FEATURES")
-
-        # 在全局特征点中筛选锚点范围内的点
+        # 筛选锚点范围内的特征点
         dx = np.abs(self.kp_coords[:, 0] - anchor_x)
         dy = np.abs(self.kp_coords[:, 1] - anchor_y)
-        mask = (dx < r) & (dy < r)
-        indices = np.where(mask)[0]
-
+        indices = np.where((dx < r) & (dy < r))[0]
         if len(indices) < 5:
-            return self._make_locked_result(False, None, None, t_start, "FEW_KPTS")
+            return self._make_result(False, t_start=t_start, _locked_state="FEW_KPTS")
 
         locked_kp = [self.kp_big_all[i] for i in indices]
         locked_des = self.des_big_all[indices]
         locked_flann = self._create_flann(locked_des)
 
-        # 逐步放宽阈值的重试策略
-        retry_ratios = [0.9, 0.8, 0.75, 0.7, 0.65]
-        retry_min_matches = [5, 4, 4, 3, 3]
+        # 逐步放宽阈值重试
+        for ratio, min_m in [(0.85, 5), (0.78, 4), (0.70, 3)]:
+            result = self._sift_match_region(
+                kp_mini, des_mini, minimap_gray.shape,
+                locked_kp, locked_flann, ratio, min_m)
+            if result is not None:
+                tx, ty, inlier_count, quality = result
+                if abs(tx - anchor_x) <= r * 1.5 and abs(ty - anchor_y) <= r * 1.5:
+                    angle, stopped = self._arrow_dir.update(tx, ty)
+                    self._last_arrow_angle = angle
+                    self._last_arrow_stopped = stopped
+                    return self._make_result(True, tx, ty, t_start=t_start,
+                                             arrow_angle=angle, arrow_stopped=stopped,
+                                             match_count=inlier_count, match_quality=quality,
+                                             _locked_state="LOCKED")
 
-        for attempt in range(min(self._lock_max_retries, len(retry_ratios))):
-            ratio = retry_ratios[attempt] if attempt < len(retry_ratios) else 0.65
-            min_match = retry_min_matches[attempt] if attempt < len(retry_min_matches) else 3
+        return self._make_result(False, t_start=t_start, _locked_state="LOCK_FAIL")
 
-            try:
-                matches = locked_flann.knnMatch(des_mini, k=2)
-            except cv2.error:
-                continue
-
-            good = []
-            for m_n in matches:
-                if len(m_n) == 2:
-                    m, n = m_n
-                    if m.distance < ratio * n.distance:
-                        good.append(m)
-
-            if len(good) >= min_match:
-                src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                dst_pts = np.float32([locked_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
-                if M is not None:
-                    inlier_count = int(mask.sum()) if mask is not None else 0
-                    if inlier_count >= min_match:
-                        # Homography 缩放合理性检查
-                        sx = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
-                        sy = np.sqrt(M[0, 1] ** 2 + M[1, 1] ** 2)
-                        avg_scale = (sx + sy) / 2
-                        max_scale = getattr(config, 'SIFT_MAX_HOMOGRAPHY_SCALE', 8.0)
-                        if avg_scale > max_scale or avg_scale < 1.0 / max_scale:
-                            continue
-                        h, w = minimap_gray.shape
-                        ref_x, ref_y = w / 2.0, h / 2.0
-
-                        center_pt = np.float32([[[ref_x, ref_y]]])
-                        dst_center = cv2.perspectiveTransform(center_pt, M)
-                        tx = int(dst_center[0][0][0])
-                        ty = int(dst_center[0][0][1])
-
-                        if abs(tx - anchor_x) <= r * 1.5 and abs(ty - anchor_y) <= r * 1.5:
-                            if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
-                                angle, stopped = self._arrow_dir.update(tx, ty)
-                                self._last_arrow_angle = angle
-                                self._last_arrow_stopped = stopped
-                                return self._make_locked_result(True, tx, ty, t_start, "LOCKED", arrow_angle=angle,
-                                                           arrow_stopped=stopped, retry=attempt + 1)
-
-        # 所有重试都失败
-        return self._make_locked_result(False, None, None, t_start, "LOCK_FAIL")
-
-    def _make_locked_result(self, found, cx, cy, t_start, state, arrow_angle=None, arrow_stopped=True, retry=0):
-        """构造锁定模式的返回字典"""
-        t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000
-        self._frame_times.append(t_elapsed)
-        if len(self._frame_times) >= 60:
-            avg = sum(self._frame_times) / len(self._frame_times)
-            print(f"[🔒锁定] 平均耗时: {avg:.1f}ms | state: {state} | retries: {retry}")
-            self._frame_times.clear()
+    def _make_result(self, found, cx=None, cy=None, t_start=None,
+                     arrow_angle=None, arrow_stopped=True, is_inertial=False,
+                     match_count=0, match_quality=0.0, _locked_state=''):
+        """统一构造返回字典"""
+        if t_start is not None:
+            t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000
+            self._frame_times.append(t_elapsed)
+            if len(self._frame_times) >= 60:
+                avg = sum(self._frame_times) / len(self._frame_times)
+                self._frame_times.clear()
         return {
-            'found': found,
-            'center_x': cx,
-            'center_y': cy,
-            'arrow_angle': arrow_angle,
-            'arrow_stopped': arrow_stopped,
-            'is_inertial': not found,
-            'match_count': 0,
-            'map_width': self.map_width,
-            'map_height': self.map_height,
-            '_locked_state': state,
+            'found': found, 'center_x': cx, 'center_y': cy,
+            'arrow_angle': arrow_angle, 'arrow_stopped': arrow_stopped,
+            'is_inertial': is_inertial, 'match_count': match_count,
+            'match_quality': match_quality,
+            'map_width': self.map_width, 'map_height': self.map_height,
+            '_locked_state': _locked_state,
         }
 
     @staticmethod
     def _draw_arrow_marker(img_bgr, cx, cy, size=None, angle=0, stopped=False):
-        """
-        在地图上绘制玩家方向标记。
-        stopped=True 时画圆点，否则画方向箭头。
-        angle: 旋转角度（度），0=朝上，顺时针增加
-        """
         if size is None:
             size = 12
-
         overlay = img_bgr.copy()
-
         if stopped:
             r = int(size * 0.6)
             cv2.circle(overlay, (int(cx), int(cy)), r, (48, 182, 254), -1)
@@ -528,164 +382,53 @@ class SIFTMapTracker:
                 [cx - size * 0.6, cy + size * 0.7],
                 [cx + size * 0.6, cy + size * 0.7],
             ], dtype=np.float64)
-
             if angle != 0:
                 rad = math.radians(angle)
-                cos_a = math.cos(rad)
-                sin_a = math.sin(rad)
+                cos_a, sin_a = math.cos(rad), math.sin(rad)
                 centered = pts - np.array([cx, cy])
                 rot_mat = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-                rotated = (rot_mat @ centered.T).T + np.array([cx, cy])
-                pts = rotated.astype(np.int32)
+                pts = ((rot_mat @ centered.T).T + np.array([cx, cy])).astype(np.int32)
             else:
                 pts = pts.astype(np.int32)
-
             cv2.fillPoly(overlay, [pts], (48, 182, 254))
             cv2.polylines(overlay, [pts], True, (255, 255, 255), 1)
-
         cv2.addWeighted(overlay, 0.85, img_bgr, 0.15, 0, img_bgr)
 
     @staticmethod
     def _paste_arrow_patch(img_bgr, cx, cy, arrow_patch, offset_x, offset_y, scale=1.0):
-        """将从小地图抠出的箭头图像块(BGRA)贴到目标图像上"""
         if arrow_patch is None or arrow_patch.size == 0:
             return
-
         ph, pw = arrow_patch.shape[:2]
-
         if scale != 1.0:
-            new_w = max(1, int(pw * scale))
-            new_h = max(1, int(ph * scale))
+            new_w, new_h = max(1, int(pw * scale)), max(1, int(ph * scale))
             arrow_patch = cv2.resize(arrow_patch, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            offset_x = int(offset_x * scale)
-            offset_y = int(offset_y * scale)
+            offset_x, offset_y = int(offset_x * scale), int(offset_y * scale)
             ph, pw = new_w, new_h
-
-        paste_x = cx - offset_x
-        paste_y = cy - offset_y
-
+        paste_x, paste_y = cx - offset_x, cy - offset_y
         dh, dw = img_bgr.shape[:2]
-
-        sx1 = max(0, -paste_x)
-        sy1 = max(0, -paste_y)
-        dx1 = max(0, paste_x)
-        dy1 = max(0, paste_y)
-        dx2 = min(dw, paste_x + pw)
-        dy2 = min(dh, paste_y + ph)
-        sx2 = sx1 + (dx2 - dx1)
-        sy2 = sy1 + (dy2 - dy1)
-
+        sx1, sy1 = max(0, -paste_x), max(0, -paste_y)
+        dx1, dy1 = max(0, paste_x), max(0, paste_y)
+        dx2, dy2 = min(dw, paste_x + pw), min(dh, paste_y + ph)
+        sx2, sy2 = sx1 + (dx2 - dx1), sy1 + (dy2 - dy1)
         if dx2 <= dx1 or dy2 <= dy1 or sx2 <= sx1 or sy2 <= sy1:
             return
-
         roi = img_bgr[dy1:dy2, dx1:dx2]
         patch_region = arrow_patch[sy1:sy2, sx1:sx2]
-
         bgr_part = patch_region[:, :, :3]
         alpha_part = patch_region[:, :, 3:4].astype(np.float32) / 255.0
-
         blended = (bgr_part.astype(np.float32) * alpha_part +
                    roi.astype(np.float32) * (1.0 - alpha_part))
         img_bgr[dy1:dy2, dx1:dx2] = blended.astype(np.uint8)
 
-    # ------------------------------------------
-    # ORB 快速备份匹配（局部模式下 SIFT 失败时的候补）
-    # ------------------------------------------
-    def _orb_local_match(self, minimap_bgr, minimap_gray):
-        """
-        ORB 备份：在 SIFT 局部匹配失败后尝试 ORB 匹配。
-        比 SIFT 快 ~3x，精度略低但足以维持跟踪连续性。
-        返回 (tx, ty) 或 None。
-        """
-        if not self.using_local or self.orb is None:
-            return None
-
-        try:
-            h_mm, w_mm = minimap_gray.shape[:2]
-            circ_mask = self._get_circular_mask(h_mm, w_mm)
-            kp_orb_mini, des_orb_mini = self.orb.detectAndCompute(minimap_gray, circ_mask)
-            if des_orb_mini is None or len(kp_orb_mini) < 3:
-                return None
-
-            # 在局部区域的大地图上做 ORB 检测
-            if self.last_x is None or self.last_y is None:
-                return None
-            r = self.SEARCH_RADIUS
-            lx, ly = self.last_x, self.last_y
-            x1 = max(0, lx - r)
-            y1 = max(0, ly - r)
-            x2 = min(self.map_width, lx + r)
-            y2 = min(self.map_height, ly + r)
-
-            # 大地图局部灰度（从预存灰度大地图裁剪）
-            local_gray = self._logic_map_gray[y1:y2, x1:x2]
-            local_gray = self._adaptive_clahe(local_gray)
-
-            kp_orb_map, des_orb_map = self.orb.detectAndCompute(local_gray, None)
-            if des_orb_map is None or len(kp_orb_map) < 5:
-                return None
-
-            matches = self.orb_bf.knnMatch(des_orb_mini, des_orb_map, k=2)
-            good = []
-            for m_n in matches:
-                if len(m_n) == 2:
-                    m, n = m_n
-                    if m.distance < 0.75 * n.distance:
-                        good.append(m)
-
-            if len(good) < 5:
-                return None
-
-            src_pts = np.float32([kp_orb_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-            dst_pts = np.float32([kp_orb_map[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 10.0)
-            if M is None:
-                return None
-            inlier_count = int(mask.sum()) if mask is not None else 0
-            if inlier_count < 4:
-                return None
-
-            # 缩放合理性
-            sx_h = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
-            sy_h = np.sqrt(M[0, 1] ** 2 + M[1, 1] ** 2)
-            avg_scale = (sx_h + sy_h) / 2
-            if avg_scale > 5.0 or avg_scale < 0.2:
-                return None
-
-            center_pt = np.float32([[[w_mm / 2.0, h_mm / 2.0]]])
-            dst_center = cv2.perspectiveTransform(center_pt, M)
-            tx = int(dst_center[0][0][0]) + x1  # 局部→全局坐标
-            ty = int(dst_center[0][0][1]) + y1
-
-            if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
-                # 跳变检查（使用与主匹配相同的阈值）
-                jump = abs(tx - lx) + abs(ty - ly)
-                if jump < self.JUMP_THRESHOLD:
-                    print(f"[ORB备份] ✅ 匹配成功 ({tx},{ty}) inliers={inlier_count}")
-                    return tx, ty
-        except Exception as e:
-            pass
-        return None
-
-    # ------------------------------------------
-    # 核心匹配（两轮搜索 + 跳变过滤）
-    # ------------------------------------------
-    def match(self, minimap_bgr):
-        with self._lock:
-            return self._match_impl(minimap_bgr)
-
+    # ---- 工具方法 ----
     @staticmethod
     def _make_circular_mask(h, w):
-        """为圆形小地图生成圆形掩码，裁掉四角噪声区域"""
         mask = np.zeros((h, w), dtype=np.uint8)
         cx, cy = w // 2, h // 2
-        r = min(cx, cy) - 2  # 留2px安全边距
-        cv2.circle(mask, (cx, cy), r, 255, -1)
+        cv2.circle(mask, (cx, cy), min(cx, cy) - 2, 255, -1)
         return mask
 
     def _get_circular_mask(self, h, w):
-        """带缓存的圆形掩码（小地图尺寸校准后固定，避免每帧重建）"""
         key = (h, w)
         if not hasattr(self, '_circ_mask_cache'):
             self._circ_mask_cache = {}
@@ -696,19 +439,130 @@ class SIFTMapTracker:
         self._circ_mask_cache[key] = mask
         return mask
 
-    def _enhance_low_texture(self, gray):
-        """对超低纹理帧（海面/天空）进行锐化增强，提取更多 SIFT 特征"""
-        blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
-        sharpened = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
-        return sharpened
+    def _enhance_for_texture(self, gray, texture_std):
+        """统一的纹理增强：根据 texture_std 连续决定增强强度"""
+        if texture_std < 15:
+            # 超低纹理(海面/天空)：双边保边 + 高CLAHE + 强锐化
+            filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+            enhanced = self._clahe_low.apply(filtered)
+            blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
+            return cv2.addWeighted(enhanced, 2.0, blurred, -1.0, 0)
+        elif texture_std < 30:
+            # 低纹理(雪地/草坪)：温和锐化
+            blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
+            return cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+        return gray
 
-    def _enhance_low_texture_aggressive(self, gray):
-        """更激进的低纹理增强：双边滤波保边 + 超高 CLAHE + 锐化（特征重试用）"""
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-        enhanced = self._clahe_very_low.apply(filtered)
-        blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
-        sharpened = cv2.addWeighted(enhanced, 2.0, blurred, -1.0, 0)
-        return sharpened
+    def _extract_minimap_features(self, minimap_gray):
+        """提取小地图特征点（带圆形掩码），返回 (kp, des)"""
+        h_mm, w_mm = minimap_gray.shape[:2]
+        circ_mask = self._get_circular_mask(h_mm, w_mm)
+        kp, des = self.sift.detectAndCompute(minimap_gray, circ_mask)
+        if des is None or len(kp) < 2:
+            return None, None
+        return kp, des
+
+    def _sift_match_region(self, kp_mini, des_mini, mm_shape,
+                           region_kp, region_flann, ratio, min_match):
+        """
+        通用 SIFT 区域匹配。
+        返回 (tx, ty, inlier_count, quality) 或 None。
+        """
+        try:
+            matches = region_flann.knnMatch(des_mini, k=2)
+        except cv2.error:
+            return None
+
+        good = [m for m_n in matches if len(m_n) == 2
+                for m, n in [m_n] if m.distance < ratio * n.distance]
+
+        if len(good) < min_match:
+            return None
+
+        src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([region_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
+        if M is None:
+            return None
+
+        inlier_count = int(mask.sum()) if mask is not None else 0
+        if inlier_count < min_match:
+            return None
+
+        # 缩放合理性
+        sx = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
+        sy = np.sqrt(M[0, 1] ** 2 + M[1, 1] ** 2)
+        avg_scale = (sx + sy) / 2
+        max_scale = getattr(config, 'SIFT_MAX_HOMOGRAPHY_SCALE', 8.0)
+        if avg_scale > max_scale or avg_scale < 1.0 / max_scale:
+            return None
+
+        h, w = mm_shape[:2]
+        center_pt = np.float32([[[w / 2.0, h / 2.0]]])
+        dst_center = cv2.perspectiveTransform(center_pt, M)
+        tx, ty = int(dst_center[0][0][0]), int(dst_center[0][0][1])
+
+        if not (0 <= tx < self.map_width and 0 <= ty < self.map_height):
+            return None
+
+        inlier_ratio = inlier_count / max(len(good), 1)
+        count_conf = min(1.0, inlier_count / 12.0)
+        quality = min(1.0, inlier_ratio * count_conf)
+        return tx, ty, inlier_count, quality
+
+    def _orb_nearby_match(self, minimap_gray, cx_hint, cy_hint, radius):
+        """ORB 附近搜索：在 (cx_hint, cy_hint) 周围 radius 内做 ORB 匹配"""
+        if self.orb is None:
+            return None
+        h_mm, w_mm = minimap_gray.shape[:2]
+        circ_mask = self._get_circular_mask(h_mm, w_mm)
+        kp_orb_mini, des_orb_mini = self.orb.detectAndCompute(minimap_gray, circ_mask)
+        if des_orb_mini is None or len(kp_orb_mini) < 3:
+            return None
+
+        x1 = max(0, cx_hint - radius)
+        y1 = max(0, cy_hint - radius)
+        x2 = min(self.map_width, cx_hint + radius)
+        y2 = min(self.map_height, cy_hint + radius)
+
+        local_gray = self._logic_map_gray[y1:y2, x1:x2]
+        local_gray = self._adaptive_clahe(local_gray)
+        kp_orb_map, des_orb_map = self.orb.detectAndCompute(local_gray, None)
+        if des_orb_map is None or len(kp_orb_map) < 5:
+            return None
+
+        matches = self.orb_bf.knnMatch(des_orb_mini, des_orb_map, k=2)
+        good = [m for m_n in matches if len(m_n) == 2
+                for m, n in [m_n] if m.distance < 0.75 * n.distance]
+        if len(good) < 5:
+            return None
+
+        src_pts = np.float32([kp_orb_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp_orb_map[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 10.0)
+        if M is None or (int(mask.sum()) if mask is not None else 0) < 4:
+            return None
+
+        sx_h = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
+        sy_h = np.sqrt(M[0, 1] ** 2 + M[1, 1] ** 2)
+        if not (0.2 < (sx_h + sy_h) / 2 < 5.0):
+            return None
+
+        center_pt = np.float32([[[w_mm / 2.0, h_mm / 2.0]]])
+        dst_center = cv2.perspectiveTransform(center_pt, M)
+        tx = int(dst_center[0][0][0]) + x1
+        ty = int(dst_center[0][0][1]) + y1
+
+        if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
+            jump = abs(tx - cx_hint) + abs(ty - cy_hint)
+            if jump < self.JUMP_THRESHOLD:
+                return tx, ty
+        return None
+
+    # ---- 核心匹配 ----
+    def match(self, minimap_bgr):
+        with self._lock:
+            return self._match_impl(minimap_bgr)
 
     def _match_impl(self, minimap_bgr):
         t_start = self._perf_time.perf_counter()
@@ -716,172 +570,107 @@ class SIFTMapTracker:
         center_x, center_y = None, None
         arrow_angle = None
         is_inertial = False
-        match_quality = 0.0  # 0-1 匹配质量
-        self._sift_confused = False  # 每帧重置
+        match_quality = 0.0
 
         minimap_gray_raw = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
-        texture_std = np.std(minimap_gray_raw)
-        is_low_texture = texture_std < self._clahe_low_thresh
-        is_very_low_texture = texture_std < self._clahe_very_low_thresh
+        texture_std = float(np.std(minimap_gray_raw))
 
+        # 自适应 CLAHE
         minimap_gray = self._adaptive_clahe(minimap_gray_raw)
 
-        # 超低纹理（海面/天空）：额外锐化增强
-        if is_very_low_texture:
-            minimap_gray = self._enhance_low_texture(minimap_gray)
+        # 统一纹理增强
+        minimap_gray = self._enhance_for_texture(minimap_gray, texture_std)
 
-        # 圆形 mask：过滤圆形小地图四角噪声特征点
-        h_mm, w_mm = minimap_gray.shape[:2]
-        circ_mask = self._get_circular_mask(h_mm, w_mm)
-        kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, circ_mask)
+        # 提取特征
+        kp_mini, des_mini = self._extract_minimap_features(minimap_gray)
 
         # 超低纹理 + 特征过少 → 用更激进的预处理重试
-        if is_very_low_texture and (des_mini is None or len(kp_mini) < 15):
-            enhanced = self._enhance_low_texture_aggressive(minimap_gray_raw)
-            kp_retry, des_retry = self.sift.detectAndCompute(enhanced, circ_mask)
+        if texture_std < 15 and (des_mini is None or len(kp_mini) < 15):
+            enhanced = self._enhance_for_texture(minimap_gray_raw, texture_std=5)
+            kp_retry, des_retry = self._extract_minimap_features(enhanced)
             if des_retry is not None and len(kp_retry) > (len(kp_mini) if kp_mini is not None else 0):
                 kp_mini, des_mini = kp_retry, des_retry
 
-        # 低纹理场景动态放宽匹配参数
-        eff_match_ratio = (getattr(config, 'SIFT_MATCH_RATIO_LOW_TEXTURE', 0.88)
-                           if is_low_texture else config.SIFT_MATCH_RATIO)
-        eff_min_match = (getattr(config, 'SIFT_MIN_MATCH_LOW_TEXTURE', 3)
-                         if is_low_texture else config.SIFT_MIN_MATCH_COUNT)
+        # 动态匹配参数：按 texture_std 连续插值
+        t = max(0.0, min(1.0, (texture_std - 15) / 15))  # 0 at std=15, 1 at std=30
+        eff_match_ratio = 0.88 - t * 0.06  # 0.88 → 0.82
+        eff_min_match = 3 if texture_std < 30 else config.SIFT_MIN_MATCH_COUNT
 
-        if des_mini is not None and len(kp_mini) >= 2:
-
+        if des_mini is not None:
+            # ---- 第一轮：正常 SIFT 匹配（局部 → 全局回退）----
             for search_round in range(2):
-
                 if search_round == 0 and self.using_local:
-                    current_kp = self.kp_local
-                    current_flann = self.flann_local
-                elif search_round == 0 and not self.using_local:
-                    current_kp = list(self.kp_big_all)
-                    current_flann = self.flann_global
+                    current_kp, current_flann = self.kp_local, self.flann_local
+                elif search_round == 0:
+                    current_kp, current_flann = list(self.kp_big_all), self.flann_global
                 else:
                     if not self.using_local:
                         break
-                    current_kp = list(self.kp_big_all)
-                    current_flann = self.flann_global
+                    current_kp, current_flann = list(self.kp_big_all), self.flann_global
 
-                try:
-                    matches = current_flann.knnMatch(des_mini, k=2)
-                except cv2.error:
-                    matches = []
+                result = self._sift_match_region(
+                    kp_mini, des_mini, minimap_gray.shape,
+                    current_kp, current_flann, eff_match_ratio, eff_min_match)
 
-                good = []
-                for m_n in matches:
-                    if len(m_n) == 2:
-                        m, n = m_n
-                        if m.distance < eff_match_ratio * n.distance:
-                            good.append(m)
-
-                if len(good) >= eff_min_match:
-                    src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                    dst_pts = np.float32([current_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-
-                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
-
-                    if M is not None:
-                        inlier_count = int(mask.sum()) if mask is not None else 0
-                        if inlier_count < eff_min_match:
+                if result is not None:
+                    tx, ty, inlier_count, quality = result
+                    if self.last_x is not None:
+                        max_jump = self.JUMP_THRESHOLD if search_round == 0 else self.JUMP_THRESHOLD * 2
+                        if abs(tx - self.last_x) + abs(ty - self.last_y) >= max_jump:
                             continue
+                    found, center_x, center_y, match_quality = True, tx, ty, quality
+                    break
 
-                        # Homography 缩放合理性检查（防止UI误匹配）
-                        sx = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
-                        sy = np.sqrt(M[0, 1] ** 2 + M[1, 1] ** 2)
-                        avg_scale = (sx + sy) / 2
-                        max_scale = getattr(config, 'SIFT_MAX_HOMOGRAPHY_SCALE', 8.0)
-                        if avg_scale > max_scale or avg_scale < 1.0 / max_scale:
-                            self._sift_confused = True  # 几何异常 → 标记混乱
-                            continue
+            # ---- 第二轮：附近搜索（SIFT 失败时，在上次位置周围扩大范围重试）----
+            if not found and self.last_x is not None:
+                nr = self.NEARBY_SEARCH_RADIUS
+                dx = np.abs(self.kp_coords[:, 0] - self.last_x)
+                dy = np.abs(self.kp_coords[:, 1] - self.last_y)
+                indices = np.where((dx < nr) & (dy < nr))[0]
+                if len(indices) >= 10:
+                    nearby_kp = [self.kp_big_all[i] for i in indices]
+                    nearby_des = self.des_big_all[indices]
+                    nearby_flann = self._create_flann(nearby_des)
+                    # 用放宽的阈值
+                    result = self._sift_match_region(
+                        kp_mini, des_mini, minimap_gray.shape,
+                        nearby_kp, nearby_flann, 0.90, 3)
+                    if result is not None:
+                        tx, ty, inlier_count, quality = result
+                        if abs(tx - self.last_x) + abs(ty - self.last_y) < self.JUMP_THRESHOLD * 1.5:
+                            found, center_x, center_y = True, tx, ty
+                            match_quality = quality * 0.8  # 降低附近搜索的置信度
 
-                        h, w = minimap_gray.shape
-                        ref_x, ref_y = w / 2.0, h / 2.0
+                # ORB 兜底
+                if not found:
+                    orb_result = self._orb_nearby_match(
+                        minimap_gray, self.last_x, self.last_y, nr)
+                    if orb_result is not None:
+                        found = True
+                        center_x, center_y = orb_result
+                        match_quality = 0.4
 
-                        center_pt = np.float32([[[ref_x, ref_y]]])
-                        dst_center = cv2.perspectiveTransform(center_pt, M)
-                        tx = int(dst_center[0][0][0])
-                        ty = int(dst_center[0][0][1])
-
-                        # 置信度评分：综合 inlier 率 + 绝对数量
-                        # 雪地/低纹理场景下 inlier 极少时（5~8），inlier_ratio 可能接近1.0
-                        # 但绝对数量太少意味着匹配本身噪声很大，需要额外惩罚
-                        inlier_ratio = inlier_count / max(len(good), 1)
-                        count_confidence = min(1.0, inlier_count / 12.0)  # <12个inlier时降低置信度
-                        match_quality = min(1.0, inlier_ratio * count_confidence)
-
-                        if 0 <= tx < self.map_width and 0 <= ty < self.map_height:
-                            if self.last_x is not None:
-                                jump = abs(tx - self.last_x) + abs(ty - self.last_y)
-                                # 局部搜索用更紧的阈值，全局回退放宽但仍然有限
-                                max_jump = self.JUMP_THRESHOLD if search_round == 0 else self.JUMP_THRESHOLD * 2
-                                if jump < max_jump:
-                                    found = True
-                                    center_x, center_y = tx, ty
-                                    break
-                                else:
-                                    continue
-                            else:
-                                found = True
-                                center_x, center_y = tx, ty
-                                break
-
-        # --- 状态更新 ---
-        if found:
-            self.last_x = center_x
-            self.last_y = center_y
+        # ---- 状态更新 ----
+        if found and not is_inertial:
+            self.last_x, self.last_y = center_x, center_y
             self.lost_frames = 0
             self.local_fail_count = 0
             self._switch_to_local(center_x, center_y)
-
         else:
-            # === ORB 快速备份：SIFT 失败 + 局部模式 → ORB 尝试挽救 ===
-            if (not found and self.using_local and self.orb is not None
-                    and des_mini is not None and len(kp_mini) >= 2):
-                orb_result = self._orb_local_match(minimap_bgr, minimap_gray)
-                if orb_result is not None:
-                    found = True
-                    center_x, center_y = orb_result
-                    match_quality = 0.5  # ORB 匹配质量标记为中等
-                    self.last_x = center_x
-                    self.last_y = center_y
-                    self.lost_frames = 0
-                    self.local_fail_count = 0
-                    self._switch_to_local(center_x, center_y)
-
-            if not found:
-                self.lost_frames += 1
-
+            self.lost_frames += 1
+            if self.using_local:
+                self.local_fail_count += 1
+                if self.local_fail_count >= self.LOCAL_FAIL_LIMIT:
+                    self._switch_to_global()
+            if self.last_x is not None and self.lost_frames <= config.MAX_LOST_FRAMES:
+                found, center_x, center_y = True, self.last_x, self.last_y
+                is_inertial = True
+            elif self.lost_frames > config.MAX_LOST_FRAMES:
+                self.last_x = self.last_y = None
                 if self.using_local:
-                    self.local_fail_count += 1
-                    if self.local_fail_count >= self.LOCAL_FAIL_LIMIT:
-                        self._switch_to_global()
+                    self._switch_to_global()
 
-                if self.last_x is not None and self.lost_frames <= config.MAX_LOST_FRAMES:
-                    found = True
-                    center_x = self.last_x
-                    center_y = self.last_y
-                    is_inertial = True
-                elif self.lost_frames > config.MAX_LOST_FRAMES:
-                    self.last_x = None
-                    self.last_y = None
-                    if self.using_local:
-                        self._switch_to_global()
-
-        # === 性能统计 ===
-        t_elapsed = (self._perf_time.perf_counter() - t_start) * 1000
-        self._frame_times.append(t_elapsed)
-        if len(self._frame_times) >= 60:
-            avg = sum(self._frame_times) / len(self._frame_times)
-            mode = "局部" if self.using_local else "全局"
-            feat = len(self.kp_local) if self.using_local else len(self.kp_big_all)
-            print(f"[{mode}模式] 平均耗时: {avg:.1f}ms | "
-                  f"特征点: {feat} | lost: {self.lost_frames} | "
-                  f"fps: {1000/avg:.1f}")
-            self._frame_times.clear()
-
-        # ===== 箭头方向：纯坐标驱动 =====
+        # 箭头方向
         arrow_stopped = True
         if found and not is_inertial:
             arrow_angle, arrow_stopped = self._arrow_dir.update(center_x, center_y)
@@ -893,18 +682,11 @@ class SIFTMapTracker:
         self._last_arrow_angle = arrow_angle
         self._last_arrow_stopped = arrow_stopped
 
-        return {
-            'found': found,
-            'center_x': center_x,
-            'center_y': center_y,
-            'arrow_angle': arrow_angle,
-            'arrow_stopped': arrow_stopped,
-            'is_inertial': is_inertial,
-            'match_count': inlier_count,
-            'match_quality': match_quality,
-            'map_width': self.map_width,
-            'map_height': self.map_height,
-        }
+        return self._make_result(
+            found, center_x, center_y, t_start=t_start,
+            arrow_angle=arrow_angle, arrow_stopped=arrow_stopped,
+            is_inertial=is_inertial, match_count=0,
+            match_quality=match_quality)
 
 
 class LoFTRMapTracker:
