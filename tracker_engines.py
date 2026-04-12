@@ -200,6 +200,7 @@ class SIFTMapTracker:
         self.last_y = None
         self.lost_frames = 0
         self._sift_confused = False
+        self._ever_found = False   # 曾经成功定位过？冷启动只在首次启动时允许
 
         # 状态冻结
         self._frozen = False
@@ -898,9 +899,10 @@ class SIFTMapTracker:
                             found, center_x, center_y = True, *ecc_result
                             match_quality = 0.3
 
-        # ---- 冷启动低纹理场景兜底（海洋/大片裸地，last_x 为 None）----
-        # 只在小地图自身表现出低纹理时才尝试，防止普通场景 SIFT 首帧失败时误匹配
-        if not found and self.last_x is None and texture_std < 45:
+        # ---- 冷启动低纹理场景兜底（海洋/大片裸地）----
+        # 仅当从未成功定位过时才触发（真正的冷启动），
+        # 丢位置后的重定位走正常 SIFT 全局搜索，不走此分支，避免暂停画面误匹配
+        if not found and not self._ever_found and texture_std < 45:
             cold_result = self._ocean_cold_start(minimap_gray_raw)
             if cold_result is not None:
                 found, center_x, center_y = True, cold_result[0], cold_result[1]
@@ -922,6 +924,7 @@ class SIFTMapTracker:
             self.last_x, self.last_y = center_x, center_y
             self.lost_frames = 0
             self.local_fail_count = 0
+            self._ever_found = True   # 标记已成功定位，冷启动不再触发
             self._switch_to_local(center_x, center_y)
         else:
             self.lost_frames += 1
