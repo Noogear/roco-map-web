@@ -47,6 +47,7 @@ const TrackerCore = (() => {
         wsManualClose: false,  // 标记是否为手动断开（抑制重复日志）
         captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
         lastWasUpdate: false, // logUpdate 状态标记
+        nullBlobCount: 0,     // 连续 null blob 计数，用于检测视频流问题
     };
 
     // ==================== 内部工具 ====================
@@ -461,6 +462,14 @@ const TrackerCore = (() => {
             var c = S.captureCanvas;
             if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
+            if (!ctx) {
+                // context 丢失（内存压力等），强制重建 canvas
+                S.captureCanvas = document.createElement('canvas');
+                c = S.captureCanvas;
+                c.width = sz; c.height = sz;
+                ctx = c.getContext('2d');
+                if (!ctx) return null;
+            }
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
             return c.toDataURL('image/jpeg', 0.80);
         },
@@ -490,6 +499,14 @@ const TrackerCore = (() => {
             var c = S.captureCanvas;
             if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
             var ctx = c.getContext('2d');
+            if (!ctx) {
+                // context 丢失，强制重建
+                S.captureCanvas = document.createElement('canvas');
+                c = S.captureCanvas;
+                c.width = sz; c.height = sz;
+                ctx = c.getContext('2d');
+                if (!ctx) return Promise.resolve(null);
+            }
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
 
             return new Promise(function(resolve) {
@@ -592,17 +609,7 @@ const TrackerCore = (() => {
                     });
 
                     // 接收后端二进制响应: [4字节大端JSON长度][JSON][JPEG图片]
-                    sock.on('result', function(data) {
-                        // 标准化为 ArrayBuffer：Socket.IO 不同版本/浏览器可能给 ArrayBuffer 或 Uint8Array
-                        var buf;
-                        if (data instanceof ArrayBuffer) {
-                            buf = data;
-                        } else if (ArrayBuffer.isView(data)) {
-                            buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-                        } else {
-                            console.warn('[WS] result: 未知数据类型', typeof data);
-                            return;
-                        }
+                    var _processResultBuf = function(buf, byteLen) {
                         var view = new DataView(buf);
                         if (view.byteLength < 4) return;
                         var jsonLen = view.getUint32(0, false);
@@ -612,10 +619,7 @@ const TrackerCore = (() => {
                         var status;
                         try { status = JSON.parse(jsonStr); } catch(e) { return; }
 
-                        if (status.error) {
-                            self.log('\u274c 解码失败');
-                            return;
-                        }
+                        if (status.error) { self.log('\u274c 解码失败'); return; }
 
                         var jpegStart = 4 + jsonLen;
                         var jpegBytes = buf.slice(jpegStart);
@@ -638,10 +642,25 @@ const TrackerCore = (() => {
                                     hybrid_busy: !!status.h,
                                 }
                             };
-                            var rs = result.status;
-                            var kb = (buf.byteLength / 1024).toFixed(1);
-                            self.logUpdate(_fmtResult(rs, kb));
+                            self.logUpdate(_fmtResult(result.status, (byteLen / 1024).toFixed(1)));
                             if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                        }
+                    };
+
+                    sock.on('result', function(data) {
+                        // 标准化为 ArrayBuffer：兼容 ArrayBuffer / TypedArray / Blob
+                        if (data instanceof ArrayBuffer) {
+                            _processResultBuf(data, data.byteLength);
+                        } else if (ArrayBuffer.isView(data)) {
+                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                            _processResultBuf(buf, data.byteLength);
+                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                            // polling 升级过程中 Socket.IO 某些版本可能传 Blob
+                            var blobSize = data.size;
+                            data.arrayBuffer().then(function(ab) { _processResultBuf(ab, blobSize); });
+                        } else {
+                            console.warn('[WS] result: 未知数据类型', typeof data, data);
+                            return;
                         }
                     });
 
