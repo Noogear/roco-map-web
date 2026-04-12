@@ -528,6 +528,16 @@ def ws_reset_history():
     })
 
 
+@socketio.on('request_jpeg')
+def ws_request_jpeg():
+    """前端请求强制推送一张新 JPEG（如切换到 JPEG 渲染模式时触发）。
+    重置节流锚点到不可能的坐标，确保下次 _on_result_ready 必定发送 result+JPEG。
+    """
+    global _last_jpeg_x, _last_jpeg_y
+    _last_jpeg_x = -99999.0
+    _last_jpeg_y = -99999.0
+
+
 @socketio.on('frame')
 def ws_receive_frame(raw_bytes):
     """

@@ -969,9 +969,15 @@ function _updateRenderModeBtn() {
 function toggleRenderMode() {
     _renderMode = _renderMode === 'bigmap' ? 'jpeg' : 'bigmap';
     _updateRenderModeBtn();
-    TC.log(_renderMode === 'bigmap'
-        ? '🗺️ 已切换到全图平滑模式（首次加载 33MB，之后零开销）'
-        : '📸 已切换到 JPEG 模式（低流量，边缘稍有黑边）');
+    if (_renderMode === 'jpeg') {
+        TC.log('📸 已切换到 JPEG 模式（低流量，边缘稍有黑边）');
+        // 重置后端节流锚点，确保立即推送一帧新 JPEG（否则静止时可能长时间无图）
+        if (TC.wsConnected && TC.wsSocket) {
+            TC.wsSocket.emit('request_jpeg');
+        }
+    } else {
+        TC.log('🗺️ 已切换到全图平滑模式（首次加载 33MB，之后零开销）');
+    }
 }
 
 /** Catmull-Rom 样条基函数：t∈[0,1] 对应 p1→p2 段 */
