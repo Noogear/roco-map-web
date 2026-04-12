@@ -214,6 +214,9 @@ class AIMapTrackerWeb:
         # Plan B: _push_jpeg=False 时跳过 cv2.imencode，节省 10-15ms/帧。
         # 由 main_web.py 根据客户端类型（frame / frame_coords）动态切换。
         self._push_jpeg = True
+        # Plan A: result_callback 由 main_web.py 注册，处理完后立即推送新结果。
+        # 叠加式：pull 逻辑仍保留作兜底，callback 失败不影响正常工作。
+        self.result_callback = None
         self._new_frame_event = Event()
         self._worker_thread = Thread(
             target=self._background_processor,
@@ -451,6 +454,12 @@ class AIMapTrackerWeb:
                 self.process_frame(need_base64=False, need_jpeg=self._push_jpeg)
             except Exception as e:
                 print(f"[sift-worker] 处理异常: {e}")
+                continue
+            if self.result_callback is not None:
+                try:
+                    self.result_callback()
+                except Exception as cb_e:
+                    print(f"[sift-worker] result_callback 异常: {cb_e}")
 
     def set_mode(self, mode):
         """切换识别模式: 'sift' 或 'loftr'"""
