@@ -442,7 +442,7 @@ TC.init({
             lf = !!result.status.found;
             lAngle = result.status.arrow_angle || 0;
             lStopped = !!result.status.arrow_stopped;
-            setDot(lx, ly, result.status.state || '', lf, lAngle, lStopped);
+            setDot(lx, ly, result.status.state || '', lf, lAngle, lStopped, !!result.status.is_teleport);
             updUIBig(result);
             if (autoRun && lf) ensureVis(lx, ly);
             // 路线: 用玩家坐标更新进度
@@ -493,7 +493,7 @@ function applyT() {
 }
 
 // ========== 红点 & UI 更新 ==========
-function setDot(x, y, state, found, angle, stopped){
+function setDot(x, y, state, found, angle, stopped, isTeleport){
     // 地图坐标 → 屏幕坐标
     var screenX = x * sc + ox;
     var screenY = y * sc + oy;
@@ -506,6 +506,21 @@ function setDot(x, y, state, found, angle, stopped){
     if (ap && ac) {
         ap.setAttribute('display', stopped ? 'none' : '');
         ac.setAttribute('display', stopped ? '' : 'none');
+    }
+
+    // === 传送快速路径：立即跳位，不走 lerp ===
+    if (isTeleport) {
+        _lastDotMapX = x; _lastDotMapY = y; _lastDotAngle = angle;
+        _lerp.tx = screenX; _lerp.ty = screenY; _lerp.tAngle = angle;
+        _lerp.cx = screenX; _lerp.cy = screenY; _lerp.cAngle = angle;
+        _lerp.running = false;
+        _applyDotPos(screenX, screenY, angle);
+        DOT.classList.remove('inertial','lost');
+        if(!found){ DOT.classList.add('lost'); ARWD.style.opacity='0'; }
+        else { if(state==='INERTIAL') DOT.classList.add('inertial'); ARWD.style.opacity='.85'; }
+        CH.style.opacity=found?'.25':'0';
+        SX.textContent=Math.round(x); SY.textContent=Math.round(y);
+        return;
     }
 
     // === 静止死区过滤：位置和角度变化量均低于阈值时跳过 lerp，消除静止抖动 ===

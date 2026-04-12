@@ -688,6 +688,7 @@ const TrackerCore = (() => {
                                 arrow_angle: status.a || 0,
                                 arrow_stopped: !!status.as,
                                 coord_lock: !!status.l,
+                                is_teleport: !!status.tp,
                                 hybrid: !!status.hy,
                                 hybrid_busy: !!status.h,
                             }

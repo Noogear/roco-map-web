@@ -25,90 +25,13 @@ from collections import deque
 
 from backend import config
 from backend.tracker_engines import SIFTMapTracker
+from backend.tracking.minimap import CircleCalibrator, detect_and_extract
+from backend.tracking.smoother import CoordSmoother
 
 
-# 坐标过滤参数
-POS_HISTORY_SIZE = 20      # 保留最近 N 次坐标
-POS_OUTLIER_THRESHOLD = 200 # 超过此距离视为异常帧，丢弃
-
-
-def _create_kalman_filter():
-    """
-    创建 4 状态 (x, y, vx, vy) / 2 观测 (x, y) 的卡尔曼滤波器。
-    用于替代线性外推+中位数平滑，提供更准确的预测和更平滑的输出。
-    """
-    kf = cv2.KalmanFilter(4, 2)
-    # 状态转移矩阵: x' = x + vx*dt, y' = y + vy*dt (dt=1 frame)
-    kf.transitionMatrix = np.array([
-        [1, 0, 1, 0],
-        [0, 1, 0, 1],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-    ], dtype=np.float32)
-    # 观测矩阵: 只能观测 x, y
-    kf.measurementMatrix = np.array([
-        [1, 0, 0, 0],
-        [0, 1, 0, 0],
-    ], dtype=np.float32)
-    # 过程噪声 (模型不确定性)
-    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1.0
-    kf.processNoiseCov[2, 2] = 2.0  # 速度变化更不确定
-    kf.processNoiseCov[3, 3] = 2.0
-    # 观测噪声 (默认中等信任)
-    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 5.0
-    # 初始协方差
-    kf.errorCovPost = np.eye(4, dtype=np.float32) * 500.0
-    return kf
-
-
-class _CircleCalibrator:
-    """
-    运行时自动校准小地图圆形参数 (半径、圆心位置)。
-    前 N 帧为校准期，所有检测到的圆都放行；
-    校准收敛后，通过半径+圆心偏移严格过滤异常检测(地图展开、战斗误检)。
-    连续长时间未检测到 → 自动重置校准(适应分辨率/UI变化)。
-    """
-
-    def __init__(self):
-        self._history = deque(maxlen=30)
-        self._calibrated = False
-        self.expected_cx = None
-        self.expected_cy = None
-        self.expected_r = None
-        self._consecutive_miss = 0
-
-    def update(self, cx, cy, r):
-        self._history.append((cx, cy, r))
-        self._consecutive_miss = 0
-        n_cal = getattr(config, 'MINIMAP_CIRCLE_CALIBRATION_FRAMES', 8)
-        if len(self._history) >= n_cal:
-            rs = [d[2] for d in self._history]
-            cxs = [d[0] for d in self._history]
-            cys = [d[1] for d in self._history]
-            self.expected_r = int(np.median(rs))
-            self.expected_cx = int(np.median(cxs))
-            self.expected_cy = int(np.median(cys))
-            if not self._calibrated:
-                self._calibrated = True
-                print(f"  [圆校准] 已收敛: center=({self.expected_cx},{self.expected_cy}), r={self.expected_r}")
-
-    def is_valid(self, cx, cy, r):
-        if not self._calibrated:
-            return True
-        r_tol = getattr(config, 'MINIMAP_CIRCLE_R_TOLERANCE', 8)
-        c_tol = getattr(config, 'MINIMAP_CIRCLE_CENTER_TOLERANCE', 15)
-        return (abs(r - self.expected_r) <= r_tol and
-                abs(cx - self.expected_cx) <= c_tol and
-                abs(cy - self.expected_cy) <= c_tol)
-
-    def record_miss(self):
-        self._consecutive_miss += 1
-        n_reset = getattr(config, 'MINIMAP_CIRCLE_RECALIBRATE_MISS', 30)
-        if self._consecutive_miss >= n_reset and self._calibrated:
-            self._history.clear()
-            self._calibrated = False
-            self._consecutive_miss = 0
-            print("[圆校准] 连续未检测到小地图圆，重置校准（可能分辨率/UI变化）")
+# (坐标过滤参数保留为向后兼容，实际由 CoordSmoother 值守)
+POS_HISTORY_SIZE = CoordSmoother.POS_HISTORY_SIZE
+POS_OUTLIER_THRESHOLD = CoordSmoother.POS_OUTLIER_THRESHOLD
 
 
 class MapTrackerWeb:
@@ -152,29 +75,28 @@ class MapTrackerWeb:
         # 连续 TP_CONFIRM_FRAMES 帧 SIFT 稳定匹配到同一远处新位置才视为传送，
         # 随机噪声帧在空间上分散，不会通过聚类校验，因此不会误触。
         self._tp_candidate_buffer = deque(maxlen=getattr(config, 'TP_CONFIRM_FRAMES', 3))
+        self._tp_just_confirmed = False  # 当帧传送聚类确认成功，通知前端直接跳位
+
+        # === SCENE_CHANGE 防抖：挂机时单帧检测失败不立即进入冻结状态 ===
+        # 加载画面(渐黑 fade)通常持续 >30 帧，2 帧 debounce 不影响真实场景切换
+        # 但能吸收 HoughCircles 或方差检测的偶发单帧误判
+        self._scene_change_streak = 0
+        self._scene_change_debounce = getattr(config, 'SCENE_CHANGE_DEBOUNCE', 2)
 
         # === 圆形小地图检测器 (方形截取 + HoughCircles 自动校准) ===
-        self._circle_cal = _CircleCalibrator()
+        self._circle_cal = CircleCalibrator()
 
-        # === 卡尔曼滤波器（替代线性外推+中位数平滑）===
-        self._kalman = _create_kalman_filter()
-        self._kalman_initialized = False  # 第一次观测后才开始滤波
-
-        # 坐标平滑缓冲池（60帧滑动窗口 + 中位数滤波，消除 SIFT 抖动）
-        # 注：卡尔曼滤波作为主滤波器，smooth_buffer 仅用于持久化恢复
-        self.SMOOTH_BUFFER_SIZE = 60
-        self.smooth_buffer_x = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
-        self.smooth_buffer_y = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
-
-        # 渲染静止死区：记录上一帧实际用于渲染的坐标，避免噪声引起地图抖动
-        self._display_x = None
-        self._display_y = None
-        self._smooth_median_window = 15  # 取最近15帧的中位数作为输出（抗抖动）
-
-        # 持久化文件路径（与 main_web.py 同级）
+        # === 坐标平滑器（卡尔曼 + EMA 防抖 + TP 检测缓冲）===
         _base_dir = os.path.dirname(os.path.abspath(__file__))
         self._smooth_file = os.path.join(_base_dir, '.smooth_coords.json')
-        self._load_smooth_buffer()  # 启动时恢复历史坐标
+        self._smoother = CoordSmoother(smooth_buffer_path=self._smooth_file)
+        # 向后兼容 - _process_sift 直接用 smoother 的属性
+        self.smooth_buffer_x = self._smoother.smooth_buffer_x
+        self.smooth_buffer_y = self._smoother.smooth_buffer_y
+        self.pos_history = self._smoother.pos_history
+        self.SMOOTH_BUFFER_SIZE = CoordSmoother.SMOOTH_BUFFER_SIZE
+        self._display_x: int | None = None
+        self._display_y: int | None = None
 
         self.latest_status = {
             'mode': 'sift',
@@ -203,175 +125,32 @@ class MapTrackerWeb:
         self._worker_thread.start()
         print("  ⚡ SIFT 后台处理线程已启动")
 
-    # ========== 坐标平滑 ==========
+    # ========== 坐标平滑（代理到 CoordSmoother）==========
 
-    def _smooth_coord(self, raw_x, raw_y):
-        """
-        坐标平滑：60帧滑动窗口 + 最近 N 帧中位数滤波。
-        返回 (smooth_x, smooth_y)，消除 SIFT 单帧随机抖动。
-        每60帧自动持久化到本地文件。
-        """
-        if raw_x is not None and raw_y is not None:
-            self.smooth_buffer_x.append(raw_x)
-            self.smooth_buffer_y.append(raw_y)
-            if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
-                self._save_smooth_buffer()
-
-        n = min(len(self.smooth_buffer_x), self._smooth_median_window)
-        if n < 3:
-            return raw_x or 0, raw_y or 0
-
-        recent_x = list(self.smooth_buffer_x)[-n:]
-        recent_y = list(self.smooth_buffer_y)[-n:]
-        recent_x.sort()
-        recent_y.sort()
-        mid = n // 2
-        if n % 2 == 0:
-            sx = (recent_x[mid - 1] + recent_x[mid]) // 2
-            sy = (recent_y[mid - 1] + recent_y[mid]) // 2
-        else:
-            sx = recent_x[mid]
-            sy = recent_y[mid]
-        return int(sx), int(sy)
+    def _smooth_coord(self, raw_x, raw_y, is_inertial=False, arrow_stopped=True):
+        return self._smoother._render_ema(raw_x, raw_y, is_inertial, arrow_stopped)
 
     def _load_smooth_buffer(self):
-        """启动时从本地文件恢复最近60个坐标点"""
-        if not os.path.isfile(self._smooth_file):
-            return
-        try:
-            with open(self._smooth_file, 'r') as f:
-                data = json.load(f)
-            xs = data.get('x', [])
-            ys = data.get('y', [])
-            if len(xs) == len(ys) and len(xs) > 0:
-                self.smooth_buffer_x.extend(xs[-self.SMOOTH_BUFFER_SIZE:])
-                self.smooth_buffer_y.extend(ys[-self.SMOOTH_BUFFER_SIZE:])
-                # 用最后一个历史坐标初始化卡尔曼
-                self._kalman_reset(xs[-1], ys[-1])
-                print(f"📍 已从本地恢复 {len(xs)} 个历史坐标点 (最新: {xs[-1]}, {ys[-1]})")
-        except Exception as e:
-            print(f"[警告] 加载坐标历史失败: {e}")
+        pass  # CoordSmoother __init__ 自动加载
 
     def _save_smooth_buffer(self):
-        """将当前缓冲池的坐标写入本地 JSON 文件"""
-        try:
-            data = {
-                'x': list(self.smooth_buffer_x),
-                'y': list(self.smooth_buffer_y),
-                'ts': time.time(),
-            }
-            with open(self._smooth_file, 'w') as f:
-                json.dump(data, f)
-        except Exception as e:
-            pass  # 静默失败，不影响主流程
+        pass  # CoordSmoother 自动持久化
 
-    # ========== 卡尔曼滤波器 ==========
+    # ========== 卡尔曼滤波器（代理到 CoordSmoother）==========
 
     def _kalman_update(self, cx, cy, quality=1.0):
-        """
-        卡尔曼滤波：用观测值 (cx, cy) 校正，返回平滑后的坐标。
-        quality: 0-1，匹配质量越低 → 观测噪声越大 → 更信赖预测值。
-        """
-        if not self._kalman_initialized:
-            # 首次初始化状态
-            self._kalman.statePost = np.array(
-                [[np.float32(cx)], [np.float32(cy)], [0], [0]], dtype=np.float32)
-            self._kalman_initialized = True
-            return cx, cy
-
-        # 根据质量动态调整观测噪声: 高质量→小噪声(信赖观测), 低质量→大噪声(信赖预测)
-        noise_scale = max(1.0, 50.0 * (1.0 - quality))
-        self._kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * noise_scale
-
-        # predict → correct
-        self._kalman.predict()
-        measurement = np.array([[np.float32(cx)], [np.float32(cy)]], dtype=np.float32)
-        corrected = self._kalman.correct(measurement)
-        return int(corrected[0, 0]), int(corrected[1, 0])
+        return self._smoother._kalman_update(cx, cy, quality)
 
     def _kalman_predict(self):
-        """
-        无观测值时使用卡尔曼预测（比惯性重复上一坐标更准确）。
-        返回 (predicted_x, predicted_y) 或 None（未初始化时）。
-        """
-        if not self._kalman_initialized:
-            return None
-        predicted = self._kalman.predict()
-        return int(predicted[0, 0]), int(predicted[1, 0])
+        return self._smoother._kalman_predict()
 
     def _kalman_reset(self, cx, cy):
-        """重定位后重置卡尔曼状态（如混合引擎注入新坐标）"""
-        self._kalman = _create_kalman_filter()
-        self._kalman.statePost = np.array(
-            [[np.float32(cx)], [np.float32(cy)], [0], [0]], dtype=np.float32)
-        self._kalman_initialized = True
+        self._smoother._kalman_reset(cx, cy)
 
     # ========== 场景切换检测 ==========
 
     def _detect_and_extract_minimap(self, square_bgr):
-        """
-        从方形截取区域中检测圆形小地图并提取。
-        利用 HoughCircles 几何检测（替代启发式阈值）判定小地图是否存在：
-          - 正常帧: 检测到圆 → 提取圆内方形区域供 SIFT 匹配
-          - 战斗/暂停/UI: 无圆 → 返回 None
-          - 地图展开: 检测到圆但半径异常 → 校准器拒绝 → 返回 None
-
-        自动校准: 前 N 帧收集统计 → 自动收紧半径/圆心容差 → 适应任何分辨率
-
-        Returns:
-            numpy.ndarray — 提取的小地图 (tight square, 与原圆形裁剪格式一致),
-            或 None (无有效小地图)
-        """
-        if square_bgr is None or square_bgr.size == 0:
-            return None
-
-        gray = cv2.cvtColor(square_bgr, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape[:2]
-        min_dim = min(h, w)
-
-        circles = cv2.HoughCircles(
-            gray, cv2.HOUGH_GRADIENT, 1.2, min_dim // 2,
-            param1=80, param2=35,
-            minRadius=int(min_dim * 0.25),
-            maxRadius=int(min_dim * 0.48)
-        )
-
-        if circles is None or len(circles[0]) == 0:
-            if not self.sift_engine.frozen:
-                self._circle_cal.record_miss()
-            return None
-
-        # 取最靠近中心的圆（小地图应在截取区域中央）
-        cx_img, cy_img = w / 2, h / 2
-        best, best_dist = None, float('inf')
-        for c in circles[0]:
-            d = math.sqrt((c[0] - cx_img) ** 2 + (c[1] - cy_img) ** 2)
-            if d < best_dist:
-                best_dist = d
-                best = c
-
-        det_cx, det_cy, det_r = int(best[0]), int(best[1]), int(best[2])
-
-        # 校准验证（校准后拒绝半径/位置异常的圆，如地图展开 r 偏大）
-        if not self._circle_cal.is_valid(det_cx, det_cy, det_r):
-            if not self.sift_engine.frozen:
-                self._circle_cal.record_miss()
-            return None
-
-        self._circle_cal.update(det_cx, det_cy, det_r)
-
-        # 提取圆内方形区域（与之前引擎输入格式一致）
-        x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
-        x2, y2 = min(w, det_cx + det_r), min(h, det_cy + det_r)
-        minimap = square_bgr[y1:y2, x1:x2].copy()
-
-        # 基础防护：过小或纯色（Loading 时的圆形 UI 元素）
-        if minimap.size < 100:
-            return None
-        if np.var(cv2.cvtColor(minimap, cv2.COLOR_BGR2GRAY)) < 80:
-            return None
-
-        return minimap
+        return detect_and_extract(square_bgr, self._circle_cal, self.sift_engine.frozen)
 
     # ========== 线性速度一致性过滤 ==========
 
@@ -498,6 +277,8 @@ class MapTrackerWeb:
                 need_jpeg=True,
             )
 
+        _is_tp = self._tp_just_confirmed
+        self._tp_just_confirmed = False
         self.latest_status = {
             'mode': self.current_mode,
             'state': status_state,
@@ -508,6 +289,7 @@ class MapTrackerWeb:
             'arrow_angle': getattr(self, '_last_arrow_angle_out', 0),
             'arrow_stopped': getattr(self, '_last_arrow_stopped_out', True),
             'coord_lock': self.sift_engine.coord_lock_enabled,
+            'is_teleport': _is_tp,
         }
 
         self.latest_result_frame = final_bgr
@@ -539,6 +321,20 @@ class MapTrackerWeb:
         if extracted is None:
             # 无有效小地图(战斗/暂停/UI/地图展开)
 
+            # SCENE_CHANGE debounce：需连续 N 帧失败才真正进入冻结状态
+            # 防止挂机时单帧 HoughCircles 抖动或低纹理方差误判引起"重定位中"闪烁
+            self._scene_change_streak += 1
+            _debounce = self._scene_change_debounce
+            if self._scene_change_streak < _debounce and self.sift_engine.last_x is not None:
+                # 未达 debounce 阈值 + 引擎有上一有效坐标：用惯性代替 SCENE_CHANGE
+                sx, sy = self.sift_engine.last_x, self.sift_engine.last_y
+                display_crop, _ = self._render_sift_crop(
+                    sx, sy, sx, sy, True, True,
+                    self.sift_engine._last_arrow_angle,
+                    self.sift_engine._last_arrow_stopped,
+                    {'_locked_state': ''}, half_view)
+                return True, display_crop, 'INERTIAL', 0, sx, sy
+
             # 冻结 SIFT 引擎状态（仅首次进入 BLOCK 时触发）
             self.sift_engine._freeze_state()
 
@@ -568,6 +364,7 @@ class MapTrackerWeb:
 
         # 小地图重现：解冻引擎状态（恢复局部索引+坐标）
         self.sift_engine._thaw_state()
+        self._scene_change_streak = 0   # 重置连续失帧计数
         minimap_bgr = extracted  # 提取的圆内区域，与之前引擎输入格式一致
 
         # === 坐标锁定模式检测 ===
@@ -678,6 +475,7 @@ class MapTrackerWeb:
                 self._display_x = _med_x
                 self._display_y = _med_y
                 self._tp_candidate_buffer.clear()
+                self._tp_just_confirmed = True
                 smooth_x, smooth_y = _med_x, _med_y
                 # 同步 SIFT 引擎位置，让后续帧立即在新位置局部搜索
                 with self.sift_engine._lock:
@@ -697,6 +495,10 @@ class MapTrackerWeb:
         ema_alpha_max = getattr(config, 'RENDER_EMA_ALPHA_MAX', 0.92) # 快速最高 alpha
         ema_slow_dist = getattr(config, 'RENDER_EMA_SLOW_DIST', 6)    # 低于此速度用 min
         ema_fast_dist = getattr(config, 'RENDER_EMA_FAST_DIST', 45)   # 高于此速度用 max
+        # 玩家确认停止时（箭头方向系统判定为静止），扩大静止死区：
+        # SIFT 单帧噪声约 ±3-5px，死区扩大到 10px 可完全吸收，防止挂机地图漂移
+        if arrow_stopped and found and not is_inertial:
+            still_threshold = getattr(config, 'RENDER_STOPPED_STILL_THRESHOLD', 10)
         if found and smooth_x and smooth_y:
             if self._display_x is None:
                 # 首帧直接初始化
@@ -717,13 +519,15 @@ class MapTrackerWeb:
                     self._display_y = int(self._display_y + adaptive_alpha * ddy)
             else:
                 # 惯性帧（卡尔曼预测）：同样速度自适应，预测值不应锁死
-                ddx = smooth_x - self._display_x
-                ddy = smooth_y - self._display_y
-                dist = math.sqrt(ddx * ddx + ddy * ddy)
-                t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
-                adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
-                self._display_x = int(self._display_x + adaptive_alpha * ddx)
-                self._display_y = int(self._display_y + adaptive_alpha * ddy)
+                # 传送候选积累中时冻结渲染坐标，防止速度外推漂向错误方向
+                if not self._tp_candidate_buffer:
+                    ddx = smooth_x - self._display_x
+                    ddy = smooth_y - self._display_y
+                    dist = math.sqrt(ddx * ddx + ddy * ddy)
+                    t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
+                    adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
+                    self._display_x = int(self._display_x + adaptive_alpha * ddx)
+                    self._display_y = int(self._display_y + adaptive_alpha * ddy)
             smooth_x, smooth_y = self._display_x, self._display_y
 
         # 渲染裁剪区域 + 画点

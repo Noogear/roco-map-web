@@ -4,7 +4,12 @@ tracker_engines.py - 纯识别引擎模块（无 Web 框架依赖）
 包含:
   SIFTMapTracker    SIFT 传统特征匹配引擎
 
-此模块仅依赖 cv2 / numpy / PIL / config，可被任何前端（Web/CLI/TUI）复用。
+算法层已拆分到 backend/core/：
+  enhance.py  图像增强（CLAHE / 色温补偿）
+  features.py SIFT/ORB 特征提取与匹配
+  flow.py     LK 光流追踪器
+  ecc.py      ECC 像素级对齐
+  cold_start.py 低纹理冷启动
 """
 
 import math
@@ -15,98 +20,14 @@ from collections import deque
 from threading import Lock
 from backend import config
 
-
-def _angular_diff(a, b):
-    """最短角度差 (带符号, -180~180)"""
-    d = (a - b) % 360
-    return d - 360 if d > 180 else d
-
-
-class _ArrowDirectionSystem:
-    """
-    纯坐标驱动的方向系统（无视觉特征依赖）。
-
-    核心思路:
-      - 每帧接收地图坐标，根据坐标位移方向计算箭头朝向
-      - 多帧累积位移 + EMA 平滑，过滤 SIFT 单帧抖动
-      - 瞬间反向转向时快速跟随（角度差超阈值则跳过平滑直接赋值）
-      - 静止不动时标记 is_stopped，前端渲染为圆点
-    """
-
-    def __init__(self):
-        # 位置历史（用于累积位移判断移动/静止）
-        _hist_len = getattr(config, 'ARROW_POS_HISTORY_LEN', 4)
-        self._pos_history = deque(maxlen=_hist_len)
-
-        # 移动判定阈值（累积位移 < 阈值 → 静止）
-        self._move_threshold = getattr(config, 'ARROW_MOVE_MIN_DISPLACEMENT', 6)
-
-        # 静止防抖：连续 N 帧低于阈值才判定为静止
-        self._stopped_debounce = getattr(config, 'ARROW_STOPPED_DEBOUNCE', 3)
-        self._low_move_streak = 0
-
-        # EMA 平滑
-        self._ema_alpha = getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.35)
-
-        # 急转弯阈值：角度差超过此值时跳过 EMA 直接赋值（应付瞬间反向）
-        self._snap_threshold = getattr(config, 'ARROW_SNAP_THRESHOLD', 90)
-
-        # 输出状态
-        self._last_angle = 0.0
-        self._ema_angle = None
-        self._is_stopped = True
-
-    def update(self, map_x=None, map_y=None):
-        """
-        每帧调用：根据坐标位移更新方向。
-
-        Args:
-            map_x, map_y: 当前帧地图坐标 (None = 定位失败/惯性帧)
-
-        Returns:
-            (angle, is_stopped)
-            angle: float — 箭头朝向角 (0=北, 顺时针)
-            is_stopped: bool — 是否处于静止状态
-        """
-        if map_x is None or map_y is None:
-            return self._last_angle, self._is_stopped
-
-        self._pos_history.append((map_x, map_y))
-
-        if len(self._pos_history) < 2:
-            return self._last_angle, self._is_stopped
-
-        # 累积位移：最旧帧 → 当前帧
-        old_x, old_y = self._pos_history[0]
-        cum_dx = map_x - old_x
-        cum_dy = map_y - old_y
-        cum_dist = math.sqrt(cum_dx * cum_dx + cum_dy * cum_dy)
-
-        if cum_dist < self._move_threshold:
-            # 低位移，累加静止计数
-            self._low_move_streak += 1
-            if self._low_move_streak >= self._stopped_debounce:
-                self._is_stopped = True
-            return self._last_angle, self._is_stopped
-
-        # 有效移动 → 重置静止计数
-        self._low_move_streak = 0
-        self._is_stopped = False
-
-        raw_angle = math.degrees(math.atan2(cum_dx, -cum_dy)) % 360
-
-        # 平滑 or 急转快跳
-        if self._ema_angle is None:
-            self._ema_angle = raw_angle
-        else:
-            diff = _angular_diff(raw_angle, self._ema_angle)
-            if abs(diff) >= self._snap_threshold:
-                self._ema_angle = raw_angle
-            else:
-                self._ema_angle = (self._ema_angle + self._ema_alpha * diff) % 360
-
-        self._last_angle = self._ema_angle
-        return self._last_angle, self._is_stopped
+from backend.core.enhance import (make_clahe_pair, adaptive_clahe, adaptive_clahe_map,
+                                  enhance_for_texture, correct_color_temperature)
+from backend.core.features import (CircularMaskCache, create_flann,
+                                   extract_minimap_features, sift_match_region)
+from backend.core.flow import LKTracker
+from backend.core.ecc import ecc_align
+from backend.core.cold_start import ColdStarter
+from backend.tracking.direction import ArrowDirectionSystem
 
 
 class SIFTMapTracker:
@@ -114,12 +35,10 @@ class SIFTMapTracker:
 
     def __init__(self):
         print("正在初始化 SIFT 引擎...")
-        # 自适应 CLAHE：双档 (标准 / 低纹理)，运行时按纹理 std 线性插值
-        self._clahe_normal = cv2.createCLAHE(
-            clipLimit=getattr(config, 'CLAHE_LIMIT_NORMAL', 3.0), tileGridSize=(8, 8))
-        self._clahe_low = cv2.createCLAHE(
-            clipLimit=getattr(config, 'CLAHE_LIMIT_LOW_TEXTURE', 6.0), tileGridSize=(8, 8))
+        # 自适应 CLAHE（双档），及掩码缓存
+        self._clahe_normal, self._clahe_low = make_clahe_pair()
         self._low_texture_thresh = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
+        self._mask_cache = CircularMaskCache()
 
         # SIFT 检测器
         _sift_contrast = getattr(config, 'SIFT_CONTRAST_THRESHOLD', 0.02)
@@ -129,7 +48,7 @@ class SIFTMapTracker:
         self._last_arrow_angle = 0.0
         self._last_arrow_stopped = True
         # 箭头方向系统（纯坐标驱动）
-        self._arrow_dir = _ArrowDirectionSystem()
+        self._arrow_dir = ArrowDirectionSystem()
 
         # 线程锁（防止并发请求导致 kp_local / flann 竞态）
         self._lock = Lock()
@@ -141,7 +60,8 @@ class SIFTMapTracker:
 
         logic_map_gray = cv2.cvtColor(logic_map_bgr, cv2.COLOR_BGR2GRAY)
         self._logic_map_gray = logic_map_gray
-        logic_map_enhanced = self._adaptive_clahe_map(logic_map_gray)
+        logic_map_enhanced = adaptive_clahe_map(logic_map_gray, self._clahe_normal, self._clahe_low,
+                                                self._low_texture_thresh)
         print("正在提取大地图 SIFT 特征点...")
         self.kp_big_all, self.des_big_all = self.sift.detectAndCompute(logic_map_enhanced, None)
         print(f"✅ 全局特征点: {len(self.kp_big_all)} 个")
@@ -149,7 +69,7 @@ class SIFTMapTracker:
         self.kp_coords = np.array([kp.pt for kp in self.kp_big_all], dtype=np.float32)
 
         print("正在构建全局 FLANN 索引...")
-        self.flann_global = self._create_flann(self.des_big_all)
+        self.flann_global = create_flann(self.des_big_all)
 
         # 局部 FLANN（动态重建）
         self.kp_local = list(self.kp_big_all)
@@ -167,28 +87,30 @@ class SIFTMapTracker:
         self.orb = cv2.ORB_create(nfeatures=500)
         self.orb_bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
-        # LK 光流状态（帧间快速跟踪）
-        self._lk_enabled = getattr(config, 'LK_ENABLED', True)
-        self._lk_prev_gray = None      # 上一帧小地图灰度图
-        self._lk_prev_pts = None       # 上一帧的跟踪点（小地图像素坐标）
-        self._lk_map_scale = 4.0       # 小地图像素 → 大地图像素的比例（SIFT 成功后更新）
-        self._lk_frame_num = 0
-        self._lk_sift_every = getattr(config, 'LK_SIFT_INTERVAL', 4)
-        self._lk_min_conf = getattr(config, 'LK_MIN_CONFIDENCE', 0.5)
-        self._lk_params = dict(
-            winSize=(15, 15), maxLevel=2,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        # LK 光流追踪器
+        self._lk = LKTracker(
+            enabled=getattr(config, 'LK_ENABLED', True),
+            sift_every=getattr(config, 'LK_SIFT_INTERVAL', 4),
+            min_conf=getattr(config, 'LK_MIN_CONFIDENCE', 0.5),
+            mask_cache=self._mask_cache,
+        )
+        self._lk.map_scale = 4.0   # 初始比例，SIFT 匹配成功后更新
 
         # ECC 低纹理兜底
         self._ecc_enabled = getattr(config, 'ECC_ENABLED', True)
         self._ecc_min_cc = getattr(config, 'ECC_MIN_CORRELATION', 0.25)
-        self._last_sift_scale = self._lk_map_scale  # 默认与 LK scale 一致，进海洋后 ECC 可立即工作
+        self._last_sift_scale = self._lk.map_scale  # 默认与 LK scale 一致
 
-        # 海洋/低纹理区域冷启动（启动时预扫描大地图）
-        self._ocean_std_thresh = getattr(config, 'OCEAN_STD_THRESHOLD', 20)
-        self._ocean_region_tile = getattr(config, 'OCEAN_REGION_TILE', 400)
-        self._ocean_candidates = self._build_ocean_candidates(logic_map_gray)
-        print(f"🌊 低纹理区域候选: {len(self._ocean_candidates)} 个")
+        # 海洋/低纹理区域冷启动
+        self._cold_starter = ColdStarter(
+            map_width=self.map_width,
+            map_height=self.map_height,
+            logic_map_gray=logic_map_gray,
+            mask_cache=self._mask_cache,
+        )
+        self._cold_starter.build_candidates()
+        print(f"🌊 低纹理区域候选: {len(self._cold_starter._candidates)} 个")
+        self._cold_start_cd = 0   # 冷启动冷却帧数
 
         # 附近搜索 FLANN 缓存（按网格桶缓存，避免每帧重建）
         self._nearby_flann_cache = {}
@@ -199,7 +121,6 @@ class SIFTMapTracker:
         self.last_y = None
         self.lost_frames = 0
         self._sift_confused = False
-        self._cold_start_cd = 0   # 冷启动冷却帧数，防止暂停页面反复误触发
 
         # 状态冻结
         self._frozen = False
@@ -265,35 +186,6 @@ class SIFTMapTracker:
             return self._frozen_last_x, self._frozen_last_y
         return None
 
-    # ---- 自适应 CLAHE ----
-    def _adaptive_clahe(self, gray):
-        """低纹理用 _clahe_low，否则 _clahe_normal"""
-        if np.std(gray) < self._low_texture_thresh:
-            return self._clahe_low.apply(gray)
-        return self._clahe_normal.apply(gray)
-
-    def _adaptive_clahe_map(self, gray):
-        """大地图分块自适应 CLAHE"""
-        h, w = gray.shape[:2]
-        tile = 256
-        result = np.empty_like(gray)
-        thresh = self._low_texture_thresh
-        for y in range(0, h, tile):
-            for x in range(0, w, tile):
-                patch = gray[y:y+tile, x:x+tile]
-                clahe = self._clahe_low if np.std(patch) < thresh else self._clahe_normal
-                result[y:y+tile, x:x+tile] = clahe.apply(patch)
-        return result
-
-    @staticmethod
-    def _create_flann(descriptors):
-        index_params = dict(algorithm=1, trees=5)
-        search_params = dict(checks=50)
-        flann = cv2.FlannBasedMatcher(index_params, search_params)
-        flann.add([descriptors])
-        flann.train()
-        return flann
-
     # ---- 局部/全局搜索切换 ----
     def _switch_to_local(self, cx, cy):
         """以 (cx, cy) 为中心，提取半径内的特征点，重建局部 FLANN"""
@@ -311,7 +203,7 @@ class SIFTMapTracker:
             return
         self.kp_local = [self.kp_big_all[i] for i in indices]
         self.des_local = self.des_big_all[indices]
-        self.flann_local = self._create_flann(self.des_local)
+        self.flann_local = create_flann(self.des_local)
         self.using_local = True
         self.local_fail_count = 0
         self._local_center = (cx, cy)
@@ -340,9 +232,10 @@ class SIFTMapTracker:
         t_start = self._perf_time.perf_counter()
         r = self._lock_search_radius
 
+        minimap_bgr = correct_color_temperature(minimap_bgr)
         minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
-        minimap_gray = self._adaptive_clahe(minimap_gray)
-        kp_mini, des_mini = self._extract_minimap_features(minimap_gray)
+        minimap_gray = adaptive_clahe(minimap_gray, self._clahe_normal, self._clahe_low, self._low_texture_thresh)
+        kp_mini, des_mini = extract_minimap_features(minimap_gray, self.sift, self._mask_cache)
         if des_mini is None:
             return self._make_result(False, t_start=t_start, _locked_state="NO_FEATURES")
 
@@ -355,15 +248,16 @@ class SIFTMapTracker:
 
         locked_kp = [self.kp_big_all[i] for i in indices]
         locked_des = self.des_big_all[indices]
-        locked_flann = self._create_flann(locked_des)
+        locked_flann = create_flann(locked_des)
 
         # 逐步放宽阈值重试
         for ratio, min_m in [(0.85, 5), (0.78, 4), (0.70, 3)]:
-            result = self._sift_match_region(
+            result = sift_match_region(
                 kp_mini, des_mini, minimap_gray.shape,
-                locked_kp, locked_flann, ratio, min_m)
+                locked_kp, locked_flann, ratio, min_m,
+                self.map_width, self.map_height)
             if result is not None:
-                tx, ty, inlier_count, quality = result
+                tx, ty, inlier_count, quality, _scale = result
                 if abs(tx - anchor_x) <= r * 1.5 and abs(ty - anchor_y) <= r * 1.5:
                     angle, stopped = self._arrow_dir.update(tx, ty)
                     self._last_arrow_angle = angle
@@ -450,203 +344,12 @@ class SIFTMapTracker:
         img_bgr[dy1:dy2, dx1:dx2] = blended.astype(np.uint8)
 
     # ---- 工具方法 ----
-    @staticmethod
-    def _make_circular_mask(h, w):
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cx, cy = w // 2, h // 2
-        cv2.circle(mask, (cx, cy), min(cx, cy) - 2, 255, -1)
-        return mask
-
-    def _get_circular_mask(self, h, w):
-        key = (h, w)
-        if not hasattr(self, '_circ_mask_cache'):
-            self._circ_mask_cache = {}
-        cached = self._circ_mask_cache.get(key)
-        if cached is not None:
-            return cached
-        mask = self._make_circular_mask(h, w)
-        self._circ_mask_cache[key] = mask
-        return mask
-
-    def _build_ocean_candidates(self, map_gray):
-        """
-        启动时扫描大地图，找出所有低纹理区域（海洋/大片裸地等）作为冷启动候选。
-        过滤纯黑（mean<10）和纯白/灰白留白（mean>200）边框，只保留真实地形区域。
-        返回 list of (cx, cy, mean_val) 三元组。
-        """
-        tile = self._ocean_region_tile
-        h, w = map_gray.shape[:2]
-        half = tile // 2
-        candidates = []
-        for cy in range(half, h - half, tile):
-            for cx in range(half, w - half, tile):
-                patch = map_gray[cy - half:cy + half, cx - half:cx + half]
-                mean_val = float(np.mean(patch))
-                # 排除纯黑边框和纯白/情白领域（两者 std 同样很低但不是真实海洋）
-                if float(np.std(patch)) < self._ocean_std_thresh and 10 < mean_val < 200:
-                    candidates.append((cx, cy, mean_val))
-        return candidates
-
-    def _ocean_cold_start(self, minimap_gray_raw):
-        """
-        冷启动低纹理场景定位：将小地图与大地图预标记低纹理区域做多尺度模板匹配。
-        - 多尺度：冷启动时比例未知，在 3.5‒5.5 间扫描取最优
-        - 圆形掩码：将小地图四角黑边填充为均值，避免干扰相关系数
-        - 半丢失模式：有 last_x 时只搜附近区域（大幅加速+减少误匹配）
-        minimap_gray_raw: 未经 CLAHE 增强的原始灰度小地图。
-        返回 (tx, ty) 或 None。
-        """
-        if not self._ocean_candidates:
-            return None
-
-        h_mm, w_mm = minimap_gray_raw.shape[:2]
-        mini_mean = float(np.mean(minimap_gray_raw))
-        color_thresh = getattr(config, 'OCEAN_COLOR_THRESH', 50)
-        margin = self._ocean_region_tile // 2
-        min_cc = getattr(config, 'OCEAN_COLD_START_MIN_CC', 0.20)
-
-        # 半丢失时根据丢帧数动态扩大搜索半径：丢帧越多玩家移动越远
-        # 最小 1200px，每超出 8 帧额外增加 60px，最大 2400px
-        _semi_lost_radius = min(2400, 1200 + max(0, self.lost_frames - 8) * 60)
-        if self.last_x is not None:
-            close_candidates = [
-                (cx, cy, mm) for cx, cy, mm in self._ocean_candidates
-                if (abs(mm - mini_mean) < color_thresh
-                    and abs(cx - self.last_x) < _semi_lost_radius
-                    and abs(cy - self.last_y) < _semi_lost_radius)
-            ]
-        else:
-            close_candidates = [(cx, cy, mm) for cx, cy, mm in self._ocean_candidates
-                                if abs(mm - mini_mean) < color_thresh]
-        if not close_candidates:
-            return None
-
-        # 圆形掩码：四角填充为均值，减少角落黑边对相关系数的干扰
-        circ_mask = self._get_circular_mask(h_mm, w_mm)
-        mini_filled = minimap_gray_raw.copy()
-        mini_filled[circ_mask == 0] = int(mini_mean)
-
-        # 多尺度：冷启动时实际比例未知，用当前估计 ±25% 范围扫描
-        base_s = self._last_sift_scale  # 通常 4.0
-        scales = sorted({round(base_s * f, 2) for f in (0.75, 0.875, 1.0, 1.125, 1.25)}
-                        | {3.5, 4.0, 4.5, 5.0})
-
-        best_cc = -1.0
-        best_pos = None
-        best_scale = base_s
-
-        for s in scales:
-            dst_w = max(1, int(w_mm * s))
-            dst_h = max(1, int(h_mm * s))
-            mini_scaled = cv2.resize(mini_filled, (dst_w, dst_h))
-
-            for cx, cy, _ in close_candidates:
-                x1 = max(0, cx - dst_w // 2 - margin)
-                y1 = max(0, cy - dst_h // 2 - margin)
-                x2 = min(self.map_width,  x1 + dst_w + 2 * margin)
-                y2 = min(self.map_height, y1 + dst_h + 2 * margin)
-                region = self._logic_map_gray[y1:y2, x1:x2]
-                if region.shape[0] <= dst_h or region.shape[1] <= dst_w:
-                    continue
-                try:
-                    res = cv2.matchTemplate(region, mini_scaled, cv2.TM_CCOEFF_NORMED)
-                except cv2.error:
-                    continue
-                _, max_val, _, max_loc = cv2.minMaxLoc(res)
-                if max_val > best_cc:
-                    best_cc = max_val
-                    match_x = x1 + max_loc[0] + dst_w // 2
-                    match_y = y1 + max_loc[1] + dst_h // 2
-                    best_pos = (match_x, match_y)
-                    best_scale = s
-
-        if best_pos is not None and best_cc >= min_cc:
-            # 用冷启动匹配到的比例更新 scale，提升后续 ECC / LK 精度
-            self._last_sift_scale = best_scale
-            self._lk_map_scale = best_scale
-            return best_pos
-        return None
-
-    def _enhance_for_texture(self, gray, texture_std):
-        """统一的纹理增强：根据 texture_std 连续决定增强强度"""
-        if texture_std < 15:
-            # 超低纹理(海面/天空)：双边保边 + 高CLAHE + 强锐化
-            filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-            enhanced = self._clahe_low.apply(filtered)
-            blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
-            return cv2.addWeighted(enhanced, 2.0, blurred, -1.0, 0)
-        elif texture_std < 30:
-            # 低纹理(雪地/草坪)：温和锐化
-            blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
-            return cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
-        return gray
-
-    def _extract_minimap_features(self, minimap_gray):
-        """提取小地图特征点（带圆形掩码），返回 (kp, des)"""
-        h_mm, w_mm = minimap_gray.shape[:2]
-        circ_mask = self._get_circular_mask(h_mm, w_mm)
-        kp, des = self.sift.detectAndCompute(minimap_gray, circ_mask)
-        if des is None or len(kp) < 2:
-            return None, None
-        return kp, des
-
-    def _sift_match_region(self, kp_mini, des_mini, mm_shape,
-                           region_kp, region_flann, ratio, min_match):
-        """
-        通用 SIFT 区域匹配。
-        返回 (tx, ty, inlier_count, quality) 或 None。
-        """
-        try:
-            matches = region_flann.knnMatch(des_mini, k=2)
-        except cv2.error:
-            return None
-
-        good = [m for m_n in matches if len(m_n) == 2
-                for m, n in [m_n] if m.distance < ratio * n.distance]
-
-        if len(good) < min_match:
-            return None
-
-        src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-        dst_pts = np.float32([region_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, config.SIFT_RANSAC_THRESHOLD)
-        if M is None:
-            return None
-
-        inlier_count = int(mask.sum()) if mask is not None else 0
-        if inlier_count < min_match:
-            return None
-
-        # 缩放合理性
-        sx = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
-        sy = np.sqrt(M[0, 1] ** 2 + M[1, 1] ** 2)
-        avg_scale = (sx + sy) / 2
-        max_scale = getattr(config, 'SIFT_MAX_HOMOGRAPHY_SCALE', 8.0)
-        if avg_scale > max_scale or avg_scale < 1.0 / max_scale:
-            return None
-
-        # 记录 scale 供 LK / ECC 使用（side-channel）
-        self._last_sift_scale = avg_scale
-
-        h, w = mm_shape[:2]
-        center_pt = np.float32([[[w / 2.0, h / 2.0]]])
-        dst_center = cv2.perspectiveTransform(center_pt, M)
-        tx, ty = int(dst_center[0][0][0]), int(dst_center[0][0][1])
-
-        if not (0 <= tx < self.map_width and 0 <= ty < self.map_height):
-            return None
-
-        inlier_ratio = inlier_count / max(len(good), 1)
-        count_conf = min(1.0, inlier_count / 12.0)
-        quality = min(1.0, inlier_ratio * count_conf)
-        return tx, ty, inlier_count, quality
-
     def _orb_nearby_match(self, minimap_gray, cx_hint, cy_hint, radius):
         """ORB 附近搜索：在 (cx_hint, cy_hint) 周围 radius 内做 ORB 匹配"""
         if self.orb is None:
             return None
         h_mm, w_mm = minimap_gray.shape[:2]
-        circ_mask = self._get_circular_mask(h_mm, w_mm)
+        circ_mask = self._mask_cache.get(h_mm, w_mm)
         kp_orb_mini, des_orb_mini = self.orb.detectAndCompute(minimap_gray, circ_mask)
         if des_orb_mini is None or len(kp_orb_mini) < 3:
             return None
@@ -657,7 +360,7 @@ class SIFTMapTracker:
         y2 = min(self.map_height, cy_hint + radius)
 
         local_gray = self._logic_map_gray[y1:y2, x1:x2]
-        local_gray = self._adaptive_clahe(local_gray)
+        local_gray = adaptive_clahe(local_gray, self._clahe_normal, self._clahe_low, self._low_texture_thresh)
         kp_orb_map, des_orb_map = self.orb.detectAndCompute(local_gray, None)
         if des_orb_map is None or len(kp_orb_map) < 5:
             return None
@@ -690,96 +393,6 @@ class SIFTMapTracker:
                 return tx, ty
         return None
 
-    def _lk_track(self, minimap_gray):
-        """
-        LK 稀疏光流估计帧间位移。
-        把小地图像素位移乘以 scale 转换到大地图坐标系。
-        返回 (dx_map, dy_map, confidence) 或 None。
-        """
-        if (not self._lk_enabled
-                or self._lk_prev_gray is None
-                or self._lk_prev_pts is None
-                or len(self._lk_prev_pts) < 4
-                or self.last_x is None):
-            return None
-        try:
-            curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                self._lk_prev_gray, minimap_gray,
-                self._lk_prev_pts, None, **self._lk_params)
-            if curr_pts is None or status is None:
-                return None
-            ok = status.ravel() == 1
-            good_curr = curr_pts[ok]
-            good_prev = self._lk_prev_pts[ok]
-            if len(good_curr) < 4:
-                return None
-            disp = good_curr - good_prev
-            dx_mm = float(np.median(disp[:, 0]))
-            dy_mm = float(np.median(disp[:, 1]))
-            confidence = len(good_curr) / max(len(self._lk_prev_pts), 1)
-            # 更新跟踪点为当前帧（仅用良好点）
-            self._lk_prev_pts = good_curr.reshape(-1, 1, 2)
-            s = self._lk_map_scale
-            return dx_mm * s, dy_mm * s, confidence
-        except cv2.error:
-            return None
-
-    def _ecc_nearby_match(self, minimap_gray, cx_hint, cy_hint):
-        """
-        ECC（增强相关系数）像素级匹配，专用于低纹理场景（海洋/雪地）。
-        利用上次 SIFT 确定的 scale 在大地图中提取等比例区域，
-        用 ECC 找出当前小地图相对于该区域的微小平移。
-        搜索区域为 1.5 倍 crop 大小（允许更大位移）。
-        返回 (tx, ty) 或 None。
-        """
-        if not self._ecc_enabled or self._last_sift_scale is None:
-            return None
-        s = self._last_sift_scale
-        h_mm, w_mm = minimap_gray.shape[:2]
-        crop_w = int(w_mm * s * 1.5)  # 扩大搜索区域
-        crop_h = int(h_mm * s * 1.5)
-        x1 = max(0, cx_hint - crop_w // 2)
-        y1 = max(0, cy_hint - crop_h // 2)
-        x2 = min(self.map_width, x1 + crop_w)
-        y2 = min(self.map_height, y1 + crop_h)
-        actual_w = x2 - x1
-        actual_h = y2 - y1
-        if actual_w < 20 or actual_h < 20:
-            return None
-
-        map_crop = self._logic_map_gray[y1:y2, x1:x2]
-        map_resized = cv2.resize(map_crop, (w_mm, h_mm))
-
-        ref = map_resized.astype(np.float32)
-        tmpl = minimap_gray.astype(np.float32)
-        warp = np.eye(2, 3, dtype=np.float32)
-        try:
-            cc, warp = cv2.findTransformECC(
-                ref, tmpl, warp, cv2.MOTION_TRANSLATION,
-                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 1e-3))
-        except cv2.error:
-            return None
-
-        if cc < self._ecc_min_cc:
-            return None
-
-        # warp maps tmpl→ref: tmpl(x,y) ≈ ref(x+tx, y+ty)
-        # 小地图中心在 ref 空间的位置 = (w_mm/2 - tx, h_mm/2 - ty)
-        # 转换回大地图坐标（ref 像素 → map 坐标）
-        tx_px, ty_px = float(warp[0, 2]), float(warp[1, 2])
-        scale_x = actual_w / w_mm
-        scale_y = actual_h / h_mm
-        center_ref_x = w_mm / 2.0 - tx_px
-        center_ref_y = h_mm / 2.0 - ty_px
-        map_x = int(x1 + center_ref_x * scale_x)
-        map_y = int(y1 + center_ref_y * scale_y)
-
-        if not (0 <= map_x < self.map_width and 0 <= map_y < self.map_height):
-            return None
-        if abs(map_x - cx_hint) + abs(map_y - cy_hint) < self.JUMP_THRESHOLD:
-            return map_x, map_y
-        return None
-
     # ---- 核心匹配 ----
     def match(self, minimap_bgr):
         with self._lock:
@@ -793,25 +406,27 @@ class SIFTMapTracker:
         is_inertial = False
         match_quality = 0.0
 
+        # 护眼/防蓝光软件叠加层色温补偿（硬件 Night Light 不影响截图，无需处理）
+        minimap_bgr = correct_color_temperature(minimap_bgr)
         minimap_gray_raw = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
         texture_std = float(np.std(minimap_gray_raw))
 
         # 自适应 CLAHE + 纹理增强
-        minimap_gray = self._adaptive_clahe(minimap_gray_raw)
-        minimap_gray = self._enhance_for_texture(minimap_gray, texture_std)
+        minimap_gray = adaptive_clahe(minimap_gray_raw, self._clahe_normal, self._clahe_low, self._low_texture_thresh)
+        minimap_gray = enhance_for_texture(minimap_gray, texture_std, self._clahe_low)
 
-        self._lk_frame_num += 1
-        run_sift = (self._lk_frame_num % self._lk_sift_every == 0)
+        self._lk.frame_num += 1
+        run_sift = self._lk.should_run_sift()
 
         _tp_far_candidate = None  # 传送候选：全局 SIFT 匹配成功但超跳变阈值
 
         # ======================================================
         # 第一层：LK 光流快速跟踪（每帧 ~2ms，跳过部分 SIFT 调用）
         # ======================================================
-        lk_result = self._lk_track(minimap_gray)
+        lk_result = self._lk.track(minimap_gray, self.last_x)
         if lk_result is not None and not run_sift:
             dx_map, dy_map, lk_conf = lk_result
-            if lk_conf >= self._lk_min_conf:
+            if lk_conf >= self._lk.min_conf:
                 tx = int(round(self.last_x + dx_map))
                 ty = int(round(self.last_y + dy_map))
                 if (0 <= tx < self.map_width and 0 <= ty < self.map_height
@@ -824,12 +439,12 @@ class SIFTMapTracker:
         # ======================================================
         if not found:
             # 提取特征
-            kp_mini, des_mini = self._extract_minimap_features(minimap_gray)
+            kp_mini, des_mini = extract_minimap_features(minimap_gray, self.sift, self._mask_cache)
 
             # 超低纹理 + 特征过少 → 更激进的预处理重试
             if texture_std < 15 and (des_mini is None or len(kp_mini) < 15):
-                enhanced = self._enhance_for_texture(minimap_gray_raw, texture_std=5)
-                kp_retry, des_retry = self._extract_minimap_features(enhanced)
+                enhanced = enhance_for_texture(minimap_gray_raw, texture_std=5, clahe_low=self._clahe_low)
+                kp_retry, des_retry = extract_minimap_features(enhanced, self.sift, self._mask_cache)
                 if des_retry is not None and len(kp_retry) > (len(kp_mini) if kp_mini is not None else 0):
                     kp_mini, des_mini = kp_retry, des_retry
 
@@ -850,12 +465,13 @@ class SIFTMapTracker:
                             break
                         current_kp, current_flann = list(self.kp_big_all), self.flann_global
 
-                    result = self._sift_match_region(
+                    result = sift_match_region(
                         kp_mini, des_mini, minimap_gray.shape,
-                        current_kp, current_flann, eff_match_ratio, eff_min_match)
+                        current_kp, current_flann, eff_match_ratio, eff_min_match,
+                        self.map_width, self.map_height)
 
                     if result is not None:
-                        tx, ty, inlier_count, quality = result
+                        tx, ty, inlier_count, quality, avg_scale = result
                         if self.last_x is not None:
                             max_jump = self.JUMP_THRESHOLD if search_round == 0 else self.JUMP_THRESHOLD * 2
                             if abs(tx - self.last_x) + abs(ty - self.last_y) >= max_jump:
@@ -864,9 +480,10 @@ class SIFTMapTracker:
                                     _tp_far_candidate = (tx, ty, quality)
                                 continue
                         found, center_x, center_y, match_quality = True, tx, ty, quality
-                        # SIFT 成功 → 更新 LK 比例和跟踪点
-                        if self._last_sift_scale is not None:
-                            self._lk_map_scale = self._last_sift_scale
+                        # SIFT 成功 → 同步 scale
+                        self._last_sift_scale = avg_scale
+                        self._lk.map_scale = avg_scale
+                        self._cold_starter.update_scale(avg_scale)
                         break
 
                 # ---- SIFT 第二轮：附近搜索（使用 FLANN 缓存）----
@@ -883,7 +500,7 @@ class SIFTMapTracker:
                         if len(indices) >= 10:
                             nearby_kp = [self.kp_big_all[i] for i in indices]
                             nearby_des = self.des_big_all[indices]
-                            nearby_flann = self._create_flann(nearby_des)
+                            nearby_flann = create_flann(nearby_des)
                             # 缓存（最多保留 30 个桶）
                             if len(self._nearby_flann_cache) >= 30:
                                 self._nearby_flann_cache.pop(next(iter(self._nearby_flann_cache)))
@@ -892,14 +509,18 @@ class SIFTMapTracker:
                             nearby_kp = nearby_des = nearby_flann = None
 
                     if nearby_flann is not None:
-                        result = self._sift_match_region(
+                        result = sift_match_region(
                             kp_mini, des_mini, minimap_gray.shape,
-                            nearby_kp, nearby_flann, 0.90, 3)
+                            nearby_kp, nearby_flann, 0.90, 3,
+                            self.map_width, self.map_height)
                         if result is not None:
-                            tx, ty, inlier_count, quality = result
+                            tx, ty, inlier_count, quality, avg_scale = result
                             if abs(tx - self.last_x) + abs(ty - self.last_y) < self.JUMP_THRESHOLD * 1.5:
                                 found, center_x, center_y = True, tx, ty
                                 match_quality = quality * 0.8
+                                self._last_sift_scale = avg_scale
+                                self._lk.map_scale = avg_scale
+                                self._cold_starter.update_scale(avg_scale)
 
                     # ---- ORB 兜底 ----
                     if not found:
@@ -911,8 +532,11 @@ class SIFTMapTracker:
 
                     # ---- ECC 像素级兜底（低/中纹理均可，海洋必备）----
                     if not found:
-                        ecc_result = self._ecc_nearby_match(
-                            minimap_gray, self.last_x, self.last_y)
+                        ecc_result = ecc_align(
+                            minimap_gray, self._logic_map_gray,
+                            self.last_x, self.last_y,
+                            self._last_sift_scale, self.map_width, self.map_height,
+                            self.JUMP_THRESHOLD, self._ecc_min_cc)
                         if ecc_result is not None:
                             found, center_x, center_y = True, *ecc_result
                             match_quality = 0.3
@@ -935,7 +559,7 @@ class SIFTMapTracker:
                       and texture_std < _semi_lost_texture_thresh)
         _fully_lost = (self.last_x is None and texture_std < _ocean_texture_thresh)
         if not found and (_fully_lost or _semi_lost) and self._cold_start_cd == 0:
-            cold_result = self._ocean_cold_start(minimap_gray_raw)
+            cold_result = self._cold_starter.locate(minimap_gray_raw, self.last_x, self.last_y, self.lost_frames)
             if cold_result is not None:
                 # semi_lost 模式下拒绝距上次坐标超过 JUMP_THRESHOLD 的冷启动结果：
                 # 防止陆地误匹配到远处海洋候选区后 ECC/LK 在错误位置自我强化锁死
@@ -946,20 +570,22 @@ class SIFTMapTracker:
             if cold_result is not None:
                 found, center_x, center_y = True, cold_result[0], cold_result[1]
                 match_quality = 0.25
+                self._last_sift_scale = self._cold_starter._last_scale
+                self._lk.map_scale = self._cold_starter._last_scale
                 self._cold_start_cd = 60   # 成功：长冷却，让 LK/SIFT 接管
             else:
                 self._cold_start_cd = 20   # 失败：短冷却，横渡时尽快重试
 
         # 更新 LK 上一帧（不论用哪层跟踪，都更新灰度图）
-        self._lk_prev_gray = minimap_gray.copy()
+        self._lk.prev_gray = minimap_gray.copy()
         if found and not is_inertial:
             # 重新提取当前帧关键点给下一帧 LK 使用
             h_mm, w_mm = minimap_gray.shape[:2]
-            circ_mask = self._get_circular_mask(h_mm, w_mm)
+            circ_mask = self._mask_cache.get(h_mm, w_mm)
             pts = cv2.goodFeaturesToTrack(
                 minimap_gray, maxCorners=60, qualityLevel=0.01,
                 minDistance=7, mask=circ_mask)
-            self._lk_prev_pts = pts  # shape (N,1,2) or None
+            self._lk.prev_pts = pts  # shape (N,1,2) or None
 
         # ---- 状态更新 ----
         if found and not is_inertial:
@@ -979,8 +605,8 @@ class SIFTMapTracker:
                 is_inertial = True
             elif self.lost_frames > config.MAX_LOST_FRAMES:
                 self.last_x = self.last_y = None
-                self._lk_prev_gray = None
-                self._lk_prev_pts = None
+                self._lk.prev_gray = None
+                self._lk.prev_pts = None
                 if self.using_local:
                     self._switch_to_global()
 

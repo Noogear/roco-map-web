@@ -27,6 +27,7 @@ from backend import config
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_socketio import SocketIO, emit
 from backend.tracker_core import MapTrackerWeb
+from backend.store import get_route_files, load_route_data, load_circle_state, save_circle_state
 
 # 项目目录路径（backend/ 的上一级）
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,29 +38,6 @@ ASSETS_DIR   = os.path.join(_BASE_DIR, 'assets')
 # ==================== 路线文件管理 ====================
 
 _ROUTES_DIR = os.path.join(_BASE_DIR, 'routes')
-
-
-def _get_route_files():
-    """扫描 routes 目录，返回可用的路线文件列表"""
-    routes = []
-    if not os.path.isdir(_ROUTES_DIR):
-        return routes
-    for f in sorted(os.listdir(_ROUTES_DIR)):
-        if f.lower().endswith('.json'):
-            routes.append(f)
-    return routes
-
-
-def _load_route_data(filename):
-    """加载单个路线 JSON 文件"""
-    filepath = os.path.join(_ROUTES_DIR, filename)
-    if not os.path.isfile(filepath):
-        return None
-    try:
-        with open(filepath, 'r', encoding='utf-8') as fh:
-            return json.load(fh)
-    except Exception:
-        return None
 
 
 # 固定使用 SIFT 引擎
@@ -111,6 +89,7 @@ def _make_status_json() -> bytes:
         'a': round(status.get('arrow_angle', 0), 1),
         'as': int(status.get('arrow_stopped', True)),
         'l': int(tracker.sift_engine.coord_lock_enabled),
+        'tp': int(status.get('is_teleport', False)),
     }, separators=(',', ':')).encode('utf-8')
 
 
@@ -175,27 +154,11 @@ _CIRCLE_STATE_FILE = os.path.join(_BASE_DIR, '.circle_state.json')
 
 
 def _load_circle_state():
-    """启动时从本地文件恢复圆形选区状态"""
-    if not os.path.isfile(_CIRCLE_STATE_FILE):
-        return None
-    try:
-        with open(_CIRCLE_STATE_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return None
+    return load_circle_state(_CIRCLE_STATE_FILE)
 
 
 def _save_circle_state(cx, cy, r):
-    """将圆形选区状态写入本地 JSON 文件"""
-    try:
-        data = {'cx': cx, 'cy': cy, 'r': r, 'ts': time.time()}
-        with open(_CIRCLE_STATE_FILE, 'w') as f:
-            json.dump(data, f)
-        print(f"💾 圆形选区已保存: cx={cx:.4f}, cy={cy:.4f}, r={r:.4f}")
-        return True
-    except Exception as e:
-        print(f"[警告] 保存圆形选区失败: {e}")
-        return False
+    return save_circle_state(_CIRCLE_STATE_FILE, cx, cy, r)
 
 
 # 启动时加载已有状态
@@ -407,10 +370,10 @@ def process():
 @app.route('/api/routes')
 def api_list_routes():
     """列出所有可用路线文件"""
-    files = _get_route_files()
+    files = get_route_files(_ROUTES_DIR)
     routes = []
     for f in files:
-        data = _load_route_data(f)
+        data = load_route_data(_ROUTES_DIR, f)
         if data:
             routes.append({
                 'filename': f,
@@ -428,7 +391,7 @@ def api_get_route(filename):
     safe_name = os.path.basename(filename)
     if not safe_name.endswith('.json'):
         return jsonify({'error': 'Only JSON files allowed'}), 400
-    data = _load_route_data(safe_name)
+    data = load_route_data(_ROUTES_DIR, safe_name)
     if data is None:
         return jsonify({'error': 'Route not found'}), 404
     data['filename'] = safe_name
