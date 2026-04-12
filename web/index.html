@@ -510,8 +510,16 @@ TC.init({
                 imgSrc = 'data:image/jpeg;base64,' + imgSrc;
             }
             // 必须在同步阶段捕获坐标，onload 是异步的，届时 _mapState 已被新帧覆盖
+            var capX = _mapState ? _mapState.x : 0;
+            var capY = _mapState ? _mapState.y : 0;
             var img = new Image();
-            img.onload = function() { _lastJpegImg = img; };
+            img.onload = function() {
+                _prevJpegImg = _lastJpegImg;
+                _prevJpegPos = _lastJpegPos;
+                _lastJpegImg = img;
+                _lastJpegPos = { x: capX, y: capY };
+                _jpegFadeAlpha = 0;  // 开始淡入
+            };
             img.src = imgSrc;
         }
         if (result.status) {
@@ -900,7 +908,11 @@ var _mapRAFActive = false;
 var _mapRAFId = null;
 // JPEG 模式专用状态
 var _renderMode = 'bigmap';       // 'bigmap' | 'jpeg'
-var _lastJpegImg = null;          // 上一帧 JPEG decode 后的 Image 对象
+var _lastJpegImg = null;          // 当前 JPEG 图片（Image 对象）
+var _lastJpegPos = null;          // 当前 JPEG 对应的服务端坐标 {x,y}，用于亚帧微平移
+var _prevJpegImg = null;          // 交叉淡入淡出：前一帧 JPEG
+var _prevJpegPos = null;          // 交叉淡入淡出：前一帧 JPEG 坐标
+var _jpegFadeAlpha = 1;           // JPEG 淡入进度 0→1（1 = 完全显示当前帧）
 var _renderPos = null;            // 渲染平滑位置（EMA，消除新后端帧到来时的回弹）
 
 // 加载展示地图（用 fetch 取进度，失败自动降级 JPEG 模式）
