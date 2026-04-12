@@ -510,17 +510,8 @@ TC.init({
                 imgSrc = 'data:image/jpeg;base64,' + imgSrc;
             }
             // 必须在同步阶段捕获坐标，onload 是异步的，届时 _mapState 已被新帧覆盖
-            var capX = _mapState ? _mapState.x : 0;
-            var capY = _mapState ? _mapState.y : 0;
             var img = new Image();
-            img.onload = function() {
-                // 交叉淡入淡出：旧帧留作 prev，新帧从 alpha=0 淡入
-                _prevJpegImg = _lastJpegImg;
-                _prevJpegPos = _lastJpegPos;
-                _lastJpegImg = img;
-                _lastJpegPos = { x: capX, y: capY };
-                _jpegFadeAlpha = 0;  // 开始淡入
-            };
+            img.onload = function() { _lastJpegImg = img; };
             img.src = imgSrc;
         }
         if (result.status) {
@@ -909,11 +900,7 @@ var _mapRAFActive = false;
 var _mapRAFId = null;
 // JPEG 模式专用状态
 var _renderMode = 'bigmap';       // 'bigmap' | 'jpeg'
-var _lastJpegImg = null;          // 当前 JPEG 图片（Image 对象）
-var _lastJpegPos = null;          // 当前 JPEG 对应的服务端坐标 {x,y}，用于亚帧微平移
-var _prevJpegImg = null;          // 交叉淡入淡出：前一帧 JPEG
-var _prevJpegPos = null;          // 交叉淡入淡出：前一帧 JPEG 坐标
-var _jpegFadeAlpha = 1;           // JPEG 淡入进度 0→1（1 = 完全显示当前帧）
+var _lastJpegImg = null;          // 上一帧 JPEG decode 后的 Image 对象
 var _renderPos = null;            // 渲染平滑位置（EMA，消除新后端帧到来时的回弹）
 
 // 加载展示地图（用 fetch 取进度，失败自动降级 JPEG 模式）
@@ -1114,55 +1101,16 @@ function _renderMapCanvas() {
         return;
     }
 
-    // ---- JPEG 模式 ----
-    // 利用 Catmull-Rom 插值位置对 JPEG 做亚帧微平移（pan），60fps 平滑滚动。
-    // 同时做交叉淡入淡出，遮住 JPEG 切换的跳变瞬间。
-    // 最大平移量限为 ±40px，超出说明 JPEG 已严重过期，退化到直接覆盖。
+    // ---- JPEG 模式（Plan B）----
+    // 后端已将玩家居中裁切到 400×400，直接绘制即可，无需额外偏移
+    // （偏移会引入黑边和回弹，因为 JPEG 仅 400px，平移后超界露底色）
     if (!_lastJpegImg || !_lastJpegImg.complete) {
         ctx.fillStyle = '#111'; ctx.fillRect(0, 0, vSize, vSize);
         ctx.fillStyle = '#555'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
         ctx.fillText(_mapState ? '定位中...' : '等待分析...', half, half);
         return;
     }
-
-    var MAX_SHIFT = 40;
-
-    // 计算当前 JPEG（新帧）的 pan 偏移
-    var ndx = 0, ndy = 0;
-    if (_lastJpegPos && extPos) {
-        ndx = extPos.x - _lastJpegPos.x;
-        ndy = extPos.y - _lastJpegPos.y;
-        if (Math.abs(ndx) > MAX_SHIFT || Math.abs(ndy) > MAX_SHIFT) { ndx = 0; ndy = 0; }
-        ndx = Math.round(ndx); ndy = Math.round(ndy);
-    }
-
-    // 推进淡入（每帧 +~25%，约 4 帧/60ms 完成淡入）
-    if (_jpegFadeAlpha < 1) {
-        _jpegFadeAlpha = Math.min(1, _jpegFadeAlpha + 0.25);
-    }
-
-    // 先绘制旧帧（fade-out），计算旧帧的 pan 偏移
-    if (_jpegFadeAlpha < 1 && _prevJpegImg && _prevJpegImg.complete) {
-        var pdx = 0, pdy = 0;
-        if (_prevJpegPos && extPos) {
-            pdx = extPos.x - _prevJpegPos.x;
-            pdy = extPos.y - _prevJpegPos.y;
-            if (Math.abs(pdx) > MAX_SHIFT || Math.abs(pdy) > MAX_SHIFT) { pdx = 0; pdy = 0; }
-            pdx = Math.round(pdx); pdy = Math.round(pdy);
-        }
-        ctx.save();
-        ctx.globalAlpha = 1 - _jpegFadeAlpha;
-        ctx.drawImage(_prevJpegImg, pdx, pdy, vSize, vSize, 0, 0, vSize, vSize);
-        ctx.restore();
-        // 新帧叠加在旧帧之上（fade-in）
-        ctx.save();
-        ctx.globalAlpha = _jpegFadeAlpha;
-        ctx.drawImage(_lastJpegImg, ndx, ndy, vSize, vSize, 0, 0, vSize, vSize);
-        ctx.restore();
-    } else {
-        // 淡入完成：直接绘制（无 alpha 开销）
-        ctx.drawImage(_lastJpegImg, ndx, ndy, vSize, vSize, 0, 0, vSize, vSize);
-    }
+    ctx.drawImage(_lastJpegImg, 0, 0, vSize, vSize);
 }
 
 function _mapRAFLoop() {
