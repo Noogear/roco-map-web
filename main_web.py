@@ -471,10 +471,10 @@ def ws_receive_frame(raw_bytes):
 
         emit('result',
              struct.pack('>I', len(status_json)) + status_json + jpeg_result,
-             binary=True, broadcast=True, skip_sid=request.sid)
+             binary=True, broadcast=True)
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True, broadcast=True, skip_sid=request.sid)
+        emit('error', struct.pack('>I', len(err)) + err, binary=True)
 
 
 @socketio.on('frame_coords')
@@ -507,10 +507,10 @@ def ws_frame_coords(raw_bytes):
 
         emit('coords',
              struct.pack('>I', len(status_json)) + status_json,
-             binary=True, broadcast=True, skip_sid=request.sid)
+             binary=True, broadcast=True)
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True, broadcast=True, skip_sid=request.sid)
+        emit('error', struct.pack('>I', len(err)) + err, binary=True)
 
 
 # ==================== 启动入口 ====================
