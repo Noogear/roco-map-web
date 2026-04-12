@@ -185,6 +185,12 @@ class SIFTMapTracker:
         self._ecc_min_cc = getattr(config, 'ECC_MIN_CORRELATION', 0.25)
         self._last_sift_scale = self._lk_map_scale  # 默认与 LK scale 一致，进海洋后 ECC 可立即工作
 
+        # 海洋/低纹理区域冷启动（启动时预扫描大地图）
+        self._ocean_std_thresh = getattr(config, 'OCEAN_STD_THRESHOLD', 20)
+        self._ocean_region_tile = getattr(config, 'OCEAN_REGION_TILE', 400)
+        self._ocean_candidates = self._build_ocean_candidates(logic_map_gray)
+        print(f"🌊 低纹理区域候选: {len(self._ocean_candidates)} 个")
+
         # 附近搜索 FLANN 缓存（按网格桶缓存，避免每帧重建）
         self._nearby_flann_cache = {}
         self._nearby_flann_bucket = 200  # 网格粒度（地图像素）
@@ -459,6 +465,91 @@ class SIFTMapTracker:
         mask = self._make_circular_mask(h, w)
         self._circ_mask_cache[key] = mask
         return mask
+
+    def _build_ocean_candidates(self, map_gray):
+        """
+        启动时扫描大地图，找出所有低纹理区域（海洋/大片裸地等）作为冷启动候选。
+        返回 list of (cx, cy, mean_val) 三元组。
+        """
+        tile = self._ocean_region_tile
+        h, w = map_gray.shape[:2]
+        half = tile // 2
+        candidates = []
+        for cy in range(half, h - half, tile):
+            for cx in range(half, w - half, tile):
+                patch = map_gray[cy - half:cy + half, cx - half:cx + half]
+                if float(np.std(patch)) < self._ocean_std_thresh:
+                    candidates.append((cx, cy, float(np.mean(patch))))
+        return candidates
+
+    def _ocean_cold_start(self, minimap_gray_raw):
+        """
+        冷启动低纹理场景定位：将小地图与大地图预标记低纹理区域做多尺度模板匹配。
+        - 多尺度：冷启动时比例未知，在 3.5‒5.5 间扫描取最优
+        - 圆形掩码：将小地图四角黑边填充为均值，避免干扰相关系数
+        minimap_gray_raw: 未经 CLAHE 增强的原始灰度小地图。
+        返回 (tx, ty) 或 None。
+        """
+        if not self._ocean_candidates:
+            return None
+
+        h_mm, w_mm = minimap_gray_raw.shape[:2]
+        mini_mean = float(np.mean(minimap_gray_raw))
+        color_thresh = getattr(config, 'OCEAN_COLOR_THRESH', 35)
+        margin = self._ocean_region_tile // 2
+        min_cc = getattr(config, 'OCEAN_COLD_START_MIN_CC', 0.30)
+
+        # 颜色预筛选（快速排除明显不同亮度的区域）
+        close_candidates = [(cx, cy, mm) for cx, cy, mm in self._ocean_candidates
+                            if abs(mm - mini_mean) < color_thresh]
+        if not close_candidates:
+            return None
+
+        # 圆形掩码：四角填充为均值，减少角落黑边对相关系数的干扰
+        circ_mask = self._get_circular_mask(h_mm, w_mm)
+        mini_filled = minimap_gray_raw.copy()
+        mini_filled[circ_mask == 0] = int(mini_mean)
+
+        # 多尺度：冷启动时实际比例未知，用当前估计 ±25% 范围扫描
+        base_s = self._last_sift_scale  # 通常 4.0
+        scales = sorted({round(base_s * f, 2) for f in (0.75, 0.875, 1.0, 1.125, 1.25)}
+                        | {3.5, 4.0, 4.5, 5.0})
+
+        best_cc = -1.0
+        best_pos = None
+        best_scale = base_s
+
+        for s in scales:
+            dst_w = max(1, int(w_mm * s))
+            dst_h = max(1, int(h_mm * s))
+            mini_scaled = cv2.resize(mini_filled, (dst_w, dst_h))
+
+            for cx, cy, _ in close_candidates:
+                x1 = max(0, cx - dst_w // 2 - margin)
+                y1 = max(0, cy - dst_h // 2 - margin)
+                x2 = min(self.map_width,  x1 + dst_w + 2 * margin)
+                y2 = min(self.map_height, y1 + dst_h + 2 * margin)
+                region = self._logic_map_gray[y1:y2, x1:x2]
+                if region.shape[0] <= dst_h or region.shape[1] <= dst_w:
+                    continue
+                try:
+                    res = cv2.matchTemplate(region, mini_scaled, cv2.TM_CCOEFF_NORMED)
+                except cv2.error:
+                    continue
+                _, max_val, _, max_loc = cv2.minMaxLoc(res)
+                if max_val > best_cc:
+                    best_cc = max_val
+                    match_x = x1 + max_loc[0] + dst_w // 2
+                    match_y = y1 + max_loc[1] + dst_h // 2
+                    best_pos = (match_x, match_y)
+                    best_scale = s
+
+        if best_pos is not None and best_cc >= min_cc:
+            # 用冷启动匹配到的比例更新 scale，提升后续 ECC / LK 精度
+            self._last_sift_scale = best_scale
+            self._lk_map_scale = best_scale
+            return best_pos
+        return None
 
     def _enhance_for_texture(self, gray, texture_std):
         """统一的纹理增强：根据 texture_std 连续决定增强强度"""
@@ -803,6 +894,14 @@ class SIFTMapTracker:
                         if ecc_result is not None:
                             found, center_x, center_y = True, *ecc_result
                             match_quality = 0.3
+
+        # ---- 冷启动低纹理场景兜底（海洋/大片裸地，last_x 为 None）----
+        # 不限 texture_std：只要 SIFT 失败 + 无历史位置，就尝试多尺度模板匹配
+        if not found and self.last_x is None:
+            cold_result = self._ocean_cold_start(minimap_gray_raw)
+            if cold_result is not None:
+                found, center_x, center_y = True, cold_result[0], cold_result[1]
+                match_quality = 0.25
 
         # 更新 LK 上一帧（不论用哪层跟踪，都更新灰度图）
         self._lk_prev_gray = minimap_gray.copy()
