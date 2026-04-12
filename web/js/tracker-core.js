@@ -433,6 +433,7 @@ const TrackerCore = (() => {
             // 连接中则复用同一个 Promise，避免并发调用创建多个 socket
             if (S.wsConnecting) return S.wsConnecting;
             S.wsConnecting = new Promise(function(resolve, reject) {
+
                 try {
                     var sock = io({
                         transports: ['websocket'],
@@ -521,6 +522,7 @@ const TrackerCore = (() => {
                     reject(e);
                 }
             });
+            return S.wsConnecting;
         },
 
         disconnectWS() {
