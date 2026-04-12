@@ -43,6 +43,7 @@ const TrackerCore = (() => {
         wsSocket: null,
         wsConnected: false,
         captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
+        lastWasUpdate: false, // logUpdate 状态标记
     };
 
     let opts = {
@@ -71,14 +72,38 @@ const TrackerCore = (() => {
 
         // ========== 日志 ==========
         log(msg) {
+            S.lastWasUpdate = false;
             let el = opts.logEl;
             if (typeof el === 'string') el = document.getElementById(el);
             if (!el) return;
             const time = new Date().toLocaleTimeString();
             el.textContent += `[${time}] ${msg}\n`;
-            var MAX = parseInt(el.dataset.maxLen || '5000', 10);
-            var TRIM = parseInt(el.dataset.trimLen || '4000', 10);
+            var MAX = parseInt(el.dataset.maxLen || '3000', 10);
+            var TRIM = parseInt(el.dataset.trimLen || '2000', 10);
             if (el.textContent.length > MAX) el.textContent = el.textContent.slice(-TRIM);
+            el.scrollTop = el.scrollHeight;
+        },
+
+        /** 覆盖式日志：高频状态行原地刷新，不堆积 */
+        logUpdate(msg) {
+            let el = opts.logEl;
+            if (typeof el === 'string') el = document.getElementById(el);
+            if (!el) return;
+            const time = new Date().toLocaleTimeString();
+            const line = `[${time}] ${msg}\n`;
+            if (S.lastWasUpdate) {
+                // 替换最后一行（找倒数第二个换行符）
+                var text = el.textContent;
+                var end = text.length - 1; // 跳过末尾 \n
+                var prev = text.lastIndexOf('\n', end - 1);
+                el.textContent = (prev >= 0 ? text.slice(0, prev + 1) : '') + line;
+            } else {
+                S.lastWasUpdate = true;
+                el.textContent += line;
+                var MAX = parseInt(el.dataset.maxLen || '3000', 10);
+                var TRIM = parseInt(el.dataset.trimLen || '2000', 10);
+                if (el.textContent.length > MAX) el.textContent = el.textContent.slice(-TRIM);
+            }
             el.scrollTop = el.scrollHeight;
         },
 
@@ -341,11 +366,12 @@ const TrackerCore = (() => {
                 });
             }).then(function(result) {
                 if (result.status) {
-                    self.log('\u5206\u6790\u5b8c\u6210 | ' +
-                        (result.status.found ? '\u2705 \u627e\u5230\u4f4d\u7f6e' : '\u274c \u672a\u627e\u5230') +
-                        ' (' + result.status.matches + ' \u5339\u914d\u70b9)');
+                    var st = result.status;
+                    var icon = st.found ? '\u2705' : '\u274c';
+                    var pos = st.found ? ' (' + st.position.x + ', ' + st.position.y + ')' : '';
+                    self.logUpdate(icon + ' ' + (st.found ? '\u627e\u5230' : '\u672a\u627e\u5230') + pos + ' | ' + st.matches + '\u5339');
                 } else {
-                    self.log('\u5206\u6790\u5b8c\u6210\uff0c\u4f46\u672a\u8fd4\u56de\u72b6\u6001\u4fe1\u606f');
+                    self.logUpdate('\u5206\u6790\u5b8c\u6210\uff0c\u65e0\u72b6\u6001');
                 }
                 if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                 return result;
@@ -425,9 +451,10 @@ const TrackerCore = (() => {
                                 hybrid_busy: !!status.h,
                             }
                         };
-                            self.log('\u5206\u6790\u5b8c\u6210 | ' +
-                                (result.status.found ? '\u2705 \u627e\u5230\u4f4d\u7f6e' : '\u274c \u672a\u627e\u5230') +
-                                ' (' + result.status.matches + ' \u5339\u914d\u70b9)');
+                            var rs = result.status;
+                            var icon = rs.found ? '\u2705' : '\u274c';
+                            var pos = rs.found ? ' (' + rs.position.x + ', ' + rs.position.y + ')' : '';
+                            self.logUpdate(icon + ' ' + (rs.found ? '\u627e\u5230' : '\u672a\u627e\u5230') + pos + ' | ' + rs.matches + '\u5339');
                             if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                         }
                     });
