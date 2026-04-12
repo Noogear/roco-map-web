@@ -783,46 +783,38 @@ class AIMapTrackerWeb:
         return found, display_crop, status_state, match_count, last_x, last_y
 
     def _render_sift_crop(self, smooth_x, smooth_y, cx, cy, found, is_inertial, arrow_angle, arrow_stopped, result, half_view):
-        """SIFT 模式的地图裁剪和标记绘制，返回 (display_crop, status_state)"""
+        """SIFT 模式的地图裁剪，返回 (display_crop, status_state)。
+        扩边 JPEG_PAD 像素供前端亚帧微平移；箭头/圆点由前端 60fps 叠加，此处不绘制。
+        """
+        pad = getattr(config, 'JPEG_PAD', 0)
         if found and cx is not None:
             ox = getattr(config, 'RENDER_OFFSET_X', 0)
             oy = getattr(config, 'RENDER_OFFSET_Y', 0)
 
-            y1 = max(0, smooth_y + oy - half_view)
-            y2 = min(self.map_height, smooth_y + oy + half_view)
-            x1 = max(0, smooth_x + ox - half_view)
-            x2 = min(self.map_width, smooth_x + ox + half_view)
+            y1 = max(0, smooth_y + oy - half_view - pad)
+            y2 = min(self.map_height, smooth_y + oy + half_view + pad)
+            x1 = max(0, smooth_x + ox - half_view - pad)
+            x2 = min(self.map_width, smooth_x + ox + half_view + pad)
             display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
-            local_x = (smooth_x + ox) - x1
-            local_y = (smooth_y + oy) - y1
-            if not is_inertial:
-                self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle, stopped=arrow_stopped)
-                cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=4, color=(0, 255, 0), thickness=-1)
-                cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=7, color=(255, 255, 255), thickness=1)
-            else:
-                self.sift_engine._draw_arrow_marker(display_crop, local_x, local_y, angle=arrow_angle, stopped=arrow_stopped)
-                cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=4, color=(0, 255, 255), thickness=-1)
-                cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=7, color=(255, 255, 255), thickness=1)
+            # 箭头与位置标记由前端在 canvas 上叠加，后端不再绘制
         else:
             if self.sift_engine.last_x is not None and self.sift_engine.last_y is not None:
-                y1 = max(0, self.sift_engine.last_y - half_view)
-                y2 = min(self.map_height, self.sift_engine.last_y + half_view)
-                x1 = max(0, self.sift_engine.last_x - half_view)
-                x2 = min(self.map_width, self.sift_engine.last_x + half_view)
+                y1 = max(0, self.sift_engine.last_y - half_view - pad)
+                y2 = min(self.map_height, self.sift_engine.last_y + half_view + pad)
+                x1 = max(0, self.sift_engine.last_x - half_view - pad)
+                x2 = min(self.map_width, self.sift_engine.last_x + half_view + pad)
             else:
                 x1 = x2 = y1 = y2 = 0
 
             if (self.sift_engine.last_x is not None and self.sift_engine.last_y is not None and
                     x2 > x1 and y2 > y1):
                 display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
-                local_x = self.sift_engine.last_x - x1
-                local_y = self.sift_engine.last_y - y1
-                cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=5, color=(0, 0, 255), thickness=-1)
-                cv2.circle(display_crop, (local_x, int(local_y + 6)), radius=8, color=(255, 255, 255), thickness=1)
             else:
-                display_crop = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
+                full_size = config.VIEW_SIZE + 2 * pad
+                display_crop = np.zeros((full_size, full_size, 3), dtype=np.uint8)
                 lock_label = "🔒 " if self.sift_engine.coord_lock_enabled else ""
-                cv2.putText(display_crop, f"{lock_label}Lost...", (130, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.putText(display_crop, f"{lock_label}Lost...", (130 + pad, 200 + pad),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         # 状态显示
         if self.sift_engine.coord_lock_enabled:
@@ -860,15 +852,18 @@ class AIMapTrackerWeb:
         return found, display_crop, status_state, match_count, last_x, last_y
 
     def _compose_output_frame(self, display_crop, half_view):
-        """将裁剪地图贴到固定大小画布上，返回最终 BGR 帧。"""
-        view_size = config.VIEW_SIZE
+        """将裁剪地图居中贴到画布上，返回最终 BGR 帧。
+        画布尺寸 = VIEW_SIZE + 2*JPEG_PAD，供前端亚帧微平移使用。
+        """
+        pad = getattr(config, 'JPEG_PAD', 0)
+        full_size = config.VIEW_SIZE + 2 * pad
         # 创建 BGR 画布并居中粘贴
-        final_bgr = np.full((view_size, view_size, 3), 43, dtype=np.uint8)
+        final_bgr = np.full((full_size, full_size, 3), 43, dtype=np.uint8)
         h, w = display_crop.shape[:2]
-        y_off = max(0, half_view - h // 2)
-        x_off = max(0, half_view - w // 2)
-        paste_h = min(h, view_size - y_off)
-        paste_w = min(w, view_size - x_off)
+        y_off = max(0, (full_size - h) // 2)
+        x_off = max(0, (full_size - w) // 2)
+        paste_h = min(h, full_size - y_off)
+        paste_w = min(w, full_size - x_off)
         final_bgr[y_off:y_off + paste_h, x_off:x_off + paste_w] = display_crop[:paste_h, :paste_w]
 
         return final_bgr
