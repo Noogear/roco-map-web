@@ -718,9 +718,17 @@ class AIMapTrackerWeb:
                     self.sift_engine.lost_frames = 0
                     self.sift_engine._switch_to_local(_med_x, _med_y)
 
-        # === 渲染平滑防抖：静止死区 + 移动 EMA ===
+        # === 渲染平滑防抖：静止死区 + 速度自适应 EMA ===
+        # alpha 随速度线性增大：慢速平滑抗抖，快速立即跟随避免视觉滞后
+        #   dist ≤ still_threshold → 静止死区（不动）
+        #   dist ≤ ema_slow_dist  → alpha = ema_alpha_min（最平滑）
+        #   dist ≥ ema_fast_dist  → alpha = ema_alpha_max（立即跟随）
+        #   中间线性插值
         still_threshold = getattr(config, 'RENDER_STILL_THRESHOLD', 2)
-        ema_alpha = getattr(config, 'RENDER_EMA_ALPHA', 0.45)
+        ema_alpha_min = getattr(config, 'RENDER_EMA_ALPHA', 0.35)     # 慢速最低 alpha
+        ema_alpha_max = getattr(config, 'RENDER_EMA_ALPHA_MAX', 0.92) # 快速最高 alpha
+        ema_slow_dist = getattr(config, 'RENDER_EMA_SLOW_DIST', 6)    # 低于此速度用 min
+        ema_fast_dist = getattr(config, 'RENDER_EMA_FAST_DIST', 45)   # 高于此速度用 max
         if found and smooth_x and smooth_y:
             if self._display_x is None:
                 # 首帧直接初始化
@@ -734,15 +742,20 @@ class AIMapTrackerWeb:
                     # 静止死区：保持不动
                     pass
                 else:
-                    # 移动 EMA：平滑向目标靠近，消除方向移动时的横向抖动
-                    self._display_x = int(self._display_x + ema_alpha * ddx)
-                    self._display_y = int(self._display_y + ema_alpha * ddy)
+                    # 速度自适应 alpha：慢→平滑，快→立即跟随
+                    t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
+                    adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
+                    self._display_x = int(self._display_x + adaptive_alpha * ddx)
+                    self._display_y = int(self._display_y + adaptive_alpha * ddy)
             else:
-                # 惯性帧：同样用 EMA，但允许在静止死区内跟随（卡尔曼预测不应锁死）
+                # 惯性帧（卡尔曼预测）：同样速度自适应，预测值不应锁死
                 ddx = smooth_x - self._display_x
                 ddy = smooth_y - self._display_y
-                self._display_x = int(self._display_x + ema_alpha * ddx)
-                self._display_y = int(self._display_y + ema_alpha * ddy)
+                dist = math.sqrt(ddx * ddx + ddy * ddy)
+                t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
+                adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
+                self._display_x = int(self._display_x + adaptive_alpha * ddx)
+                self._display_y = int(self._display_y + adaptive_alpha * ddy)
             smooth_x, smooth_y = self._display_x, self._display_y
 
         # 渲染裁剪区域 + 画点

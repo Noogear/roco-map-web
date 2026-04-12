@@ -88,7 +88,10 @@ RENDER_OFFSET_Y = 0
 
 # --- 渲染平滑 ---
 RENDER_STILL_THRESHOLD = 5
-RENDER_EMA_ALPHA = 0.35
+RENDER_EMA_ALPHA = 0.35          # 慢速时的最低 alpha（最平滑）
+RENDER_EMA_ALPHA_MAX = 0.92      # 快速时的最高 alpha（立即跟随，无视觉滞后）
+RENDER_EMA_SLOW_DIST = 6         # 低于此 px 差距使用 ALPHA 最小值
+RENDER_EMA_FAST_DIST = 45        # 高于此 px 差距使用 ALPHA 最大值
 
 # --- 传送检测 ---
 TP_JUMP_THRESHOLD = 300

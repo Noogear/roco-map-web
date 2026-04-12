@@ -506,8 +506,9 @@ class SIFTMapTracker:
         margin = self._ocean_region_tile // 2
         min_cc = getattr(config, 'OCEAN_COLD_START_MIN_CC', 0.20)
 
-        # 半丢失时只搜附近 1200px 范围（大幅减少搜索量）
-        _semi_lost_radius = 1200
+        # 半丢失时根据丢帧数动态扩大搜索半径：丢帧越多玩家移动越远
+        # 最小 1200px，每超出 8 帧额外增加 60px，最大 2400px
+        _semi_lost_radius = min(2400, 1200 + max(0, self.lost_frames - 8) * 60)
         if self.last_x is not None:
             close_candidates = [
                 (cx, cy, mm) for cx, cy, mm in self._ocean_candidates
@@ -919,23 +920,26 @@ class SIFTMapTracker:
 
         # ---- 冷启动低纹理场景兜底（海洋/大片裸地/海岸线）----
         # 触发条件1: 完全丢失跟踪（last_x=None）+ 小地图低纹理 + 冷却结束
-        # 触发条件2: 半丢失(连续丢帧>15但<MAX)+ 低纹理 — 海洋近岸场景专用
-        # 冷却机制：触发一次后冻结 90 帧（约 3 秒），防止暂停页面等纯色 UI
-        #   图像反复误触发 → last_x 被设置 → LK 失败 → last_x 清空 → 再触发 → 闪烁环
+        # 触发条件2: 半丢失(连续丢帧>8但<MAX)+ 低纹理 — 海洋近岸/横渡场景专用
+        # 冷却机制：
+        #   成功：冻结 60 帧（~2秒），下帧由 LK+SIFT 接管，不会再触发
+        #   失败：冻结 20 帧（~0.7秒），尽快重试，适应横渡过程中持续找不到的情况
         # ★ 成功后恢复：cold_result 进入普通状态更新，last_x/last_y 赋值，
         #   下一帧 LK + SIFT 自动接管，不再触发（last_x 已非 None）
         if self._cold_start_cd > 0:
             self._cold_start_cd -= 1
         _ocean_texture_thresh = 55  # 包含海岸线混合纹理的阈值（比纯海洋高）
-        _semi_lost = (self.last_x is not None and self.lost_frames >= 15
+        _semi_lost = (self.last_x is not None and self.lost_frames >= 8
                       and texture_std < _ocean_texture_thresh)
         _fully_lost = (self.last_x is None and texture_std < _ocean_texture_thresh)
         if not found and (_fully_lost or _semi_lost) and self._cold_start_cd == 0:
             cold_result = self._ocean_cold_start(minimap_gray_raw)
-            self._cold_start_cd = 90   # 无论成功与否，冷却 90 帧
             if cold_result is not None:
                 found, center_x, center_y = True, cold_result[0], cold_result[1]
                 match_quality = 0.25
+                self._cold_start_cd = 60   # 成功：长冷却，让 LK/SIFT 接管
+            else:
+                self._cold_start_cd = 20   # 失败：短冷却，横渡时尽快重试
 
         # 更新 LK 上一帧（不论用哪层跟踪，都更新灰度图）
         self._lk_prev_gray = minimap_gray.copy()
