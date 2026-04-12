@@ -6,7 +6,12 @@ $:
         tags: cnb:arch:amd64
         cpus: 6
       services:
-        - vscode
+        - name: vscode
+          options:
+            launch: uv run main_web.py cpu
+            keepAliveTimeout: 3600000
+            daemon: true
+            backup: true
         - docker
       stages:
         - name: ls

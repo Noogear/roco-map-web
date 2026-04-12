@@ -657,49 +657,78 @@ class AIMapTrackerWeb:
                 self._save_smooth_buffer()
 
         # === 传送检测：候选聚类确认 ===
-        # 条件：真实匹配帧 + 当前显示位置已初始化 + 卡尔曼输出距显示位置超过阈值
+        # 来源1: 真实匹配帧的卡尔曼输出超跳变阈值（原有逻辑）
+        # 来源2: SIFT 引擎全局搜索发现远处高质量匹配但被跳变过滤丢弃（新增）
+        _tp_thresh = getattr(config, 'TP_JUMP_THRESHOLD', 300)
+        _tp_new_entry = False  # 本帧是否有新的传送候选进入缓冲
+
+        # 来源2：引擎传回的远距离候选（绕过了 JUMP_THRESHOLD 但质量达标）
+        _far_cand = result.get('_tp_far_candidate')
+        if _far_cand is not None and self._display_x is not None:
+            _fc_x, _fc_y, _fc_q = _far_cand
+            _fc_jump = math.sqrt(
+                (_fc_x - self._display_x) ** 2 + (_fc_y - self._display_y) ** 2
+            )
+            if _fc_jump > _tp_thresh:
+                self._tp_candidate_buffer.append((_fc_x, _fc_y))
+                _tp_new_entry = True
+
+        # 来源1: 真实匹配帧的卡尔曼输出超跳变阈值
         if (found and not is_inertial and cx is not None
                 and self._display_x is not None):
             _tp_jump = math.sqrt(
                 (smooth_x - self._display_x) ** 2 + (smooth_y - self._display_y) ** 2
             )
-            _tp_thresh = getattr(config, 'TP_JUMP_THRESHOLD', 300)
             if _tp_jump > _tp_thresh:
-                # 大幅跳变：放入候选缓冲
                 self._tp_candidate_buffer.append((smooth_x, smooth_y))
-                _tp_confirm = getattr(config, 'TP_CONFIRM_FRAMES', 3)
-                _tp_radius = getattr(config, 'TP_CLUSTER_RADIUS', 150)
-                if len(self._tp_candidate_buffer) >= _tp_confirm:
-                    # 检查候选点是否空间聚集（聚集 = 传送，分散 = 噪声）
-                    _cands = list(self._tp_candidate_buffer)
-                    _med_x = sorted(c[0] for c in _cands)[len(_cands) // 2]
-                    _med_y = sorted(c[1] for c in _cands)[len(_cands) // 2]
-                    _scatter = max(
-                        math.sqrt((c[0] - _med_x) ** 2 + (c[1] - _med_y) ** 2)
-                        for c in _cands
-                    )
-                    if _scatter <= _tp_radius:
-                        # 聚类确认：立即重置所有过滤器到新位置，消除延迟
-                        print(f"[传送检测] 聚类确认 scatter={_scatter:.0f}px → "
-                              f"立即重置到 ({_med_x},{_med_y})")
-                        self.pos_history.clear()
-                        self.smooth_buffer_x.clear()
-                        self.smooth_buffer_y.clear()
-                        self._kalman_reset(_med_x, _med_y)
-                        self._linear_filter_consecutive = 0
-                        self._display_x = _med_x   # 关键：跳过 EMA，立即跳到新位置
-                        self._display_y = _med_y
-                        self._tp_candidate_buffer.clear()
-                        smooth_x, smooth_y = _med_x, _med_y
-                    # else: 候选点分散 → 噪声，不处理，等待更多帧
+                _tp_new_entry = True
             else:
                 # 跳变量正常 → 是正常移动，清除候选缓冲
                 if self._tp_candidate_buffer:
                     self._tp_candidate_buffer.clear()
 
-        # === 渲染平滑防抖：静止死区 + 移动 EMA ===
+        # 聚类确认（不限制必须在 found+非惯性帧内，来源2的候选也能触发）
+        _tp_confirm = getattr(config, 'TP_CONFIRM_FRAMES', 3)
+        _tp_radius = getattr(config, 'TP_CLUSTER_RADIUS', 150)
+        if _tp_new_entry and len(self._tp_candidate_buffer) >= _tp_confirm:
+            _cands = list(self._tp_candidate_buffer)
+            _med_x = sorted(c[0] for c in _cands)[len(_cands) // 2]
+            _med_y = sorted(c[1] for c in _cands)[len(_cands) // 2]
+            _scatter = max(
+                math.sqrt((c[0] - _med_x) ** 2 + (c[1] - _med_y) ** 2)
+                for c in _cands
+            )
+            if _scatter <= _tp_radius:
+                # 聚类确认：立即重置所有过滤器到新位置，消除延迟
+                print(f"[传送检测] 聚类确认 scatter={_scatter:.0f}px → "
+                      f"立即重置到 ({_med_x},{_med_y})")
+                self.pos_history.clear()
+                self.smooth_buffer_x.clear()
+                self.smooth_buffer_y.clear()
+                self._kalman_reset(_med_x, _med_y)
+                self._linear_filter_consecutive = 0
+                self._display_x = _med_x
+                self._display_y = _med_y
+                self._tp_candidate_buffer.clear()
+                smooth_x, smooth_y = _med_x, _med_y
+                # 同步 SIFT 引擎位置，让后续帧立即在新位置局部搜索
+                with self.sift_engine._lock:
+                    self.sift_engine.last_x = _med_x
+                    self.sift_engine.last_y = _med_y
+                    self.sift_engine.lost_frames = 0
+                    self.sift_engine._switch_to_local(_med_x, _med_y)
+
+        # === 渲染平滑防抖：静止死区 + 速度自适应 EMA ===
+        # alpha 随速度线性增大：慢速平滑抗抖，快速立即跟随避免视觉滞后
+        #   dist ≤ still_threshold → 静止死区（不动）
+        #   dist ≤ ema_slow_dist  → alpha = ema_alpha_min（最平滑）
+        #   dist ≥ ema_fast_dist  → alpha = ema_alpha_max（立即跟随）
+        #   中间线性插值
         still_threshold = getattr(config, 'RENDER_STILL_THRESHOLD', 2)
-        ema_alpha = getattr(config, 'RENDER_EMA_ALPHA', 0.45)
+        ema_alpha_min = getattr(config, 'RENDER_EMA_ALPHA', 0.35)     # 慢速最低 alpha
+        ema_alpha_max = getattr(config, 'RENDER_EMA_ALPHA_MAX', 0.92) # 快速最高 alpha
+        ema_slow_dist = getattr(config, 'RENDER_EMA_SLOW_DIST', 6)    # 低于此速度用 min
+        ema_fast_dist = getattr(config, 'RENDER_EMA_FAST_DIST', 45)   # 高于此速度用 max
         if found and smooth_x and smooth_y:
             if self._display_x is None:
                 # 首帧直接初始化
@@ -713,15 +742,20 @@ class AIMapTrackerWeb:
                     # 静止死区：保持不动
                     pass
                 else:
-                    # 移动 EMA：平滑向目标靠近，消除方向移动时的横向抖动
-                    self._display_x = int(self._display_x + ema_alpha * ddx)
-                    self._display_y = int(self._display_y + ema_alpha * ddy)
+                    # 速度自适应 alpha：慢→平滑，快→立即跟随
+                    t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
+                    adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
+                    self._display_x = int(self._display_x + adaptive_alpha * ddx)
+                    self._display_y = int(self._display_y + adaptive_alpha * ddy)
             else:
-                # 惯性帧：同样用 EMA，但允许在静止死区内跟随（卡尔曼预测不应锁死）
+                # 惯性帧（卡尔曼预测）：同样速度自适应，预测值不应锁死
                 ddx = smooth_x - self._display_x
                 ddy = smooth_y - self._display_y
-                self._display_x = int(self._display_x + ema_alpha * ddx)
-                self._display_y = int(self._display_y + ema_alpha * ddy)
+                dist = math.sqrt(ddx * ddx + ddy * ddy)
+                t = max(0.0, min(1.0, (dist - ema_slow_dist) / (ema_fast_dist - ema_slow_dist)))
+                adaptive_alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
+                self._display_x = int(self._display_x + adaptive_alpha * ddx)
+                self._display_y = int(self._display_y + adaptive_alpha * ddy)
             smooth_x, smooth_y = self._display_x, self._display_y
 
         # 渲染裁剪区域 + 画点
