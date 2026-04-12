@@ -469,12 +469,17 @@ def ws_receive_frame(raw_bytes):
             'hy': int(status.get('hybrid', False)),
         }, separators=(',', ':')).encode('utf-8')
 
+        # 仅向发送方返回含 JPEG 的完整结果，避免广播大图数据导致 captureStream 闪烁
         emit('result',
              struct.pack('>I', len(status_json)) + status_json + jpeg_result,
-             binary=True, broadcast=True, skip_sid=request.sid)
+             binary=True)
+        # 向其他监听客户端（如 bigmap.html）广播仅坐标的轻量更新
+        emit('coords',
+             struct.pack('>I', len(status_json)) + status_json,
+             broadcast=True, include_self=False, binary=True)
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True, broadcast=True, skip_sid=request.sid)
+        emit('error', struct.pack('>I', len(err)) + err, binary=True)
 
 
 @socketio.on('frame_coords')
@@ -507,10 +512,10 @@ def ws_frame_coords(raw_bytes):
 
         emit('coords',
              struct.pack('>I', len(status_json)) + status_json,
-             binary=True, broadcast=True, skip_sid=request.sid)
+             binary=True)
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True, broadcast=True, skip_sid=request.sid)
+        emit('error', struct.pack('>I', len(err)) + err, binary=True)
 
 
 # ==================== 启动入口 ====================
