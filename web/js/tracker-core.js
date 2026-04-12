@@ -425,6 +425,9 @@ const TrackerCore = (() => {
                                 hybrid_busy: !!status.h,
                             }
                         };
+                            self.log('\u5206\u6790\u5b8c\u6210 | ' +
+                                (result.status.found ? '\u2705 \u627e\u5230\u4f4d\u7f6e' : '\u274c \u672a\u627e\u5230') +
+                                ' (' + result.status.matches + ' \u5339\u914d\u70b9)');
                             if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                         }
                     });
