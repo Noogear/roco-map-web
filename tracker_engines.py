@@ -469,6 +469,7 @@ class SIFTMapTracker:
     def _build_ocean_candidates(self, map_gray):
         """
         启动时扫描大地图，找出所有低纹理区域（海洋/大片裸地等）作为冷启动候选。
+        过滤纯黑（mean<10）和纯白/灰白留白（mean>200）边框，只保留真实地形区域。
         返回 list of (cx, cy, mean_val) 三元组。
         """
         tile = self._ocean_region_tile
@@ -478,8 +479,10 @@ class SIFTMapTracker:
         for cy in range(half, h - half, tile):
             for cx in range(half, w - half, tile):
                 patch = map_gray[cy - half:cy + half, cx - half:cx + half]
-                if float(np.std(patch)) < self._ocean_std_thresh:
-                    candidates.append((cx, cy, float(np.mean(patch))))
+                mean_val = float(np.mean(patch))
+                # 排除纯黑边框和纯白/情白领域（两者 std 同样很低但不是真实海洋）
+                if float(np.std(patch)) < self._ocean_std_thresh and 10 < mean_val < 200:
+                    candidates.append((cx, cy, mean_val))
         return candidates
 
     def _ocean_cold_start(self, minimap_gray_raw):
@@ -896,8 +899,8 @@ class SIFTMapTracker:
                             match_quality = 0.3
 
         # ---- 冷启动低纹理场景兜底（海洋/大片裸地，last_x 为 None）----
-        # 不限 texture_std：只要 SIFT 失败 + 无历史位置，就尝试多尺度模板匹配
-        if not found and self.last_x is None:
+        # 只在小地图自身表现出低纹理时才尝试，防止普通场景 SIFT 首帧失败时误匹配
+        if not found and self.last_x is None and texture_std < 45:
             cold_result = self._ocean_cold_start(minimap_gray_raw)
             if cold_result is not None:
                 found, center_x, center_y = True, cold_result[0], cold_result[1]
