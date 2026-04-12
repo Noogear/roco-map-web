@@ -90,6 +90,92 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_SOCKETIO_ASYNC_MO
 # 全局追踪器实例
 tracker = AIMapTrackerWeb(sift_only=_SIFT_ONLY)
 
+# Plan B: 记录当前有哪些客户端在使用 'frame' 事件（需要 JPEG）
+# 无此类客户端时 _push_jpeg=False，后台线程跳过 cv2.imencode 节省 10-15ms/帧。
+_frame_clients: set = set()
+
+# JPEG 节流：记录上次发送 JPEG 时的地图坐标。
+# 当新坐标偏移 < JPEG_PAD - JPEG_THROTTLE_MARGIN 时只发 coords，节省 80-200KB/次。
+import math as _math
+_last_jpeg_x: float = 0.0
+_last_jpeg_y: float = 0.0
+_JPEG_THROTTLE_MARGIN = 8   # 保留 8px 缓冲，pan 超出前 8px 就发新图
+
+# Plan A (push model): 最新 'frame' 客户端的 SID，供 _on_result_ready 定向推送。
+# 叠加式：push 失败时 pull 兜底（ws_receive_frame 仍发 coords）。
+_push_frame_sid: str = ''
+
+
+def _make_status_json() -> bytes:
+    """构建 WS 推送用的紧凑 JSON bytes（避免 ws_receive_frame 与 _on_result_ready 重复编码）。"""
+    status = tracker.latest_status
+    return json.dumps({
+        'm': tracker.current_mode,
+        's': status['state'],
+        'x': status['position']['x'],
+        'y': status['position']['y'],
+        'f': int(status['found']),
+        'c': status['matches'],
+        'q': round(status.get('match_quality', 0), 2),
+        'a': round(status.get('arrow_angle', 0), 1),
+        'as': int(status.get('arrow_stopped', True)),
+        'l': int(tracker.sift_engine.coord_lock_enabled),
+        'h': int(status.get('hybrid_busy', False)),
+        'hy': int(status.get('hybrid', False)),
+    }, separators=(',', ':')).encode('utf-8')
+
+
+def _on_result_ready():
+    """
+    Plan A 推送回调：sift-worker 处理完帧后立即调用，主动推送新结果。
+    比 pull 模式（等下一帧 ws_receive_frame）延迟低 ~80ms。
+    JPEG 节流逻辑在此执行（dist < budget → 只推 coords，节省带宽）。
+    每个 emit 独立 try/except，单条失败不影响其他。
+    """
+    global _last_jpeg_x, _last_jpeg_y
+
+    if tracker.latest_status.get('state') == '--':
+        return  # 首帧尚未完成，不推送
+
+    status_json = _make_status_json()
+    header = struct.pack('>I', len(status_json))
+
+    # JPEG 节流：超出 pan 余量才发新 JPEG
+    pad = getattr(config, 'JPEG_PAD', 40)
+    budget = pad - _JPEG_THROTTLE_MARGIN
+    cx = tracker.latest_status['position']['x']
+    cy = tracker.latest_status['position']['y']
+    dist = _math.sqrt((cx - _last_jpeg_x) ** 2 + (cy - _last_jpeg_y) ** 2)
+
+    sid = _push_frame_sid
+    if sid:
+        jpeg = tracker.latest_result_jpeg
+        if jpeg and dist >= budget:
+            # 位移超出余量：推 result（含 JPEG），更新锚点
+            _last_jpeg_x, _last_jpeg_y = cx, cy
+            try:
+                socketio.emit('result', header + status_json + jpeg,
+                              to=sid, binary=True, namespace='/')
+            except Exception as e:
+                print(f"[push] result → {sid} 失败: {e}")
+        else:
+            # 位移在余量内：只推轻量 coords，前端 pan 消化
+            try:
+                socketio.emit('coords', header + status_json,
+                              to=sid, binary=True, namespace='/')
+            except Exception as e:
+                print(f"[push] coords → {sid} 失败: {e}")
+
+    # 向所有客户端广播坐标（bigmap.html 等；frame 客户端收到重复 coords 无害）
+    try:
+        socketio.emit('coords', header + status_json,
+                      broadcast=True, binary=True, namespace='/')
+    except Exception as e:
+        print(f"[push] coords broadcast 失败: {e}")
+
+
+tracker.result_callback = _on_result_ready
+
 # Web 目录路径
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
 
@@ -378,6 +464,13 @@ def ws_connect():
 
 @socketio.on('disconnect')
 def ws_disconnect():
+    global _push_frame_sid
+    # Plan B: 客户端断开时从 frame_clients 移除，若没有 JPEG 消费者则关闭编码
+    _frame_clients.discard(request.sid)
+    tracker._push_jpeg = bool(_frame_clients)
+    # Plan A: 若断开的是 push 目标，清除 SID 避免无效推送
+    if request.sid == _push_frame_sid:
+        _push_frame_sid = ''
     print(f"WebSocket 客户端断开: {request.sid}")
 
 
@@ -435,47 +528,51 @@ def ws_reset_history():
     })
 
 
+@socketio.on('request_jpeg')
+def ws_request_jpeg():
+    """前端请求强制推送一张新 JPEG（如切换到 JPEG 渲染模式时触发）。
+    重置节流锚点到不可能的坐标，确保下次 _on_result_ready 必定发送 result+JPEG。
+    """
+    global _last_jpeg_x, _last_jpeg_y
+    _last_jpeg_x = -99999.0
+    _last_jpeg_y = -99999.0
+
+
 @socketio.on('frame')
 def ws_receive_frame(raw_bytes):
     """
-    接收二进制 JPEG 帧，存帧并立即返回上一帧缓存结果（非阻塞）。
-    SIFT 匹配运行在后台线程，WebSocket 接收延迟降至解码耗时（1-2ms）。
-    协议: 客户端发送原始 JPEG bytes → 服务端返回 [JSON头(4字节长度) + JPEG图片]
+    接收二进制 JPEG 帧，存帧并立即返回上一帧缓存坐标（非阻塞，pull 兜底）。
+    SIFT 匹配运行在后台线程，处理完成后由 _on_result_ready 主动推送新结果（Plan A）。
+    协议: 客户端发送原始 JPEG bytes → 服务端返回 [JSON头(4字节长度) + JSON]
+    Plan B: 注册该客户端为 JPEG 消费者，确保后台线程生成 JPEG。
+    Plan A: 记录该 SID 为 push 目标，SIFT 完成后立即推送（含 JPEG 节流）。
     """
+    global _push_frame_sid
+
+    # Plan B: 记录该 sid 需要 JPEG，后台线程保持编码开启
+    if request.sid not in _frame_clients:
+        _frame_clients.add(request.sid)
+        tracker._push_jpeg = True
+    # Plan A: 记录最新 JPEG 客户端 SID，供 _on_result_ready 定向推送
+    _push_frame_sid = request.sid
+
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
         tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程，立即返回
 
-        # 返回上一帧缓存的 JPEG 结果（后台线程异步处理当前帧）
-        jpeg_result = tracker.latest_result_jpeg
-        if not jpeg_result:
-            return  # 启动后第一帧尚无缓存，静默等待
-
+        # Pull 兜底：立即返回上一帧缓存坐标，等待 push 推送新 JPEG（~20ms 后）
         status = tracker.latest_status
-        status_json = json.dumps({
-            'm': tracker.current_mode,
-            's': status['state'],
-            'x': status['position']['x'],
-            'y': status['position']['y'],
-            'f': int(status['found']),
-            'c': status['matches'],
-            'q': round(status.get('match_quality', 0), 2),
-            'a': round(status.get('arrow_angle', 0), 1),
-            'as': int(status.get('arrow_stopped', True)),
-            'l': int(tracker.sift_engine.coord_lock_enabled),
-            'h': int(status.get('hybrid_busy', False)),
-            'hy': int(status.get('hybrid', False)),
-        }, separators=(',', ':')).encode('utf-8')
+        if status.get('state') == '--':
+            return  # 启动后尚无任何结果
 
-        # 仅向发送方返回含 JPEG 的完整结果，避免广播大图数据导致 captureStream 闪烁
-        emit('result',
-             struct.pack('>I', len(status_json)) + status_json + jpeg_result,
-             binary=True)
+        status_json = _make_status_json()
+        header = struct.pack('>I', len(status_json))
+        emit('coords', header + status_json, binary=True)
+
         # 向其他监听客户端（如 bigmap.html）广播仅坐标的轻量更新
-        emit('coords',
-             struct.pack('>I', len(status_json)) + status_json,
+        emit('coords', header + status_json,
              broadcast=True, include_self=False, binary=True)
     else:
         err = b'{"error":"decode_fail"}'
@@ -484,15 +581,22 @@ def ws_receive_frame(raw_bytes):
 
 @socketio.on('frame_coords')
 def ws_frame_coords(raw_bytes):
-    """接收帧并存帧（后台处理），立即返回上一帧缓存坐标。大幅减少带宽。"""
+    """
+    接收帧并存帧（后台处理），立即返回上一帧缓存坐标。大幅减少带宽。
+    Plan B: 无 'frame' 客户端时设 _push_jpeg=False，后台线程跳过 JPEG 编码。
+    """
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
+        # Plan B: 当前无 JPEG 消费者时关闭编码，节省 10-15ms/帧
+        if not _frame_clients:
+            tracker._push_jpeg = False
+
         tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程
 
-        if not tracker.latest_result_jpeg:
-            return  # 首帧尚无缓存，静默等待
+        if tracker.latest_status.get('state') == '--':
+            return  # 尚无任何处理结果（首帧），静默等待
 
         status = tracker.latest_status
         status_json = json.dumps({
