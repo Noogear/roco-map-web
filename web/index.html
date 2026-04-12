@@ -358,8 +358,8 @@
     </div>
 
     <div class="mode-toggle" style="display:none;">
-        <button class="mode-btn active" id="modeFile" onclick="setMode('file')">📁 文件上传</button>
-        <button class="mode-btn" id="modeScreen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
+        <button class="mode-btn active" id="modeFile" data-conn-mode="file" onclick="setMode('file')">📁 文件上传</button>
+        <button class="mode-btn" id="modeScreen" data-conn-mode="screen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
     </div>
 
     <div class="container">
@@ -427,9 +427,9 @@
 
             <!-- 模式切换 -->
             <div class="mode-toggle" style="margin-bottom:12px;">
-                <button class="mode-btn active" id="modeFile" onclick="setMode('file')">📁 文件上传</button>
-                <button class="mode-btn" id="modeScreen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
-                <button class="mode-btn" id="modeWatch" onclick="enterWatchMode()">👁️ 观看模式</button>
+                <button class="mode-btn active" id="modeFile" data-conn-mode="file" onclick="setMode('file')">📁 文件上传</button>
+                <button class="mode-btn" id="modeScreen" data-conn-mode="screen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
+                <button class="mode-btn" id="modeWatch" data-conn-mode="watch" onclick="enterWatchMode()">👁️ 观看模式</button>
             </div>
 
             <!-- 预览区 -->
@@ -453,7 +453,7 @@
                 <button class="btn-primary" onclick="processImage()">▶️ 分析定位</button>
                 <button id="coordLockBtn" class="btn-lock" onclick="toggleCoordLock()" disabled title="需要先分析定位积累坐标历史">🔒 坐标锁</button>
                 <button class="btn-reset" onclick="resetHistory()" title="清空坐标历史，重新开始累积">🗑 重置历史</button>
-                <button class="btn-pip" id="pipBtn" onclick="toggleNativePiP()">🎠 浏览器画中画</button>
+                <button class="btn-pip" id="pipBtn" data-feature="pip" onclick="toggleNativePiP()">🎠 浏览器画中画</button>
                 <button class="btn-danger" onclick="stopScreenCapture()" id="stopScreenBtn" style="display:none;">⏹ 停止捕获</button>
             </div>
 
@@ -524,8 +524,8 @@ TC.init({
         }
     },
     onScreenStart: function() {
-        document.querySelectorAll('.mode-btn').forEach(function(b) { b.classList.remove('active'); });
-        document.getElementById('modeScreen').classList.add('active');
+        Array.prototype.forEach.call(document.querySelectorAll('.mode-btn'), function(b) { b.classList.remove('active'); });
+        Array.prototype.forEach.call(document.querySelectorAll('[data-conn-mode="screen"]'), function(b) { b.classList.add('active'); });
 
         var canvas = document.getElementById('minimapCanvas');
         canvas.style.display = 'none';
@@ -548,9 +548,81 @@ TC.init({
 
 TC.log('系统就绪，请选择小地图输入方式');
 
+function setButtonAvailability(buttons, enabled, title) {
+    Array.prototype.forEach.call(buttons || [], function(btn) {
+        if (!btn) return;
+        btn.disabled = !enabled;
+        btn.title = title || '';
+        if (enabled) {
+            btn.style.opacity = '';
+            btn.style.cursor = '';
+        } else {
+            btn.style.opacity = '0.55';
+            btn.style.cursor = 'not-allowed';
+            btn.classList.remove('active');
+        }
+    });
+}
+
+function getPictureInPictureSupport() {
+    var canvas = document.getElementById('pipCanvas');
+    var video = document.getElementById('pipVideo');
+    var canStream = !!(canvas && typeof canvas.captureStream === 'function');
+    var standard = !!(canStream && video && document.pictureInPictureEnabled && typeof video.requestPictureInPicture === 'function');
+    var webkit = !!(canStream && video && typeof video.webkitSupportsPresentationMode === 'function' &&
+        video.webkitSupportsPresentationMode('picture-in-picture') && typeof video.webkitSetPresentationMode === 'function');
+    return {
+        any: standard || webkit,
+        standard: standard,
+        webkit: webkit,
+        canStream: canStream,
+    };
+}
+
+function applyCompatibilityGuards() {
+    var report = TC.getConnectionDiagnostics();
+    var pipSupport = getPictureInPictureSupport();
+
+    setButtonAvailability(
+        document.querySelectorAll('[data-conn-mode="screen"]'),
+        report.screenCapture,
+        report.screenCapture ? '开始屏幕捕获' : '当前浏览器不支持屏幕捕获，请改用 Chrome / Edge / Firefox 新版'
+    );
+
+    setButtonAvailability(
+        document.querySelectorAll('[data-conn-mode="watch"]'),
+        report.socketIO,
+        report.socketIO ? '进入观看模式' : '当前页面未加载 Socket.IO 客户端，无法进入观看模式'
+    );
+
+    setButtonAvailability(
+        document.querySelectorAll('[data-feature="pip"]'),
+        pipSupport.any,
+        pipSupport.any ? '打开浏览器画中画' : '当前浏览器不支持原生画中画，主页面仍可正常显示实时画面'
+    );
+}
+
+function logCompatibilityReport() {
+    var report = TC.getConnectionDiagnostics();
+    var pipSupport = getPictureInPictureSupport();
+    var parts = [
+        'HTTP上传' + (report.httpUpload ? '✅' : '❌'),
+        'Socket.IO' + (report.socketIO ? '✅' : '❌'),
+        '屏幕捕获' + (report.screenCapture ? '✅' : '❌'),
+        '观看模式' + (report.socketIO ? '✅' : '❌'),
+        '画中画' + (pipSupport.any ? '✅' : '❌')
+    ];
+    TC.log('兼容检测：' + parts.join(' | '));
+}
+
 // ========== 观看模式 ==========
 var isWatchMode = false;
 async function enterWatchMode() {
+    if (!TC.getConnectionDiagnostics().socketIO) {
+        TC.log('当前页面未加载 Socket.IO 客户端，无法进入观看模式');
+        return;
+    }
+
     var panel = document.getElementById('floatPanel');
     var badge = document.getElementById('watchBadge');
     var btn = document.getElementById('modeWatch');
@@ -734,8 +806,8 @@ function runScreenAutoLoop() {
 // ========== 文件模式切换 ==========
 function setMode(mode) {
     TC.mode = mode;
-    document.querySelectorAll('.mode-btn').forEach(function(b) { b.classList.remove('active'); });
-    document.getElementById('modeFile').classList.add('active');
+    Array.prototype.forEach.call(document.querySelectorAll('.mode-btn'), function(b) { b.classList.remove('active'); });
+    Array.prototype.forEach.call(document.querySelectorAll('[data-conn-mode="file"]'), function(b) { b.classList.add('active'); });
     document.getElementById('screenVideoContainer').style.display = 'none';
     document.getElementById('stopScreenBtn').style.display = 'none';
     document.getElementById('regionInfo').style.display = 'none';
@@ -784,6 +856,7 @@ const pipVideo = document.getElementById('pipVideo');
 const pipBtn = document.getElementById('pipBtn');
 const resultImg = document.getElementById('resultImg');
 let pipTimer = null;
+let pipEventsBound = false;
 
 // 初始化画布尺寸
 pipCanvas.width = 400;
@@ -799,6 +872,7 @@ function updatePiPCanvas() {
     if (!resultImg.src || !resultImg.naturalWidth || !resultImg.naturalHeight) return;
     const back = _getPipBackBuffer();
     const bctx = back.getContext('2d');
+    bctx.clearRect(0, 0, 400, 400);
     const scale = Math.min(400 / resultImg.naturalWidth, 400 / resultImg.naturalHeight);
     const w = resultImg.naturalWidth * scale;
     const h = resultImg.naturalHeight * scale;
@@ -806,14 +880,80 @@ function updatePiPCanvas() {
 
     // 原子式一次性复制到前台画布，避免 captureStream 抓到中间态
     const ctx = pipCanvas.getContext('2d');
+    ctx.clearRect(0, 0, 400, 400);
     ctx.drawImage(back, 0, 0);
+}
+
+function isNativePiPActive() {
+    return document.pictureInPictureElement === pipVideo || pipVideo.webkitPresentationMode === 'picture-in-picture';
+}
+
+function stopPiPRefresh() {
+    if (pipTimer) clearInterval(pipTimer);
+    pipTimer = null;
+}
+
+function resetPiPButtonState() {
+    pipBtn.classList.remove('active');
+    pipBtn.textContent = '🎠 浏览器画中画';
+    stopPiPRefresh();
+}
+
+function bindPiPEvents() {
+    if (pipEventsBound) return;
+    pipEventsBound = true;
+
+    pipVideo.addEventListener('leavepictureinpicture', function() {
+        resetPiPButtonState();
+        TC.log('✅ 原生画中画已关闭');
+    });
+
+    pipVideo.addEventListener('webkitpresentationmodechanged', function() {
+        if (pipVideo.webkitPresentationMode !== 'picture-in-picture') {
+            resetPiPButtonState();
+            TC.log('✅ 原生画中画已关闭');
+        }
+    });
+}
+
+async function requestNativePiP() {
+    const support = getPictureInPictureSupport();
+    if (!support.any) {
+        throw new Error('当前浏览器不支持原生画中画');
+    }
+    if (!support.canStream) {
+        throw new Error('当前浏览器不支持画布视频流');
+    }
+
+    updatePiPCanvas();
+    pipVideo.srcObject = pipCanvas.captureStream(15);
+    bindPiPEvents();
+    await pipVideo.play();
+
+    if (support.standard) {
+        await pipVideo.requestPictureInPicture();
+        return 'standard';
+    }
+
+    pipVideo.webkitSetPresentationMode('picture-in-picture');
+    return 'webkit';
+}
+
+async function exitNativePiPMode() {
+    if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        return;
+    }
+    if (pipVideo.webkitPresentationMode === 'picture-in-picture') {
+        pipVideo.webkitSetPresentationMode('inline');
+    }
 }
 
 // 切换原生画中画
 async function toggleNativePiP() {
-    // 检查浏览器支持
-    if (!document.pictureInPictureEnabled) {
-        alert('您的浏览器不支持原生画中画，请使用 Chrome/Edge 最新版');
+    const support = getPictureInPictureSupport();
+    if (!support.any) {
+        TC.log('当前浏览器不支持原生画中画，可继续直接查看主页面实时画面');
         return;
     }
 
@@ -824,20 +964,13 @@ async function toggleNativePiP() {
     }
 
     try {
-        if (document.pictureInPictureElement) {
+        if (isNativePiPActive()) {
             // 关闭画中画
-            await document.exitPictureInPicture();
-            pipBtn.classList.remove('active');
-            pipBtn.textContent = '🎠 浏览器画中画';
-            if (pipTimer) clearInterval(pipTimer);
-            pipTimer = null;
-            TC.log('✅ 原生画中画已关闭');
+            await exitNativePiPMode();
+            resetPiPButtonState();
         } else {
             // 开启画中画
-            updatePiPCanvas();
-            pipVideo.srcObject = pipCanvas.captureStream(15);
-            await pipVideo.play();
-            await pipVideo.requestPictureInPicture();
+            const mode = await requestNativePiP();
             
             // 按钮状态
             pipBtn.classList.add('active');
@@ -845,20 +978,12 @@ async function toggleNativePiP() {
             
             // 自动刷新画面
             pipTimer = setInterval(updatePiPCanvas, 200);
-            
-            // 监听关闭事件
-            pipVideo.addEventListener('leavepictureinpicture', () => {
-                pipBtn.classList.remove('active');
-                pipBtn.textContent = '🎠 浏览器画中画';
-                if (pipTimer) clearInterval(pipTimer);
-                pipTimer = null;
-                TC.log('✅ 原生画中画已关闭');
-            }, { once: true });
-            
-            TC.log('✅ 原生浏览器画中画已开启');
+
+            TC.log('✅ 原生浏览器画中画已开启' + (mode === 'webkit' ? ' (Safari 兼容模式)' : ''));
         }
     } catch (err) {
         console.error('画中画失败：', err);
+        resetPiPButtonState();
         TC.log('❌ 画中画启动失败：' + err.message);
     }
 }
@@ -972,6 +1097,8 @@ var _lastStatus = null;
 })();
 
 // 定期轮询 + 初始化检查
+applyCompatibilityGuards();
+logCompatibilityReport();
 setInterval(checkLockReadiness, 2000);
 checkLockReadiness();
 </script>

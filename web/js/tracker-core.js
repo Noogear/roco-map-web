@@ -42,6 +42,7 @@ const TrackerCore = (() => {
         selCircle: { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) },
         wsSocket: null,
         wsConnected: false,
+        wsTransportName: '',
         wsConnecting: null,    // 连接中的 Promise（防止重复创建 socket）
         wsManualClose: false,  // 标记是否为手动断开（抑制重复日志）
         captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
@@ -89,6 +90,87 @@ const TrackerCore = (() => {
         return line;
     };
 
+    var _forEachNode = function(nodes, handler) {
+        Array.prototype.forEach.call(nodes || [], handler);
+    };
+
+    var _createCustomEvent = function(name, detail) {
+        if (typeof window.CustomEvent === 'function') {
+            return new CustomEvent(name, { detail: detail });
+        }
+        var evt = document.createEvent('CustomEvent');
+        evt.initCustomEvent(name, false, false, detail);
+        return evt;
+    };
+
+    var _decodeUtf8 = function(bytes) {
+        if (typeof TextDecoder !== 'undefined') {
+            try { return new TextDecoder('utf-8').decode(bytes); } catch (e) {}
+        }
+
+        var out = '';
+        var i = 0;
+        while (i < bytes.length) {
+            var c = bytes[i++];
+            if (c < 128) {
+                out += String.fromCharCode(c);
+            } else if (c > 191 && c < 224 && i < bytes.length) {
+                var c2 = bytes[i++];
+                out += String.fromCharCode(((c & 31) << 6) | (c2 & 63));
+            } else if (i + 1 < bytes.length) {
+                var c3 = bytes[i++];
+                var c4 = bytes[i++];
+                out += String.fromCharCode(((c & 15) << 12) | ((c3 & 63) << 6) | (c4 & 63));
+            }
+        }
+        return out;
+    };
+
+    var _dataURLToBlob = function(dataURL) {
+        var parts = (dataURL || '').split(',');
+        if (parts.length < 2) return null;
+
+        var header = parts[0];
+        var b64 = parts[1];
+        var mimeMatch = header.match(/data:([^;]+)/);
+        var mime = mimeMatch ? mimeMatch[1] : 'application/octet-stream';
+        var bin = atob(b64);
+        var len = bin.length;
+        var bytes = new Uint8Array(len);
+        for (var i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+        return new Blob([bytes], { type: mime });
+    };
+
+    var _getDisplayMediaImpl = function() {
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
+            return function(options) { return navigator.mediaDevices.getDisplayMedia(options); };
+        }
+        if (typeof navigator.getDisplayMedia === 'function') {
+            return function(options) { return navigator.getDisplayMedia(options); };
+        }
+        return null;
+    };
+
+    var _getSocketTransportName = function(sock) {
+        try {
+            return (sock && sock.io && sock.io.engine && sock.io.engine.transport && sock.io.engine.transport.name) || 'socket.io';
+        } catch (e) {
+            return 'socket.io';
+        }
+    };
+
+    var _bindSocketTransportEvents = function(sock, self) {
+        if (!sock || sock.__tcTransportEventsBound) return;
+        if (!sock.io || !sock.io.engine || typeof sock.io.engine.on !== 'function') return;
+
+        sock.__tcTransportEventsBound = true;
+        sock.io.engine.on('upgrade', function(transport) {
+            var name = transport && transport.name ? transport.name : 'websocket';
+            S.wsTransportName = name;
+            self.log('🚀 Socket.IO 已升级到 ' + name);
+        });
+    };
+
     let opts = {
         logEl: null,
         canvasSize: 300,
@@ -112,6 +194,7 @@ const TrackerCore = (() => {
         set selCircle(v) { Object.assign(S.selCircle, v); },
         get isScreenActive() { return !!S.screenStream; },
         get wsConnected() { return S.wsConnected; },
+        get wsTransportName() { return S.wsTransportName; },
 
         // ========== 日志 ==========
         log(msg) {
@@ -152,6 +235,20 @@ const TrackerCore = (() => {
 
         // ========== 工具 ==========
         clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); },
+
+        getConnectionDiagnostics() {
+            var canvas = document.createElement('canvas');
+            return {
+                httpUpload: typeof fetch === 'function' && typeof FormData !== 'undefined' && typeof JSON !== 'undefined',
+                socketIO: typeof io === 'function',
+                websocket: typeof WebSocket !== 'undefined',
+                binaryFrames: typeof Blob !== 'undefined' && typeof ArrayBuffer !== 'undefined',
+                screenCapture: !!_getDisplayMediaImpl(),
+                customEvent: typeof window.CustomEvent === 'function',
+                textDecoder: typeof TextDecoder !== 'undefined',
+                canvasStream: !!canvas.captureStream,
+            };
+        },
 
         // ========== 状态格式化 ==========
         formatStatus(status) {
@@ -281,8 +378,14 @@ const TrackerCore = (() => {
         startScreenCapture(o) {
             o = o || {};
             var self = this;
+            var getDisplayMedia = _getDisplayMediaImpl();
 
-            return navigator.mediaDevices.getDisplayMedia({
+            if (!getDisplayMedia) {
+                self.log('当前浏览器不支持屏幕捕获，请改用 Chrome / Edge / Firefox 新版');
+                return Promise.resolve(false);
+            }
+
+            return getDisplayMedia({
                 video: { cursor: 'always', displaySurface: 'monitor' },
                 audio: false,
             }).then(function(strm) {
@@ -390,7 +493,15 @@ const TrackerCore = (() => {
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
 
             return new Promise(function(resolve) {
-                c.toBlob(function(blob) { resolve(blob); }, 'image/jpeg', 0.82);
+                if (typeof c.toBlob === 'function') {
+                    c.toBlob(function(blob) { resolve(blob); }, 'image/jpeg', 0.82);
+                    return;
+                }
+                try {
+                    resolve(_dataURLToBlob(c.toDataURL('image/jpeg', 0.82)));
+                } catch (e) {
+                    resolve(null);
+                }
             });
         },
 
@@ -432,37 +543,51 @@ const TrackerCore = (() => {
         connectWS() {
             var self = this;
             if (S.wsSocket && S.wsConnected) return Promise.resolve(true);
+            if (typeof io !== 'function') {
+                var missingErr = new Error('当前页面未加载 Socket.IO 客户端');
+                self.log('❌ Socket.IO 客户端未加载，无法建立实时连接');
+                return Promise.reject(missingErr);
+            }
             // 连接中则复用同一个 Promise，避免并发调用创建多个 socket
             if (S.wsConnecting) return S.wsConnecting;
             S.wsConnecting = new Promise(function(resolve, reject) {
 
                 try {
                     var sock = io({
-                        transports: ['websocket'],
+                        transports: ['polling', 'websocket'],
+                        upgrade: true,
+                        rememberUpgrade: true,
+                        timeout: 5000,
                         forceNew: true,
                     });
                     S.wsSocket = sock;
 
                     sock.on('connect', function() {
                         S.wsConnected = true;
+                        S.wsTransportName = _getSocketTransportName(sock);
                         S.wsConnecting = null;
-                        self.log('\ud83d\udcf6 Socket.IO 已连接（二进制模式）');
+                        _bindSocketTransportEvents(sock, self);
+                        self.log('📶 Socket.IO 已连接（' + S.wsTransportName + '）');
                         resolve(true);
                     });
 
-                    sock.on('disconnect', function() {
+                    sock.on('disconnect', function(reason) {
                         S.wsConnected = false;
+                        S.wsTransportName = '';
                         S.wsConnecting = null;
                         // 手动断开时已在 disconnectWS 记录日志，此处不重复打印
-                        if (!S.wsManualClose) self.log('\ud83d\udcf5 Socket.IO 已断开');
+                        if (!S.wsManualClose) {
+                            self.log('📵 Socket.IO 已断开' + (reason ? ' (' + reason + ')' : ''));
+                        }
                         S.wsManualClose = false;
                     });
 
                     sock.on('connect_error', function(err) {
                         S.wsConnected = false;
+                        S.wsTransportName = '';
                         S.wsConnecting = null;
                         console.error('SIO error:', err);
-                        self.log('\u274c Socket.IO 连接失败: ' + err.message);
+                        self.log('❌ Socket.IO 连接失败: ' + err.message + '（已尝试 polling / websocket）');
                         reject(err);
                     });
 
@@ -483,7 +608,7 @@ const TrackerCore = (() => {
                         var jsonLen = view.getUint32(0, false);
                         if (view.byteLength < 4 + jsonLen) return;
                         var jsonBytes = new Uint8Array(buf, 4, jsonLen);
-                        var jsonStr = new TextDecoder().decode(jsonBytes);
+                        var jsonStr = _decodeUtf8(jsonBytes);
                         var status;
                         try { status = JSON.parse(jsonStr); } catch(e) { return; }
 
@@ -514,7 +639,7 @@ const TrackerCore = (() => {
                                 }
                             };
                             var rs = result.status;
-                            var kb = (data.byteLength / 1024).toFixed(1);
+                            var kb = (buf.byteLength / 1024).toFixed(1);
                             self.logUpdate(_fmtResult(rs, kb));
                             if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
                         }
@@ -534,6 +659,7 @@ const TrackerCore = (() => {
             }
             S.wsSocket = null;
             S.wsConnected = false;
+            S.wsTransportName = '';
             S.wsConnecting = null;
             this.log('Socket.IO 已手动断开');
         },
@@ -590,9 +716,9 @@ const TrackerCore = (() => {
                     var img = document.createElement('img');
                     img.src = src; img.className = 'test-item'; img.title = src;
                     img.onclick = function() {
-                        grid.querySelectorAll('.test-item').forEach(function(i) { i.classList.remove('selected'); });
+                        _forEachNode(grid.querySelectorAll('.test-item'), function(i) { i.classList.remove('selected'); });
                         img.classList.add('selected');
-                        var evt = new CustomEvent('testimage:selected', { detail: { src: src, imgEl: img } });
+                        var evt = _createCustomEvent('testimage:selected', { src: src, imgEl: img });
                         document.dispatchEvent(evt);
                     };
                     grid.appendChild(img);

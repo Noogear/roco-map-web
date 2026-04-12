@@ -288,8 +288,8 @@
     <div class="float-body" id="floatBody">
         <!-- 模式切换 -->
         <div class="mode-toggle">
-            <button class="mode-btn active" id="mf" onclick="setIM('file')">文件上传</button>
-            <button class="mode-btn" id="ms" onclick="startSC()">屏幕捕获</button>
+            <button class="mode-btn active" id="mf" data-conn-mode="file" onclick="setIM('file')">文件上传</button>
+            <button class="mode-btn" id="ms" data-conn-mode="screen" onclick="startSC()">屏幕捕获</button>
         </div>
 
         <!-- 预览区 -->
@@ -355,6 +355,41 @@ var autoRun=false, autoT=null;
 var sending=false;
 var lAngle=0; // 最新箭头角度
 var lStopped=true; // 是否静止
+
+function setButtonAvailability(buttons, enabled, title) {
+    Array.prototype.forEach.call(buttons || [], function(btn) {
+        if (!btn) return;
+        btn.disabled = !enabled;
+        btn.title = title || '';
+        if (enabled) {
+            btn.style.opacity = '';
+            btn.style.cursor = '';
+        } else {
+            btn.style.opacity = '0.55';
+            btn.style.cursor = 'not-allowed';
+            btn.classList.remove('active');
+        }
+    });
+}
+
+function applyCompatibilityGuards() {
+    var report = TC.getConnectionDiagnostics();
+    setButtonAvailability(
+        document.querySelectorAll('[data-conn-mode="screen"]'),
+        report.screenCapture,
+        report.screenCapture ? '开始屏幕捕获' : '当前浏览器不支持屏幕捕获，请改用 Chrome / Edge / Firefox 新版'
+    );
+}
+
+function logCompatibilityReport() {
+    var report = TC.getConnectionDiagnostics();
+    var parts = [
+        'HTTP上传' + (report.httpUpload ? '✅' : '❌'),
+        '屏幕捕获' + (report.screenCapture ? '✅' : '❌'),
+        '触屏拖拽' + ('ontouchstart' in window ? '✅' : '⚪')
+    ];
+    TC.log('兼容检测：' + parts.join(' | '));
+}
 
 // === 静止死区：上次被接受的地图坐标，用于过滤 SIFT 微小随机抖动 ===
 var _lastDotMapX = null, _lastDotMapY = null, _lastDotAngle = null;
@@ -707,7 +742,7 @@ function stopSC(){
 function setIM(m){
     TC.mode=m;
     var btns=document.querySelectorAll('#floatBody .mode-btn');
-    btns.forEach(function(b){b.classList.remove('active');});
+    Array.prototype.forEach.call(btns, function(b){b.classList.remove('active');});
     $(m==='file'?'mf':'ms').classList.add('active');
 }
 
@@ -762,7 +797,7 @@ var RouteModule = (function(){
         updateBtnState();
         // 取消选中状态
         var items = document.querySelectorAll('#routeList .rp-item');
-        items.forEach(function(el){ el.classList.remove('selected'); });
+        Array.prototype.forEach.call(items, function(el){ el.classList.remove('selected'); });
     }
 
     /** 切换可见性 */
@@ -1018,7 +1053,7 @@ async function selectRoute(liEl){
     if(!filename) return;
 
     // UI 选中效果
-    document.querySelectorAll('#routeList .rp-item').forEach(function(e){e.classList.remove('selected');});
+    Array.prototype.forEach.call(document.querySelectorAll('#routeList .rp-item'), function(e){e.classList.remove('selected');});
     liEl.classList.add('selected');
 
     try{
@@ -1165,6 +1200,8 @@ TC.loadTestImages('testGrid').then(function(imgs){
     if(imgs.length>0) $('testImagesArea').classList.add('show');
 });
 TC.checkEngines();
+applyCompatibilityGuards();
+logCompatibilityReport();
 function escapeHtml(str){
     var d=document.createElement('div');d.textContent=str;return d.innerHTML;
 }

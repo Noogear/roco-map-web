@@ -15,6 +15,7 @@ debug_minimap.png
 _debug_*.png
 _debug_*.py
 _test_*.py
+/test_*.py
 
 # 临时环境/实验目录
 .tmp_prebuilt_env/
