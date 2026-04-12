@@ -664,6 +664,49 @@ const TrackerCore = (() => {
                         }
                     });
 
+                    // 接收后端 coords 响应（仅坐标，无 JPEG 图片，适合大地图页面）
+                    var _processCoordsResult = function(buf) {
+                        if (!buf || buf.byteLength < 4) return;
+                        var view = new DataView(buf);
+                        var jsonLen = view.getUint32(0, false);
+                        if (buf.byteLength < 4 + jsonLen) return;
+                        var jsonBytes = new Uint8Array(buf, 4, jsonLen);
+                        var jsonStr = _decodeUtf8(jsonBytes);
+                        var status;
+                        try { status = JSON.parse(jsonStr); } catch(e) { return; }
+                        if (status.error) { self.log('\u274c coords 解码失败'); return; }
+                        var result = {
+                            success: true,
+                            image: null,
+                            status: {
+                                mode: status.m,
+                                state: status.s,
+                                position: { x: status.x, y: status.y },
+                                found: !!status.f,
+                                matches: status.c,
+                                match_quality: status.q || 0,
+                                arrow_angle: status.a || 0,
+                                arrow_stopped: !!status.as,
+                                coord_lock: !!status.l,
+                                hybrid: !!status.hy,
+                                hybrid_busy: !!status.h,
+                            }
+                        };
+                        self.logUpdate(_fmtResult(result.status, (buf.byteLength / 1024).toFixed(1)));
+                        if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                    };
+
+                    sock.on('coords', function(data) {
+                        if (data instanceof ArrayBuffer) {
+                            _processCoordsResult(data);
+                        } else if (ArrayBuffer.isView(data)) {
+                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                            _processCoordsResult(buf);
+                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                            data.arrayBuffer().then(function(ab) { _processCoordsResult(ab); });
+                        }
+                    });
+
                 } catch(e) {
                     reject(e);
                 }
@@ -694,6 +737,19 @@ const TrackerCore = (() => {
             }
             S.wsSocket.emit('frame', blob);
             // 不在此处逐帧打日志，避免每帧触发 DOM 重排（scrollTop）
+            return Promise.resolve();
+        },
+
+        /**
+         * 通过 Socket.IO emit 发送二进制帧（仅返回坐标，无图片，适合大地图页面）
+         * 事件名 'frame_coords' 匹配后端 @socketio.on('frame_coords')
+         */
+        sendCoordsViaWS(blob) {
+            if (!S.wsSocket || !S.wsConnected) {
+                this.log('Socket.IO 未连接，请先连接！');
+                return Promise.reject(new Error('WS not connected'));
+            }
+            S.wsSocket.emit('frame_coords', blob);
             return Promise.resolve();
         },
 

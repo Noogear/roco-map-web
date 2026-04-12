@@ -115,14 +115,17 @@ class SIFTMapTracker:
 
     def __init__(self):
         print("正在初始化 SIFT 引擎...")
-        # 自适应 CLAHE：3 档预创建（低/中/高纹理场景）
+        # 自适应 CLAHE：4 档预创建（超低/低/中/高纹理场景）
+        _cl_very_low = getattr(config, 'CLAHE_LIMIT_VERY_LOW_TEXTURE', 8.0)
         _cl_low = getattr(config, 'CLAHE_LIMIT_LOW_TEXTURE', 5.0)
         _cl_mid = config.SIFT_CLAHE_LIMIT
         _cl_high = getattr(config, 'CLAHE_LIMIT_HIGH_TEXTURE', 2.0)
+        self._clahe_very_low = cv2.createCLAHE(clipLimit=_cl_very_low, tileGridSize=(8, 8))
         self._clahe_low  = cv2.createCLAHE(clipLimit=_cl_low,  tileGridSize=(8, 8))
         self._clahe_mid  = cv2.createCLAHE(clipLimit=_cl_mid,  tileGridSize=(8, 8))
         self._clahe_high = cv2.createCLAHE(clipLimit=_cl_high, tileGridSize=(8, 8))
         self.clahe = self._clahe_mid  # 默认（大地图特征提取用中档）
+        self._clahe_very_low_thresh = getattr(config, 'CLAHE_VERY_LOW_TEXTURE_THRESHOLD', 18)
         self._clahe_low_thresh  = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
         self._clahe_high_thresh = getattr(config, 'CLAHE_HIGH_TEXTURE_THRESHOLD', 60)
         # SIFT 检测器：降低 contrastThreshold 提取更多弱纹理特征
@@ -283,6 +286,8 @@ class SIFTMapTracker:
     def _adaptive_clahe(self, gray):
         """根据纹理标准差选择合适的 CLAHE 档位"""
         std = np.std(gray)
+        if std < self._clahe_very_low_thresh:
+            return self._clahe_very_low.apply(gray)
         if std < self._clahe_low_thresh:
             return self._clahe_low.apply(gray)
         elif std > self._clahe_high_thresh:
@@ -298,7 +303,9 @@ class SIFTMapTracker:
             for x in range(0, w, tile):
                 patch = gray[y:y+tile, x:x+tile]
                 std = np.std(patch)
-                if std < self._clahe_low_thresh:
+                if std < self._clahe_very_low_thresh:
+                    result[y:y+tile, x:x+tile] = self._clahe_very_low.apply(patch)
+                elif std < self._clahe_low_thresh:
                     result[y:y+tile, x:x+tile] = self._clahe_low.apply(patch)
                 elif std > self._clahe_high_thresh:
                     result[y:y+tile, x:x+tile] = self._clahe_high.apply(patch)
@@ -689,6 +696,20 @@ class SIFTMapTracker:
         self._circ_mask_cache[key] = mask
         return mask
 
+    def _enhance_low_texture(self, gray):
+        """对超低纹理帧（海面/天空）进行锐化增强，提取更多 SIFT 特征"""
+        blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
+        sharpened = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+        return sharpened
+
+    def _enhance_low_texture_aggressive(self, gray):
+        """更激进的低纹理增强：双边滤波保边 + 超高 CLAHE + 锐化（特征重试用）"""
+        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        enhanced = self._clahe_very_low.apply(filtered)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
+        sharpened = cv2.addWeighted(enhanced, 2.0, blurred, -1.0, 0)
+        return sharpened
+
     def _match_impl(self, minimap_bgr):
         t_start = self._perf_time.perf_counter()
         found = False
@@ -698,13 +719,34 @@ class SIFTMapTracker:
         match_quality = 0.0  # 0-1 匹配质量
         self._sift_confused = False  # 每帧重置
 
-        minimap_gray = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
-        minimap_gray = self._adaptive_clahe(minimap_gray)
+        minimap_gray_raw = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2GRAY)
+        texture_std = np.std(minimap_gray_raw)
+        is_low_texture = texture_std < self._clahe_low_thresh
+        is_very_low_texture = texture_std < self._clahe_very_low_thresh
+
+        minimap_gray = self._adaptive_clahe(minimap_gray_raw)
+
+        # 超低纹理（海面/天空）：额外锐化增强
+        if is_very_low_texture:
+            minimap_gray = self._enhance_low_texture(minimap_gray)
 
         # 圆形 mask：过滤圆形小地图四角噪声特征点
         h_mm, w_mm = minimap_gray.shape[:2]
         circ_mask = self._get_circular_mask(h_mm, w_mm)
         kp_mini, des_mini = self.sift.detectAndCompute(minimap_gray, circ_mask)
+
+        # 超低纹理 + 特征过少 → 用更激进的预处理重试
+        if is_very_low_texture and (des_mini is None or len(kp_mini) < 15):
+            enhanced = self._enhance_low_texture_aggressive(minimap_gray_raw)
+            kp_retry, des_retry = self.sift.detectAndCompute(enhanced, circ_mask)
+            if des_retry is not None and len(kp_retry) > (len(kp_mini) if kp_mini is not None else 0):
+                kp_mini, des_mini = kp_retry, des_retry
+
+        # 低纹理场景动态放宽匹配参数
+        eff_match_ratio = (getattr(config, 'SIFT_MATCH_RATIO_LOW_TEXTURE', 0.88)
+                           if is_low_texture else config.SIFT_MATCH_RATIO)
+        eff_min_match = (getattr(config, 'SIFT_MIN_MATCH_LOW_TEXTURE', 3)
+                         if is_low_texture else config.SIFT_MIN_MATCH_COUNT)
 
         if des_mini is not None and len(kp_mini) >= 2:
 
@@ -731,10 +773,10 @@ class SIFTMapTracker:
                 for m_n in matches:
                     if len(m_n) == 2:
                         m, n = m_n
-                        if m.distance < config.SIFT_MATCH_RATIO * n.distance:
+                        if m.distance < eff_match_ratio * n.distance:
                             good.append(m)
 
-                if len(good) >= config.SIFT_MIN_MATCH_COUNT:
+                if len(good) >= eff_min_match:
                     src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
                     dst_pts = np.float32([current_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
 
@@ -742,7 +784,7 @@ class SIFTMapTracker:
 
                     if M is not None:
                         inlier_count = int(mask.sum()) if mask is not None else 0
-                        if inlier_count < config.SIFT_MIN_MATCH_COUNT:
+                        if inlier_count < eff_min_match:
                             continue
 
                         # Homography 缩放合理性检查（防止UI误匹配）

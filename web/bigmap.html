@@ -463,6 +463,13 @@ async function init() {
     setTimeout(function(){ $('ldMask').classList.add('hide'); },300);
     bindEv();
     TC.log('就绪 - ' + mapInfo.map_width + 'x' + mapInfo.map_height);
+    // 自动连接 WebSocket（大地图使用 coords-only 模式，带宽极低）
+    TC.connectWS().then(function(){
+        TC.log('\ud83d\udcf6 WebSocket \u5df2\u5c31\u7eea\uff08coords \u6a21\u5f0f\uff09');
+    }).catch(function(e){
+        TC.log('\u26a0\ufe0f WS\u8fde\u63a5\u5931\u8d25\uff0c\u5c06\u4f7f\u7528HTTP\u6a21\u5f0f');
+        useWSMode=false;
+    });
 }
 
 function fitMap() {
@@ -675,45 +682,97 @@ function setupRegionDrag() {
 }
 
 // ========== 分析逻辑 (升级: WS 优先 + 圆形选区保存) ==========
-var useWSMode=true;
 async function analyzeOnce(){
     var data=TC.imageData;
     if(!data&&TC.mode==='screen'){data=TC.captureScreenImg();}
     if(!data){TC.log('\u8bf7\u5148\u9009\u62e9\u56fe\u7246\u6216\u5f00\u542c\u5c4f\u5e55\u6355\u83b7');return}
     await saveCircleState();
     TC.log('\u6b63\u5728\u5206\u6790...');
-    // 优先 WS 二进制模式
+    // 优先 WS coords-only 模式
     if(useWSMode && TC.wsConnected){
         try{
             var blob=await new Promise(function(res){
                 var img=new Image();img.onload=function(){
                     var c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;
                     var ctx=c.getContext('2d');ctx.drawImage(img,0,0);
-                    c.toBlob(res,'image/png',.95);
+                    c.toBlob(res,'image/jpeg',.85);
                 };img.src=data;
             });
-            if(blob){await TC.sendViaWS(blob);return;}
-        }catch(e){useWSMode=false;TC.log('WS \u56de送 HTTP \u6a21式');}
+            if(blob){TC.sendCoordsViaWS(blob);return;}
+        }catch(e){useWSMode=false;TC.log('WS \u56de\u9000 HTTP \u6a21\u5f0f');}
     }
     try{await TC.sendAndDisplay(data);}catch(err){TC.log('\u9519\u8bef: '+err.message);}
 }
 
 
-// ========== 自动追踪 ==========
-function toggleAuto(){
+// ========== 自动追踪 (WS coords-only 优先，HTTP 回退) ==========
+var useWSMode = true;
+var wsReconnectAt = 0;
+var nullBlobWarnAt = 0;
+var S_nullBlobCount = 0;
+
+async function toggleAuto(){
     autoRun=!autoRun;
     var btn=$('autoBtn');
-    if(autoRun){btn.textContent='\u6682\u505c\u8ffd\u8e2a';btn.className='ba';TC.log('\u81ea\u52a8\u8ffd\u8e2a\u5df2\u542f\u52a8');loopAuto();}
+    if(autoRun){
+        btn.textContent='\u6682\u505c\u8ffd\u8e2a';btn.className='ba';
+        await saveCircleState();
+        // 确保 WS 已连接
+        if(useWSMode && !TC.wsConnected){
+            try{
+                await TC.connectWS();
+            }catch(e){
+                TC.log('\u26a0\ufe0f WS\u8fde\u63a5\u5931\u8d25\uff0c\u4f7f\u7528HTTP\u6a21\u5f0f');
+                useWSMode=false;
+            }
+        }
+        var modeLabel=useWSMode&&TC.wsConnected?'WS coords':'HTTP';
+        TC.log('\u81ea\u52a8\u8ffd\u8e2a\u5df2\u542f\u52a8 ('+modeLabel+')');
+        loopAuto();
+    }
     else{btn.textContent='\u81ea\u52a8\u8ffd\u8e2a';btn.className='bs';TC.log('\u5df2\u6682\u505c');if(autoT){clearTimeout(autoT);autoT=null}}
 }
 function loopAuto(){
     if(!autoRun)return;
     captureAndSend();
-    autoT=setTimeout(function(){requestAnimationFrame(loopAuto);},50);}
+    autoT=setTimeout(function(){requestAnimationFrame(loopAuto);},80);
+}
 async function captureAndSend(){
     if(TC.mode!=='screen'||sending||!TC.isScreenActive)return;
     sending=true;
-    try{var d=TC.captureScreenImg();if(d)await TC.sendAndDisplay(d);}catch(e){console.error(e)}finally{sending=false}
+    try{
+        if(useWSMode && TC.wsConnected){
+            // WS 二进制 coords-only 模式：仅返回坐标，无图片，带宽极低
+            var blob=await TC.captureScreenImgBlob();
+            if(blob){
+                S_nullBlobCount=0;
+                TC.sendCoordsViaWS(blob);
+            } else {
+                S_nullBlobCount++;
+                if(S_nullBlobCount>=5 && Date.now()>=nullBlobWarnAt){
+                    nullBlobWarnAt=Date.now()+5000;
+                    TC.log('\u26a0\ufe0f \u622a\u56fe\u8fde\u7eed\u5931\u8d25('+S_nullBlobCount+'\u5e27)');
+                }
+            }
+        } else if(useWSMode && !TC.wsConnected){
+            // WS 断开：本帧走 HTTP，后台尝试重连
+            var d=TC.captureScreenImg();
+            if(d) await TC.sendAndDisplay(d);
+            var now=Date.now();
+            if(now>=wsReconnectAt){
+                wsReconnectAt=now+3000;
+                TC.log('\ud83d\udd04 WS\u65ad\u5f00\uff0c\u5c1d\u8bd5\u91cd\u8fde...');
+                TC.connectWS().then(function(){
+                    TC.log('\ud83d\udcf6 WS\u91cd\u8fde\u6210\u529f');
+                }).catch(function(){});
+            }
+        } else {
+            // HTTP 模式
+            var d=TC.captureScreenImg();
+            if(d) await TC.sendAndDisplay(d);
+        }
+    }catch(e){console.error(e)}
+    finally{sending=false}
 }
 
 // ========== 屏幕捕获 (包装 TC) ==========
