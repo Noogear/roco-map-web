@@ -1,0 +1,1450 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能雷达跟点</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 {
+            font-size: 1.5em;
+            margin-bottom: 16px;
+            color: #00d4ff;
+        }
+        .container {
+            display: flex;
+            gap: 24px;
+            flex-wrap: wrap;
+            justify-content: center;
+            width: 100%;
+        }
+        .panel {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            width: 100%;
+            max-width: min(80vmin, 760px);
+        }
+        .panel-title {
+            font-size: 1em;
+            color: #888;
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .preview-area {
+            position: relative;
+        }
+        canvas, img {
+            border-radius: 8px;
+            display: block;
+            background: #2b2b2b;
+        }
+        #minimapCanvas {
+            cursor: crosshair;
+            width: 300px;
+            height: 300px;
+            object-fit: contain;
+        }
+        #resultCanvas {
+            width: 100%;
+            height: auto;
+            max-width: min(80vmin, 700px);
+            aspect-ratio: 1 / 1;
+            background: #111;
+        }
+        .status-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            margin-top: 16px;
+        }
+        .status-item {
+            background: #0f3460;
+            padding: 10px 14px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .status-label { font-size: 0.75em; color: #999; }
+        .status-value { font-size: 1.1em; font-weight: bold; margin-top: 4px; }
+        .state-global { color: #ffa726; }
+        .state-local { color: #66bb6a; }
+        .state-lost { color: #ef5350; }
+        .found-yes { color: #66bb6a; }
+        .found-no { color: #ef5350; }
+        .lock-on { color: #4caf50; font-weight:bold; }
+        .lock-off { color: #666; }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: #00d4ff; color: #000; }
+        .btn-primary:hover { background: #00b8e6; transform: translateY(-1px); }
+        .btn-secondary { background: #333; color: #fff; border: 1px solid #555; }
+        .btn-secondary:hover { background: #444; }
+        .btn-danger { background: #e53935; color: #fff; }
+        .btn-danger:hover { background: #c62828; }
+        .btn-pip { background: #7c4dff; color: #fff; border: 1px solid #b388ff; }
+        .btn-pip:hover { background: #651fff; transform: translateY(-1px); }
+        .btn-pip.active { background: #00e676; color: #000; border-color: #00e676; }
+        .btn-watch { background: #e91e63; color: #fff; border: 1px solid #f48fb1; }
+        .btn-watch:hover { background: #c2185b; }
+        .btn-watch.active { background: #00e676; color: #000; border-color: #00e676; }
+        .btn-lock { background: #555; color: #ccc; border: 1px solid #777; cursor: not-allowed; opacity: 0.5; }
+        .btn-lock.ready { background: #ff9800; color: #000; border: 1px solid #ffb74d; cursor: pointer; opacity: 1; }
+        .btn-lock.ready:hover { background: #f57c00; transform: translateY(-1px); }
+        .btn-lock.active { background: #4caf50; color: #fff; border: 1px solid #81c784; cursor: pointer; opacity: 1; animation: lockPulse 2s infinite; }
+        .btn-lock.active:hover { background: #388e3c; }
+        .btn-reset { background: #607d8b; color: #fff; border: 1px solid #90a4ae; cursor: pointer; }
+        /* 状态指示灯 */
+        .status-dot {
+            display: inline-block;
+            width: 14px; height: 14px;
+            border-radius: 50%;
+            transition: background-color 0.3s, box-shadow 0.3s;
+            flex-shrink: 0;
+        }
+        .dot-green  { background: #4caf50; box-shadow: 0 0 6px rgba(76,175,80,0.6); }
+        .dot-yellow { background: #ff9800; box-shadow: 0 0 6px rgba(255,152,0,0.6); animation: dotBlink 0.8s infinite; }
+        .dot-red    { background: #f44336; box-shadow: 0 0 6px rgba(244,67,54,0.5); animation: dotBlink 0.4s infinite; }
+        @keyframes dotBlink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .status-dot-wrap {
+            display: flex; align-items: center; gap: 8px;
+        }
+        .status-dot-label { font-size: 12px; color: #aaa; }
+        .btn-reset:hover { background: #455a64; transform: translateY(-1px); }
+        .btn-reset:active { background: #37474f; }
+        @keyframes lockPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.4); }
+            50% { box-shadow: 0 0 0 6px rgba(76, 175, 80, 0); }
+        }
+
+        /* 观看模式 */
+        .watch-mode .float-body > .mode-toggle:first-of-type,
+        .watch-mode .float-body > .preview-area,
+        .watch-mode .float-body > .region-info,
+        .watch-mode .float-body > .btn-row,
+        .watch-mode .float-body > .test-images { display: none !important; }
+        .watch-badge {
+            display: none;
+            text-align: center;
+            padding: 12px;
+            margin-bottom: 8px;
+            background: rgba(233, 30, 99, 0.15);
+            border: 1px solid #e91e63;
+            border-radius: 8px;
+            font-size: 0.85em;
+            color: #f48fb1;
+        }
+        .watch-badge.show { display: block; }
+
+        input[type="file"] { display: none; }
+        label.file-label {
+            display: inline-block;
+            padding: 10px 20px;
+            background: #5c6bc0;
+            color: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        label.file-label:hover { background: #3f51b5; }
+
+        .mode-toggle {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        .mode-btn {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            background: #222;
+            color: #aaa;
+            border: 1px solid #444;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .mode-btn.active {
+            background: #00d4ff;
+            color: #000;
+            border-color: #00d4ff;
+        }
+
+        /* 测试图片选择器 */
+        .test-images {
+            display: none;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #333;
+        }
+        .test-images.show { display: block; }
+        .test-label {
+            font-size: 0.8em;
+            color: #888;
+            margin-bottom: 8px;
+        }
+        .test-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .test-item {
+            width: 50px;
+            height: 50px;
+            border-radius: 6px;
+            object-fit: cover;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: border-color 0.2s;
+        }
+        .test-item:hover { border-color: #00d4ff; }
+        .test-item.selected { border-color: #66bb6a; }
+
+        /* 悬浮输入面板 */
+        .float-panel {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            z-index: 100;
+        }
+        .float-toggle {
+            background: #16213e;
+            border: 1px solid #00d4ff;
+            color: #00d4ff;
+            padding: 10px 18px;
+            border-radius: 24px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.25s;
+            box-shadow: 0 4px 16px rgba(0,212,255,0.2);
+            user-select: none;
+            white-space: nowrap;
+        }
+        .float-toggle:hover { background: #1a3a5c; transform: scale(1.03); }
+        .float-toggle .arrow { transition: transform 0.3s; font-size: 0.8em; }
+        .float-toggle.expanded .arrow { transform: rotate(180deg); }
+        .float-body {
+            display: none;
+            margin-top: 10px;
+            background: #16213e;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            max-width: 520px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .float-body.show { display: block; animation: fadeSlideIn 0.2s ease; }
+        @keyframes fadeSlideIn { from{opacity:0;transform:translateY(-8px);} to{opacity:1;transform:translateY(0);} }
+
+        /* 屏幕捕获 & 圆形选区 */
+        #screenVideoContainer {
+            position: relative;
+            display: inline-block;
+        }
+        #screenPreview {
+            width: 480px;
+            height: 270px;
+            object-fit: contain;
+            border-radius: 8px;
+            background: #111;
+        }
+        .region-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+        }
+        .region-box {
+            position: absolute;
+            border: 2px dashed #00d4ff;
+            background: rgba(0, 212, 255, 0.08);
+            border-radius: 50%;
+            cursor: move;
+            pointer-events: auto;
+            box-shadow: 0 0 12px rgba(0, 212, 255, 0.35);
+            user-select: none;
+        }
+        .region-handle {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            background: #00d4ff;
+            border: 2px solid #fff;
+            border-radius: 50%;
+            right: -6px;
+            top: 50%;
+            margin-top: -6px;
+            cursor: ew-resize;
+        }
+
+        .region-info {
+            font-size: 0.75em;
+            color: #00d4ff;
+            margin-top: 4px;
+            font-family: monospace;
+            white-space: nowrap;
+        }
+
+        #logArea {
+            margin-top: 16px;
+            background: #0a0a15;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: monospace;
+            font-size: 0.8em;
+            color: #0f0;
+            max-height: 150px;
+            overflow-y: auto;
+            width: 100%;
+        }
+
+        /* 原生PiP专用画布与视频 */
+        #pipCanvas, #pipVideo {
+            position: fixed;
+            opacity: 0;
+            pointer-events: none;
+            width: 1px;
+            height: 1px;
+        }
+
+        @media (max-width: 900px) {
+            #resultCanvas { width: 350px; height: 350px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 识别模式切换 -->
+    <div class="mode-toggle" id="algoModeToggle" style="display:none;">
+        <span style="color:#888; font-size:0.85em; margin-right:8px;">识别引擎:</span>
+        <button class="mode-btn active" id="algoSift" onclick="switchAlgo('sift')">⚡ SIFT (快速)</button>
+        <button class="mode-btn" id="algoLoftr" onclick="switchAlgo('loftr')">🧠 LoFTR (AI)</button>
+    </div>
+
+    <div class="mode-toggle" style="display:none;">
+        <button class="mode-btn active" id="modeFile" data-conn-mode="file" onclick="setMode('file')">📁 文件上传</button>
+        <button class="mode-btn" id="modeScreen" data-conn-mode="screen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
+    </div>
+
+    <div class="container">
+        <!-- 右侧：结果输出（独占） -->
+        <div class="panel" style="max-width:700px;">
+            <div class="panel-title" style="display:none;">🗺️ 地图追踪结果</div>
+            <div class="preview-area" style="position:relative;">
+                <canvas id="resultCanvas" width="400" height="400"></canvas>
+                <!-- 渲染模式切换按钮（右上角浮层）-->
+                <button id="renderModeBtn" onclick="toggleRenderMode()"
+                    title="全图模式：下载一次大地图，60fps 平滑裁切无边界&#10;JPEG模式：后端直接发图，轻量低流量"
+                    style="position:absolute;top:6px;right:6px;padding:4px 12px;
+                           background:#0f3460;border:1px solid #00d4ff88;
+                           color:#00d4ff;border-radius:6px;cursor:pointer;font-size:0.75em;
+                           box-shadow:0 2px 8px rgba(0,0,0,0.6);white-space:nowrap;">🗺️ 全图</button>
+            </div>
+            <div class="status-bar">
+                <div class="status-item" style="display:none;">
+                    <div class="status-label">引擎</div>
+                    <div class="status-value" id="statusMode" style="color:#00d4ff;">SIFT</div>
+                </div>
+                <div class="status-item" style="display:none;">
+                    <div class="status-label">状态</div>
+                    <div class="status-value">
+                        <div class="status-dot-wrap">
+                            <span id="statusDot" class="status-dot dot-green" title="正常"></span>
+                            <span id="statusDotLabel" class="status-dot-label">--</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">坐标 X</div>
+                    <div class="status-value" id="statusX">--</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">坐标 Y</div>
+                    <div class="status-value" id="statusY">--</div>
+                </div>
+                <div class="status-item" id="lockStatusItem" style="display:none;">
+                    <div class="status-label">锁定</div>
+                    <div class="status-value" id="statusLock">--</div>
+                </div>
+                <div class="status-item" id="hybridStatusItem" style="display:none;">
+                    <div class="status-label">AI辅助</div>
+                    <div class="status-value" id="statusHybrid">--</div>
+                </div>
+                <div class="status-item" style="display:none;">
+                    <div class="status-label">质量</div>
+                    <div class="status-value" id="statusQuality">--</div>
+                </div>
+                <div class="status-item" style="display:none;">
+                    <div class="status-label">是否找到</div>
+                    <div class="status-value found-no" id="statusFound">--</div>
+                </div>
+                <div class="status-item" style="display:none;">
+                    <div class="status-label">匹配点数</div>
+                    <div class="status-value" id="statusMatches">--</div>
+                </div>
+            </div>
+            <div id="logArea"></div>
+        </div>
+    </div>
+
+    <!-- 悬浮输入面板 -->
+    <div class="float-panel" id="floatPanel">
+        <div class="float-toggle" id="floatToggle" onclick="toggleFloatPanel()">
+            📍 <span class="arrow">▼</span>
+        </div>
+        <div class="float-body" id="floatBody">
+            <!-- 观看模式徽章 -->
+            <div class="watch-badge" id="watchBadge">👁️ 观看模式 — 实时接收他人追踪画面</div>
+
+            <!-- 模式切换 -->
+            <div class="mode-toggle" style="margin-bottom:12px;">
+                <button class="mode-btn active" id="modeFile" data-conn-mode="file" onclick="setMode('file')">📁 文件上传</button>
+                <button class="mode-btn" id="modeScreen" data-conn-mode="screen" onclick="startScreenCapture()">🖥️ 屏幕捕获</button>
+                <button class="mode-btn" id="modeWatch" data-conn-mode="watch" onclick="enterWatchMode()">👁️ 观看模式</button>
+            </div>
+
+            <!-- 预览区 -->
+            <div class="preview-area">
+                <canvas id="minimapCanvas" width="300" height="300"></canvas>
+                <div id="screenVideoContainer" style="display:none;">
+                    <video id="screenPreview" autoplay playsinline muted></video>
+                    <div class="region-overlay" id="regionOverlay">
+                        <div class="region-box" id="regionBox">
+                            <div class="region-handle"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="region-info" id="regionInfo" style="display:none;">区域: --</div>
+
+            <!-- 按钮行 -->
+            <div class="btn-row">
+                <label for="fileInput" class="file-label">📂 上传图片</label>
+                <input type="file" id="fileInput" accept="image/*">
+                <button class="btn-primary" onclick="processImage()">▶️ 分析定位</button>
+                <button id="coordLockBtn" class="btn-lock" onclick="toggleCoordLock()" disabled title="需要先分析定位积累坐标历史">🔒 坐标锁</button>
+                <button class="btn-reset" onclick="resetHistory()" title="清空坐标历史，重新开始累积">🗑 重置历史</button>
+                <button class="btn-pip" id="pipBtn" data-feature="pip" onclick="toggleNativePiP()">🎠 浏览器画中画</button>
+                <button class="btn-danger" onclick="stopScreenCapture()" id="stopScreenBtn" style="display:none;">⏹ 停止捕获</button>
+            </div>
+
+            <!-- 测试小地图选择器 -->
+            <div class="test-images" id="testImagesArea" style="display:none;">
+                <div class="test-label">🧪 测试图片（点击选择）：</div>
+                <div class="test-grid" id="testGrid"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 离屏视频：始终渲染帧供截图用，不受面板收起影响 -->
+    <video id="screenOffscreen" autoplay playsinline muted style="position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;"></video>
+    <!-- 原生PiP专用元素 -->
+    <canvas id="pipCanvas"></canvas>
+    <video id="pipVideo" autoplay playsinline muted></video>
+
+<script src="js/socket.io.min.js"></script>
+<script src="js/tracker-core.js"></script>
+<script>
+// ========== 初始化 ==========
+TC.init({
+    logEl: 'logArea',
+    onAnalyzeResult: function(result) {
+        // 将后端坐标+箭头更新到前端 canvas 插值系统
+        if (result.status && result.status.position) {
+            var st = result.status;
+            _mapStatePrev = _mapState;
+            _mapState = {
+                x: st.position.x || 0,
+                y: st.position.y || 0,
+                angle: st.arrow_angle || 0,
+                stopped: !!st.arrow_stopped,
+                found: !!st.found,
+                isInertial: st.state === 'INERTIAL',
+                isSceneChange: st.state === 'SCENE_CHANGE',
+                ts: performance.now(),
+            };
+            _mapHistory.push(_mapState);
+            if (_mapHistory.length > 4) _mapHistory.shift();
+            _startMapRAF();
+        }
+        // JPEG 模式：缓存最新后端图片（全图模式也缓存，以便随时切换不黑屏）
+        if (result.image) {
+            var imgSrc = result.image;
+            if (imgSrc && imgSrc.indexOf('data:') !== 0) {
+                imgSrc = 'data:image/jpeg;base64,' + imgSrc;
+            }
+            // 必须在同步阶段捕获坐标，onload 是异步的，届时 _mapState 已被新帧覆盖
+            var capX = _mapState ? _mapState.x : 0;
+            var capY = _mapState ? _mapState.y : 0;
+            var img = new Image();
+            img.onload = function() {
+                _prevJpegImg = _lastJpegImg;
+                _prevJpegPos = _lastJpegPos;
+                _lastJpegImg = img;
+                _lastJpegPos = { x: capX, y: capY };
+                _jpegFadeAlpha = 0;  // 开始淡入
+            };
+            img.src = imgSrc;
+        }
+        if (result.status) {
+            TC.updateStatusDOM(result.status);
+            // 更新锁定状态显示
+            var lockEl = document.getElementById('statusLock');
+            if (lockEl && result.status.coord_lock !== undefined) {
+                if (result.status.coord_lock) {
+                    lockEl.textContent = '🔒';
+                    lockEl.style.color = '#4caf50';
+                } else {
+                    lockEl.textContent = '未锁';
+                    lockEl.style.color = '#888';
+                }
+                // 同步前端状态
+                coordLockEnabled = result.status.coord_lock;
+                updateLockButton();
+            }
+            // 更新混合引擎状态显示
+            var hybridEl = document.getElementById('statusHybrid');
+            var hybridItem = document.getElementById('hybridStatusItem');
+            if (hybridEl && hybridItem && result.status.hybrid !== undefined) {
+                if (result.status.hybrid) {
+                    hybridItem.style.display = '';
+                    if (result.status.hybrid_busy) {
+                        hybridEl.textContent = '🔍定位中';
+                        hybridEl.style.color = '#ffa726';
+                    } else {
+                        hybridEl.textContent = '✅就绪';
+                        hybridEl.style.color = '#66bb6a';
+                    }
+                } else {
+                    hybridItem.style.display = 'none';
+                }
+            }
+        }
+    },
+    onScreenStart: function() {
+        Array.prototype.forEach.call(document.querySelectorAll('.mode-btn'), function(b) { b.classList.remove('active'); });
+        Array.prototype.forEach.call(document.querySelectorAll('[data-conn-mode="screen"]'), function(b) { b.classList.add('active'); });
+
+        var canvas = document.getElementById('minimapCanvas');
+        canvas.style.display = 'none';
+        document.getElementById('testImagesArea').classList.remove('show');
+        if (typeof screenAutoRunning !== 'undefined' && screenAutoRunning) screenAutoRunning = false;
+
+        document.getElementById('screenVideoContainer').style.display = '';
+        document.getElementById('stopScreenBtn').style.display = '';
+        document.getElementById('regionInfo').style.display = '';
+    },
+    onScreenStop: function() {
+        if (screenAutoId) { clearTimeout(screenAutoId); screenAutoId = null; }
+        screenRunning = false;
+        document.getElementById('screenVideoContainer').style.display = 'none';
+        document.getElementById('stopScreenBtn').style.display = 'none';
+        document.getElementById('regionInfo').style.display = 'none';
+        setMode('file');
+    },
+});
+
+TC.log('系统就绪，请选择小地图输入方式');
+
+function setButtonAvailability(buttons, enabled, title) {
+    Array.prototype.forEach.call(buttons || [], function(btn) {
+        if (!btn) return;
+        btn.disabled = !enabled;
+        btn.title = title || '';
+        if (enabled) {
+            btn.style.opacity = '';
+            btn.style.cursor = '';
+        } else {
+            btn.style.opacity = '0.55';
+            btn.style.cursor = 'not-allowed';
+            btn.classList.remove('active');
+        }
+    });
+}
+
+function getPictureInPictureSupport() {
+    var canvas = document.getElementById('pipCanvas');
+    var video = document.getElementById('pipVideo');
+    var canStream = !!(canvas && typeof canvas.captureStream === 'function');
+    var standard = !!(canStream && video && document.pictureInPictureEnabled && typeof video.requestPictureInPicture === 'function');
+    var webkit = !!(canStream && video && typeof video.webkitSupportsPresentationMode === 'function' &&
+        video.webkitSupportsPresentationMode('picture-in-picture') && typeof video.webkitSetPresentationMode === 'function');
+    return {
+        any: standard || webkit,
+        standard: standard,
+        webkit: webkit,
+        canStream: canStream,
+    };
+}
+
+function applyCompatibilityGuards() {
+    var report = TC.getConnectionDiagnostics();
+    var pipSupport = getPictureInPictureSupport();
+
+    setButtonAvailability(
+        document.querySelectorAll('[data-conn-mode="screen"]'),
+        report.screenCapture,
+        report.screenCapture ? '开始屏幕捕获' : '当前浏览器不支持屏幕捕获，请改用 Chrome / Edge / Firefox 新版'
+    );
+
+    setButtonAvailability(
+        document.querySelectorAll('[data-conn-mode="watch"]'),
+        report.socketIO,
+        report.socketIO ? '进入观看模式' : '当前页面未加载 Socket.IO 客户端，无法进入观看模式'
+    );
+
+    setButtonAvailability(
+        document.querySelectorAll('[data-feature="pip"]'),
+        pipSupport.any,
+        pipSupport.any ? '打开浏览器画中画' : '当前浏览器不支持原生画中画，主页面仍可正常显示实时画面'
+    );
+}
+
+function logCompatibilityReport() {
+    var report = TC.getConnectionDiagnostics();
+    var pipSupport = getPictureInPictureSupport();
+    var parts = [
+        'HTTP上传' + (report.httpUpload ? '✅' : '❌'),
+        'Socket.IO' + (report.socketIO ? '✅' : '❌'),
+        '屏幕捕获' + (report.screenCapture ? '✅' : '❌'),
+        '观看模式' + (report.socketIO ? '✅' : '❌'),
+        '画中画' + (pipSupport.any ? '✅' : '❌')
+    ];
+    TC.log('兼容检测：' + parts.join(' | '));
+}
+
+// ========== 观看模式 ==========
+var isWatchMode = false;
+async function enterWatchMode() {
+    if (!TC.getConnectionDiagnostics().socketIO) {
+        TC.log('当前页面未加载 Socket.IO 客户端，无法进入观看模式');
+        return;
+    }
+
+    var panel = document.getElementById('floatPanel');
+    var badge = document.getElementById('watchBadge');
+    var btn = document.getElementById('modeWatch');
+
+    if (isWatchMode) {
+        // 退出观看模式
+        isWatchMode = false;
+        panel.classList.remove('watch-mode');
+        badge.classList.remove('show');
+        btn.classList.remove('active');
+        setMode('file');
+        TC.log('已退出观看模式');
+        return;
+    }
+
+    // 进入观看模式
+    isWatchMode = true;
+    panel.classList.add('watch-mode');
+    badge.classList.add('show');
+    btn.classList.add('active');
+
+    // 确保WS连接（接收广播画面需要）
+    if (!TC.wsConnected) {
+        try { await TC.connectWS(); } catch(e) { TC.log('WS连接失败: ' + e.message); return; }
+    }
+
+    TC.log('已进入观看模式，正在接收实时追踪画面...');
+}
+TC.bindFileInput(document.getElementById('fileInput'), document.getElementById('minimapCanvas'));
+
+document.addEventListener('testimage:selected', function(e) {
+    var img = e.detail.imgEl, src = e.detail.src;
+    var cvs = document.getElementById('minimapCanvas'), ctx = cvs.getContext('2d');
+    ctx.clearRect(0, 0, 300, 300);
+    var s = Math.min(300 / img.naturalWidth, 300 / img.naturalHeight);
+    var w = img.naturalWidth * s, h = img.naturalHeight * s;
+    ctx.drawImage(img, (300 - w) / 2, (300 - h) / 2, w, h);
+    TC.imageData = cvs.toDataURL('image/png');
+    TC.log('已选择测试图: ' + src);
+});
+
+TC.loadTestImages('testGrid').then(function(imgs) {
+    if (imgs.length > 0) document.getElementById('testImagesArea').classList.add('show');
+});
+TC.checkEngines();
+
+// ========== 悬浮面板 ==========
+function toggleFloatPanel() {
+    document.getElementById('floatBody').classList.toggle('show');
+    document.getElementById('floatToggle').classList.toggle('expanded');
+}
+
+// ========== 屏幕捕获（包装 TC，加 UI） ==========
+
+async function startScreenCapture() {
+    var ok = await TC.startScreenCapture({
+        previewVideo: 'screenPreview',
+        offscreenVidId: 'screenOffscreen',
+        onMeta: function(vw, vh) { initRegionBox(document.getElementById('screenPreview')); setupRegionDrag(document.getElementById('screenPreview')); }
+    });
+    if (!ok) return;
+}
+function stopScreenCapture() { TC.stopScreenCapture(); }
+
+function initRegionBox(videoEl) {
+    var overlay = document.getElementById('regionOverlay'), box = document.getElementById('regionBox');
+    function updateCircleSize() {
+        var rect = videoEl.getBoundingClientRect();
+        overlay.style.width = rect.width + 'px'; overlay.style.height = rect.height + 'px';
+        var size = Math.min(rect.width, rect.height);
+        box.style.left = (TC.selCircle.cx * rect.width - TC.selCircle.r * size) + 'px';
+        box.style.top = (TC.selCircle.cy * rect.height - TC.selCircle.r * size) + 'px';
+        var d = TC.selCircle.r * size * 2;
+        box.style.width = d + 'px'; box.style.height = d + 'px';
+        var realCX = Math.round(TC.selCircle.cx * videoEl.videoWidth);
+        var realCY = Math.round(TC.selCircle.cy * videoEl.videoHeight);
+        var realR = Math.round(TC.selCircle.r * Math.min(videoEl.videoWidth, videoEl.videoHeight));
+        document.getElementById('regionInfo').textContent =
+            '圆形选区: 中心(' + realCX + ', ' + realCY + ') 半径' + realR + 'px [' + videoEl.videoWidth + 'x' + videoEl.videoHeight + ']';
+    }
+    updateCircleSize();
+    window.__updateRegionBox = updateCircleSize;
+}
+
+var dragState = { active: false, type: '', startX: 0, startY: 0, startCircle: null };
+var _regionDragSetup = false;  // 防止多次调用累积全局监听器
+function setupRegionDrag(videoEl) {
+    if (_regionDragSetup) return;
+    _regionDragSetup = true;
+    var box = document.getElementById('regionBox');
+    var overlay = document.getElementById('regionOverlay');
+    var handle = box.querySelector('.region-handle');
+    function getPos(e) { var rect = overlay.getBoundingClientRect(); return { x: e.clientX - rect.left, y: e.clientY - rect.top }; }
+    function onDown(type, e) {
+        e.preventDefault(); e.stopPropagation();
+        dragState = { active: true, type: type, startX: getPos(e).x, startY: getPos(e).y, startCircle: { cx: TC.selCircle.cx, cy: TC.selCircle.cy, r: TC.selCircle.r } };
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+    }
+    function onMove(e) {
+        if (!dragState.active) return;
+        var p = getPos(e), rect = overlay.getBoundingClientRect(), base = Math.min(rect.width, rect.height);
+        var dx = (p.x - dragState.startX) / base, dy = (p.y - dragState.startY) / base, sc = dragState.startCircle;
+        if (dragState.type === 'move') { TC.selCircle.cx = TC.clamp(sc.cx+dx, 0, 1); TC.selCircle.cy = TC.clamp(sc.cy+dy, 0, 1); }
+        else { var maxR = Math.max(sc.cx, 1-sc.cx, sc.cy, 1-sc.cy); TC.selCircle.r = TC.clamp(sc.r+dx, 0.03, Math.min(0.49, maxR)); }
+        window.__updateRegionBox && window.__updateRegionBox();
+    }
+    function onUp() { dragState.active=false; document.removeEventListener('mousemove',onMove); document.removeEventListener('mouseup',onUp); }
+    box.addEventListener('mousedown', function(e){ onDown('move',e); });
+    if(handle) handle.addEventListener('mousedown', function(e){ onDown('resize',e); });
+    box.addEventListener('touchstart', function(e){ onDown('move', e.touches[0]); }, {passive:false});
+    if(handle) handle.addEventListener('touchstart', function(e){ onDown('resize', e.touches[0]); }, {passive:false});
+    document.addEventListener('touchmove', function(e){ if(dragState.active&&e.touches[0])onMove(e.touches[0]);}, {passive:false});
+    document.addEventListener('touchend', onUp);
+    box.addEventListener('dblclick', function(){ if(typeof toggleScreenAutoTrack==='function')toggleScreenAutoTrack(); });
+    videoEl.addEventListener('resize', function(){ setTimeout(function(){window.__updateRegionBox&&window.__updateRegionBox();}, 10); });
+}
+
+// ========== 自动追踪（屏幕捕获模式 - WebSocket 二进制 PNG） ==========
+var screenSending = false;
+var useWSMode = true;  // 是否使用 WS 二进制通道
+var wsReconnectAt = 0; // WS 断线重连限流时间戳
+var nullBlobWarnAt = 0; // null blob 警告限流时间戳
+async function captureAndSendScreenFrame() {
+    if (!TC.isScreenActive || screenSending) return;
+    screenSending = true;
+    try {
+        if (useWSMode && TC.wsConnected) {
+            // WS 二进制模式: JPEG 压缩 + 零 base64 开销（上传体积减少约 90%）
+            var blob = await TC.captureScreenImgBlob();
+            if (blob) {
+                S_nullBlobCount = 0;
+                await TC.sendViaWS(blob);
+            } else {
+                // canvas/video 未就绪：限流警告，避免日志刷屏
+                S_nullBlobCount = (S_nullBlobCount || 0) + 1;
+                if (S_nullBlobCount >= 5 && Date.now() >= nullBlobWarnAt) {
+                    nullBlobWarnAt = Date.now() + 5000;
+                    TC.log('⚠️ 截图连续失败(' + S_nullBlobCount + '帧)，视频流可能已暂停或 canvas 异常');
+                }
+            }
+        } else if (useWSMode && !TC.wsConnected) {
+            // WS 已断开：本帧走 HTTP，后台每3秒尝试重连一次
+            var frameData = TC.captureScreenImg();
+            if (frameData) { TC.imageData = frameData; await TC.sendAndDisplay(frameData); }
+            var now = Date.now();
+            if (now >= wsReconnectAt) {
+                wsReconnectAt = now + 3000;
+                TC.log('🔄 WS 断开，尝试重连...');
+                TC.connectWS().then(function() {
+                    TC.log('📶 WS 重连成功，恢复二进制模式');
+                }).catch(function() {
+                    TC.log('⚠️ WS 重连失败，继续 HTTP 模式');
+                });
+            }
+        } else {
+            // 已明确回退到 HTTP（useWSMode=false）
+            var frameData = TC.captureScreenImg();
+            if (frameData) { TC.imageData = frameData; await TC.sendAndDisplay(frameData); }
+        }
+    } catch(e) { console.error('识别出错:', e); }
+    finally { screenSending = false; }
+}
+var S_nullBlobCount = 0;
+var screenAutoRunning = false, screenAutoId = null;
+async function toggleScreenAutoTrack() {
+    screenAutoRunning = !screenAutoRunning;
+    var btn = document.getElementById('stopScreenBtn');
+    if (screenAutoRunning) {
+        // 保存圆形选区状态到服务器
+        await saveCircleState();
+        // 尝试连接 WebSocket
+        if (useWSMode && !TC.wsConnected) {
+            try {
+                await TC.connectWS();
+                useWSMode = TC.wsConnected;
+            } catch(e) {
+                TC.log('\u26a0\ufe0f WS 连接失败，回退到 HTTP 模式');
+                useWSMode = false;
+            }
+        }
+        var modeLabel = useWSMode ? 'WS\u4e8c\u8fdb\u5236(~20fps)' : 'HTTP(~20fps)';
+        btn.textContent='⏸ 暂停追踪'; TC.log('📍 屏幕自动追踪已开启 (' + modeLabel + ')'); runScreenAutoLoop();
+    }
+    else { btn.textContent='⏹ 停止捕获'; TC.log('⏸ 屏幕自动追踪已暂停'); screenSending = false; }
+}
+function runScreenAutoLoop() {
+    if (!screenAutoRunning || TC.mode !== 'screen') return;
+    captureAndSendScreenFrame();
+    screenAutoId = setTimeout(function() { requestAnimationFrame(runScreenAutoLoop); }, 100);
+}
+
+// ========== 文件模式切换 ==========
+function setMode(mode) {
+    TC.mode = mode;
+    Array.prototype.forEach.call(document.querySelectorAll('.mode-btn'), function(b) { b.classList.remove('active'); });
+    Array.prototype.forEach.call(document.querySelectorAll('[data-conn-mode="file"]'), function(b) { b.classList.add('active'); });
+    document.getElementById('screenVideoContainer').style.display = 'none';
+    document.getElementById('stopScreenBtn').style.display = 'none';
+    document.getElementById('regionInfo').style.display = 'none';
+    if (typeof screenAutoRunning !== 'undefined' && screenAutoRunning && mode !== 'screen') screenAutoRunning = false;
+    document.getElementById('minimapCanvas').style.display = 'block';
+    document.getElementById('testImagesArea').classList.add('show');
+}
+
+// ========== 分析按钮 ==========
+async function processImage() {
+    if (TC.mode === 'screen') { toggleScreenAutoTrack(); return; }
+    var data = TC.imageData;
+    if (!data) {
+        var cvs = document.getElementById('minimapCanvas');
+        if (cvs && cvs.style.display !== 'none') data = cvs.toDataURL('image/png');
+    }
+    if (!data) { TC.log('请先上传或选择小地图！'); return; }
+    // 保存圆形选区状态到服务器
+    await saveCircleState();
+    TC.log('正在 SIFT 分析...');
+    try { await TC.sendAndDisplay(data); } catch(err) { TC.log('错误: ' + err.message); console.error(err); }
+}
+
+// ========== 保存圆形选区状态 ==========
+async function saveCircleState() {
+    var sc = TC.selCircle;
+    if (!sc) return;
+    try {
+        var resp = await fetch('/api/circle_state', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cx: sc.cx, cy: sc.cy, r: sc.r })
+        });
+        var result = await resp.json();
+        if (result.success) {
+            console.log('圆形选区已保存:', sc.cx.toFixed(4), sc.cy.toFixed(4), sc.r.toFixed(4));
+        }
+    } catch(e) {
+        console.warn('保存圆形选区失败:', e.message);
+    }
+}
+
+// ========== 前端地图 Canvas 平滑渲染（60fps 速度外推）==========
+// 后端每次推送坐标时更新 _mapState，RAF 循环在两次更新之间用速度外推填充帧，
+// 使地图在匀速行走时呈现真正匀速滚动，而不是 10fps 跳帧。
+var resultCanvas = document.getElementById('resultCanvas');
+var _displayMap = null;          // 展示用大地图 Image 对象
+var _mapState = null;            // 最新一帧后端状态 {x,y,angle,stopped,found,isInertial,ts}
+var _mapStatePrev = null;        // 上一帧后端状态
+var _mapHistory = [];            // 最近4帧历史，供 Catmull-Rom 样条使用
+var _mapRAFActive = false;
+var _mapRAFId = null;
+// JPEG 模式专用状态
+var _renderMode = 'bigmap';       // 'bigmap' | 'jpeg'
+var _lastJpegImg = null;          // 当前 JPEG 图片（Image 对象）
+var _lastJpegPos = null;          // 当前 JPEG 对应的服务端坐标 {x,y}，用于亚帧微平移
+var _prevJpegImg = null;          // 交叉淡入淡出：前一帧 JPEG
+var _prevJpegPos = null;          // 交叉淡入淡出：前一帧 JPEG 坐标
+var _jpegFadeAlpha = 1;           // JPEG 淡入进度 0→1（1 = 完全显示当前帧）
+var _renderPos = null;            // 渲染平滑位置（EMA，消除新后端帧到来时的回弹）
+
+// 加载展示地图（用 fetch 取进度，失败自动降级 JPEG 模式）
+var _mapLoadProgress = 0;  // 0..1，1 = 完成
+_displayMap = new Image();
+_displayMap.onerror = function() {
+    TC.log('⚠️ 全图加载失败，已自动切换到 JPEG 模式');
+    _renderMode = 'jpeg';
+    _updateRenderModeBtn();
+};
+// 延迟 3 秒再下载大图：给 socket.io 时间从 HTTP polling 升级到 WebSocket，
+// 避免 33MB 流式下载占满 HTTP 连接池导致 polling 超时断线。
+setTimeout(function _loadMapWithProgress() {
+    fetch('/big_map-1.png').then(function(resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        var total = parseInt(resp.headers.get('content-length') || '0', 10);
+        var loaded = 0;
+        var reader = resp.body.getReader();
+        var chunks = [];
+        function pump() {
+            return reader.read().then(function(ref) {
+                if (ref.done) {
+                    var blob = new Blob(chunks, { type: 'image/png' });
+                    _displayMap.src = URL.createObjectURL(blob);
+                    _mapLoadProgress = 1;
+                    return;
+                }
+                chunks.push(ref.value);
+                loaded += ref.value.length;
+                _mapLoadProgress = total ? loaded / total : 0.5;
+                return pump();
+            });
+        }
+        return pump();
+    }).catch(function(e) {
+        TC.log('⚠️ 全图加载失败(' + e.message + ')，切换到 JPEG 模式');
+        _renderMode = 'jpeg';
+        _updateRenderModeBtn();
+    });
+}, 3000);
+
+function _updateRenderModeBtn() {
+    var btn = document.getElementById('renderModeBtn');
+    if (!btn) return;
+    if (_renderMode === 'bigmap') {
+        btn.textContent = '🗺️ 全图';
+        btn.title = '当前：全图模式（60fps平滑，无边界）\n点击切换到 JPEG 模式（轻量低流量）';
+    } else {
+        btn.textContent = '📸 JPEG';
+        btn.title = '当前：JPEG 模式（轻量低流量）\n点击切换到全图模式（60fps平滑，无边界）';
+    }
+}
+
+function toggleRenderMode() {
+    _renderMode = _renderMode === 'bigmap' ? 'jpeg' : 'bigmap';
+    _updateRenderModeBtn();
+    if (_renderMode === 'jpeg') {
+        TC.log('📸 已切换到 JPEG 模式（低流量，边缘稍有黑边）');
+        // 重置后端节流锚点，确保立即推送一帧新 JPEG（否则静止时可能长时间无图）
+        if (TC.wsConnected && TC.wsSocket) {
+            TC.wsSocket.emit('request_jpeg');
+        }
+    } else {
+        TC.log('🗺️ 已切换到全图平滑模式（首次加载 33MB，之后零开销）');
+    }
+}
+
+/** Catmull-Rom 样条基函数：t∈[0,1] 对应 p1→p2 段 */
+function _catmullRom(p0, p1, p2, p3, t) {
+    var t2 = t * t, t3 = t2 * t;
+    return 0.5 * ((2 * p1) +
+        (-p0 + p2) * t +
+        (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+        (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+}
+
+/** 位置插值：Catmull-Rom（4帧）→ 边界样条（3帧）→ 线性（2帧），绝不外推。
+ *  "延迟-1帧显示"：refTime = now - interval，t 永远 ∈ [0,1]，零回弹。
+ *  代价是约 100ms 显示延迟，但完全消除抖动。
+ */
+function _getExtrapolatedPos() {
+    if (!_mapState) return null;
+    if (!_mapState.found) return _mapState;  // SCENE_CHANGE: 用最后坐标
+
+    var h = _mapHistory;
+    if (h.length < 2) return _mapState;
+
+    var prev = h[h.length - 2], curr = h[h.length - 1];
+    var interval = curr.ts - prev.ts;
+    if (interval < 10) return curr;
+
+    // 传送检测：跳变超过 400px 直接吸附
+    var jdx = curr.x - prev.x, jdy = curr.y - prev.y;
+    if (jdx * jdx + jdy * jdy > 400 * 400) return curr;
+
+    // 延迟一帧：refTime 始终落在 [prev.ts, curr.ts] 区间，t ∈ [0,1]，永不外推
+    var refTime = performance.now() - interval;
+    var t = (refTime - prev.ts) / interval;
+    t = Math.min(Math.max(t, 0), 1);
+
+    var rx, ry;
+    if (h.length >= 4) {
+        var p0 = h[h.length - 4], p1 = h[h.length - 3];
+        rx = _catmullRom(p0.x, p1.x, prev.x, curr.x, t);
+        ry = _catmullRom(p0.y, p1.y, prev.y, curr.y, t);
+    } else if (h.length >= 3) {
+        var p0b = h[h.length - 3];
+        rx = _catmullRom(p0b.x, p0b.x, prev.x, curr.x, t);
+        ry = _catmullRom(p0b.y, p0b.y, prev.y, curr.y, t);
+    } else {
+        rx = prev.x + t * jdx;
+        ry = prev.y + t * jdy;
+    }
+
+    return {
+        x: rx, y: ry,
+        angle: curr.angle, stopped: curr.stopped,
+        found: curr.found, isInertial: curr.isInertial,
+        isSceneChange: curr.isSceneChange,
+    };
+}
+
+/** 在 canvas ctx 上画箭头（angle=0 朝北，顺时针） */
+function _drawArrowOnCanvas(ctx, cx, cy, angle, stopped) {
+    var size = 12;
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate((angle || 0) * Math.PI / 180);
+    if (stopped) {
+        ctx.fillStyle = 'rgba(48,182,254,0.85)';
+        ctx.beginPath(); ctx.arc(0, 0, Math.round(size * 0.6), 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+    } else {
+        ctx.fillStyle = 'rgba(48,182,254,0.85)';
+        ctx.beginPath();
+        ctx.moveTo(0, -size);
+        ctx.lineTo(-size * 0.6, size * 0.7);
+        ctx.lineTo(size * 0.6, size * 0.7);
+        ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+    }
+    ctx.restore();
+}
+
+/** 主渲染：根据 _renderMode 选择全图裁切或 JPEG 位移 */
+function _renderMapCanvas() {
+    if (!resultCanvas) return;
+    var ctx = resultCanvas.getContext('2d');
+    var vSize = 400, half = 200;
+    var extPos = _getExtrapolatedPos();
+
+    // ---- 全图模式（Plan A）----
+    if (_renderMode === 'bigmap') {
+        // 完全没有坐标时才显示占位画面（地图未加载或尚未收到任何帧）
+        if (!extPos || !_displayMap || !_displayMap.complete || !_displayMap.naturalWidth) {
+            _renderPos = null;
+            ctx.fillStyle = '#111'; ctx.fillRect(0, 0, vSize, vSize);
+            if (_mapLoadProgress > 0 && _mapLoadProgress < 1) {
+                var barW = Math.round(vSize * 0.7);
+                var barH = 8;
+                var bx = (vSize - barW) / 2, by = half - 20;
+                ctx.fillStyle = '#333'; ctx.fillRect(bx, by, barW, barH);
+                ctx.fillStyle = '#00d4ff'; ctx.fillRect(bx, by, Math.round(barW * _mapLoadProgress), barH);
+                ctx.fillStyle = '#aaa'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText('地图加载中 ' + Math.round(_mapLoadProgress * 100) + '%', half, by + barH + 18);
+            } else {
+                ctx.fillStyle = '#555'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText(_mapState ? '定位中...' : '等待分析...', half, half);
+            }
+            return;
+        }
+        // 有坐标就继续渲染地图（包括 found=false 的 SCENE_CHANGE 状态）
+        // _renderPos 用轻量 EMA（α=0.4）吸收亚像素抖动；
+        // isSceneChange 或传送时立即吸附（不拖尾）
+        if (!_renderPos || extPos.isSceneChange) {
+            _renderPos = { x: extPos.x, y: extPos.y };
+        } else {
+            _renderPos.x += 0.4 * (extPos.x - _renderPos.x);
+            _renderPos.y += 0.4 * (extPos.y - _renderPos.y);
+        }
+        var pos = { x: _renderPos.x, y: _renderPos.y, angle: extPos.angle,
+                    stopped: extPos.stopped, isInertial: extPos.isInertial,
+                    isSceneChange: extPos.isSceneChange };
+        var mapW = _displayMap.naturalWidth, mapH = _displayMap.naturalHeight;
+        var sx = Math.max(0, Math.min(Math.round(pos.x - half), mapW - vSize));
+        var sy = Math.max(0, Math.min(Math.round(pos.y - half), mapH - vSize));
+        var localX = Math.round(pos.x - sx);
+        var localY = Math.round(pos.y - sy);
+        ctx.drawImage(_displayMap, sx, sy, vSize, vSize, 0, 0, vSize, vSize);
+        // 位置标记点
+        var dotY = localY + 6;
+        ctx.fillStyle = pos.isInertial ? '#ffff00' : '#00ff00';
+        ctx.beginPath(); ctx.arc(localX, dotY, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(localX, dotY, 7, 0, Math.PI * 2); ctx.stroke();
+        _drawArrowOnCanvas(ctx, localX, localY, pos.angle, pos.stopped);
+        // SCENE_CHANGE 状态：左上角显示重定位提示，不冻住地图
+        if (pos.isSceneChange) {
+            ctx.fillStyle = 'rgba(0,0,0,0.45)';
+            ctx.fillRect(0, 0, vSize, 24);
+            ctx.fillStyle = '#ffcc44'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';
+            ctx.fillText('这个区域重定位中...', 8, 16);
+        }
+        return;
+    }
+
+    // ---- JPEG 模式（扩边 + 前端叠图标）----
+    // 后端发送 (VIEW_SIZE + 2*JPEG_PAD)² = 480×480 的扩边地图（无标记）。
+    // 前端根据 Catmull-Rom 插值坐标在扩边余量内做亚帧微平移：平移量在 ±40px
+    // 范围内永远不会露出黑边。箭头和位置圆点在 60fps 下叠加到画面正中心。
+    var JPEG_PAD = 40;
+    if (!_lastJpegImg || !_lastJpegImg.complete) {
+        ctx.fillStyle = '#111'; ctx.fillRect(0, 0, vSize, vSize);
+        ctx.fillStyle = '#555'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(_mapState ? '定位中...' : '等待分析...', half, half);
+        return;
+    }
+
+    // 计算 pan 偏移：Catmull-Rom 插值坐标 - JPEG 刊印时的坐标
+    var dx = 0, dy = 0;
+    if (_lastJpegPos && extPos) {
+        dx = Math.max(-JPEG_PAD, Math.min(JPEG_PAD, Math.round(extPos.x - _lastJpegPos.x)));
+        dy = Math.max(-JPEG_PAD, Math.min(JPEG_PAD, Math.round(extPos.y - _lastJpegPos.y)));
+    }
+
+    // 推进交叉淡入（每帧 +25%，约 4 帧/67ms 完成）
+    if (_jpegFadeAlpha < 1) {
+        _jpegFadeAlpha = Math.min(1, _jpegFadeAlpha + 0.25);
+    }
+
+    // 绘制旧帧（淡出），用旧帧自己的 pan 偏移
+    if (_jpegFadeAlpha < 1 && _prevJpegImg && _prevJpegImg.complete) {
+        var pdx = 0, pdy = 0;
+        if (_prevJpegPos && extPos) {
+            pdx = Math.max(-JPEG_PAD, Math.min(JPEG_PAD, Math.round(extPos.x - _prevJpegPos.x)));
+            pdy = Math.max(-JPEG_PAD, Math.min(JPEG_PAD, Math.round(extPos.y - _prevJpegPos.y)));
+        }
+        ctx.save(); ctx.globalAlpha = 1 - _jpegFadeAlpha;
+        ctx.drawImage(_prevJpegImg, JPEG_PAD + pdx, JPEG_PAD + pdy, vSize, vSize, 0, 0, vSize, vSize);
+        ctx.restore();
+        ctx.save(); ctx.globalAlpha = _jpegFadeAlpha;
+        ctx.drawImage(_lastJpegImg, JPEG_PAD + dx, JPEG_PAD + dy, vSize, vSize, 0, 0, vSize, vSize);
+        ctx.restore();
+    } else {
+        // 淡入完成：直接绘制（无 alpha 开销）
+        ctx.drawImage(_lastJpegImg, JPEG_PAD + dx, JPEG_PAD + dy, vSize, vSize, 0, 0, vSize, vSize);
+    }
+
+    // 叠加位置标记和箭头（60fps，不依赖 JPEG 帧率）
+    if (extPos) {
+        var dotY2 = half + 6;
+        ctx.fillStyle = !extPos.found ? '#ff3333' : (extPos.isInertial ? '#ffff00' : '#00ff00');
+        ctx.beginPath(); ctx.arc(half, dotY2, 4, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(half, dotY2, 7, 0, Math.PI * 2); ctx.stroke();
+        if (extPos.found) {
+            _drawArrowOnCanvas(ctx, half, half, extPos.angle, extPos.stopped);
+        }
+        if (extPos.isSceneChange) {
+            ctx.fillStyle = 'rgba(0,0,0,0.45)';
+            ctx.fillRect(0, 0, vSize, 24);
+            ctx.fillStyle = '#ffcc44'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';
+            ctx.fillText('这个区域重定位中...', 8, 16);
+        }
+    }
+}
+
+function _mapRAFLoop() {
+    if (!_mapRAFActive) { _mapRAFId = null; return; }
+    // 用 try-catch 保护：渲染异常不能杀死 RAF 循环
+    try { _renderMapCanvas(); } catch(e) { console.error('[mapRAF] 渲染异常:', e); }
+    // 若 PiP 激活，由此循环顺序驱动 PiP 更新（确保 canvas → pipCanvas 顺序一致）
+    if (pipRAFActive) {
+        try { updatePiPCanvas(); } catch(e) { console.error('[mapRAF] PiP异常:', e); }
+    }
+    _mapRAFId = requestAnimationFrame(_mapRAFLoop);
+}
+
+function _startMapRAF() {
+    if (_mapRAFActive) return;
+    _mapRAFActive = true;
+    _mapRAFLoop();
+}
+
+// 启动时先渲染一帧占位画面
+_renderMapCanvas();
+
+// ========== 纯原生浏览器画中画 ==========
+const pipCanvas = document.getElementById('pipCanvas');
+const pipVideo = document.getElementById('pipVideo');
+const pipBtn = document.getElementById('pipBtn');
+let pipTimer = null;
+let pipEventsBound = false;
+let pipRAFActive = false;
+
+// 初始化画布尺寸
+pipCanvas.width = 400;
+pipCanvas.height = 400;
+
+// 更新画中画画面：直接从 resultCanvas 复制（canvas→canvas 无闪帧风险）
+function updatePiPCanvas() {
+    if (!resultCanvas) return;
+    const ctx = pipCanvas.getContext('2d');
+    ctx.drawImage(resultCanvas, 0, 0, 400, 400);
+}
+
+function isNativePiPActive() {
+    return document.pictureInPictureElement === pipVideo || pipVideo.webkitPresentationMode === 'picture-in-picture';
+}
+
+function stopPiPRefresh() {
+    pipRAFActive = false;
+    if (pipTimer) cancelAnimationFrame(pipTimer);
+    pipTimer = null;
+}
+
+function pipRAFLoop() {
+    if (!pipRAFActive) return;
+    // 若地图 RAF 已激活，PiP 更新由 _mapRAFLoop 顺序驱动，此处跳过避免重复绘制
+    if (!_mapRAFActive) updatePiPCanvas();
+    pipTimer = requestAnimationFrame(pipRAFLoop);
+}
+
+function resetPiPButtonState() {
+    pipBtn.classList.remove('active');
+    pipBtn.textContent = '🎠 浏览器画中画';
+    stopPiPRefresh();
+}
+
+function bindPiPEvents() {
+    if (pipEventsBound) return;
+    pipEventsBound = true;
+
+    pipVideo.addEventListener('leavepictureinpicture', function() {
+        resetPiPButtonState();
+        TC.log('✅ 原生画中画已关闭');
+    });
+
+    pipVideo.addEventListener('webkitpresentationmodechanged', function() {
+        if (pipVideo.webkitPresentationMode !== 'picture-in-picture') {
+            resetPiPButtonState();
+            TC.log('✅ 原生画中画已关闭');
+        }
+    });
+}
+
+async function requestNativePiP() {
+    const support = getPictureInPictureSupport();
+    if (!support.any) {
+        throw new Error('当前浏览器不支持原生画中画');
+    }
+    if (!support.canStream) {
+        throw new Error('当前浏览器不支持画布视频流');
+    }
+
+    updatePiPCanvas();
+    pipVideo.srcObject = pipCanvas.captureStream(30);
+    bindPiPEvents();
+    await pipVideo.play();
+
+    if (support.standard) {
+        await pipVideo.requestPictureInPicture();
+        return 'standard';
+    }
+
+    pipVideo.webkitSetPresentationMode('picture-in-picture');
+    return 'webkit';
+}
+
+async function exitNativePiPMode() {
+    if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+        return;
+    }
+    if (pipVideo.webkitPresentationMode === 'picture-in-picture') {
+        pipVideo.webkitSetPresentationMode('inline');
+    }
+}
+
+// 切换原生画中画
+async function toggleNativePiP() {
+    const support = getPictureInPictureSupport();
+    if (!support.any) {
+        TC.log('当前浏览器不支持原生画中画，可继续直接查看主页面实时画面');
+        return;
+    }
+
+    // 没有图片则无法开启
+    if (!_mapState) {
+        TC.log('请先分析一张图片再开启画中画！');
+        return;
+    }
+
+    try {
+        if (isNativePiPActive()) {
+            // 关闭画中画
+            await exitNativePiPMode();
+            resetPiPButtonState();
+        } else {
+            // 开启画中画
+            const mode = await requestNativePiP();
+            
+            // 按钮状态
+            pipBtn.classList.add('active');
+            pipBtn.textContent = '✅ 关闭画中画';
+            
+            // 自动刷新画面（requestAnimationFrame 驱动，消除定时器闪烁）
+            pipRAFActive = true;
+            pipRAFLoop();
+
+            TC.log('✅ 原生浏览器画中画已开启' + (mode === 'webkit' ? ' (Safari 兼容模式)' : ''));
+        }
+    } catch (err) {
+        console.error('画中画失败：', err);
+        resetPiPButtonState();
+        TC.log('❌ 画中画启动失败：' + err.message);
+    }
+}
+
+// ========== 坐标锁定模式 ==========
+var coordLockEnabled = false;
+var lockBtn = document.getElementById('coordLockBtn');
+
+async function toggleCoordLock() {
+    if (!lockBtn || lockBtn.disabled && !lockBtn.classList.contains('active')) return;
+
+    try {
+        var resp = await fetch('/api/coord_lock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'toggle' })
+        });
+        var data = await resp.json();
+        if (data.success !== undefined) {
+            coordLockEnabled = data.enabled;
+            updateLockButton();
+            TC.log(coordLockEnabled ? '🔒 坐标锁定已开启' : '🔓 坐标锁定已关闭');
+        } else {
+            TC.log('⚠️ 锁定操作失败: ' + (data.error || '未知错误'));
+        }
+    } catch(e) {
+        TC.log('❌ 锁定请求失败: ' + e.message);
+    }
+}
+
+function updateLockButton() {
+    if (!lockBtn) return;
+    if (coordLockEnabled) {
+        lockBtn.classList.remove('ready');
+        lockBtn.classList.add('active');
+        lockBtn.textContent = '🔒 已锁定';
+        lockBtn.title = '点击关闭坐标锁定';
+    } else {
+        lockBtn.classList.remove('active');
+        lockBtn.title = '需要先分析定位积累坐标历史';
+        // 是否 ready 由 checkLockReadiness 控制
+    }
+}
+
+function checkLockReadiness() {
+    if (!lockBtn) return;
+    fetch('/api/coord_lock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'query' })
+    }).then(function(r){ return r.json(); }).then(function(data){
+        if (!coordLockEnabled) {
+            if (data.can_activate) {
+                lockBtn.disabled = false;
+                lockBtn.classList.add('ready');
+                lockBtn.title = `历史${data.history_count}个，可开启坐标锁`;
+                if (!lockBtn.classList.contains('active')) {
+                    lockBtn.textContent = '🔒 坐标锁';
+                }
+            } else {
+                lockBtn.disabled = true;
+                lockBtn.classList.remove('ready');
+                lockBtn.textContent = `🔒 坐标锁(${data.history_count})`;
+                lockBtn.title = `还需积累更多坐标 (${data.history_count}/${data.can_activate ? '?' : '...'})`;
+            }
+        }
+    }).catch(function(){});
+}
+
+async function resetHistory() {
+    if (!confirm('确定要清空所有坐标历史吗？\n坐标锁定将被关闭，需要重新积累历史坐标。')) return;
+    
+    try {
+        const resp = await fetch('/api/reset_history', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            TC.log(`🗑 历史已重置 (清除了 ${data.cleared_count} 条记录)`);
+            // 同步状态
+            coordLockEnabled = false;
+            _analyzeCount = 0;
+            updateLockButton();
+            checkLockReadiness();
+        } else {
+            TC.log('⚠️ 重置失败: ' + (data.error || '未知错误'));
+        }
+    } catch(e) {
+        TC.log('❌ 重置请求失败: ' + e.message);
+    }
+}
+
+// 每次分析结果回调时检测锁定按钮是否可用
+var _analyzeCount = 0;  // 记录成功匹配的帧数
+var _lastStatus = null;
+
+// 直接包装已注册的 onAnalyzeResult 回调（TC.init 已在上方调用）
+(function(){
+    // 从 TC 内部获取 opts 的方式：通过检查已有回调
+    var origCb = null;
+    // 我们知道 init 时传了 onAnalyzeResult，直接重新设置来包装它
+    var _origLog = TC.log;
+    var _origUpdateDOM = TC.updateStatusDOM;
+    // 拦截 updateStatusDOM 来触发检查
+    TC.updateStatusDOM = function(status, ids) {
+        _origUpdateDOM.call(TC, status, ids);
+        _lastStatus = status;
+        if (status && status.f) {
+            _analyzeCount++;
+            setTimeout(checkLockReadiness, 50);
+        }
+    };
+})();
+
+// 定期轮询 + 初始化检查
+applyCompatibilityGuards();
+logCompatibilityReport();
+setInterval(checkLockReadiness, 2000);
+checkLockReadiness();
+</script>
+</body>
+</html>

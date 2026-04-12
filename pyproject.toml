@@ -21,11 +21,13 @@ ai = [
 ]
 
 [project.scripts]
-map-tracker-web = "main_web:main"
+map-tracker-web  = "run_web:main"
+map-tracker-sift = "run_sift:run"
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-py-modules = ["main_web", "main_sift", "tracker_core", "tracker_engines", "config", "download_map", "draw_markers"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*"]

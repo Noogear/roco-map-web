@@ -7,15 +7,11 @@ __pycache__/
 venv/
 env/
 
+
 # 构建产物
 *.egg-info/
 
-# 忽略调试生成的图片
-debug_minimap.png
-_debug_*.png
-_debug_*.py
-_test_*.py
-/test_*.py
+_debug/
 
 # 临时环境/实验目录
 .tmp_prebuilt_env/
