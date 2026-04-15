@@ -14,9 +14,11 @@ const prefs = AppCommon.loadPrefs();
         pipBtn: document.getElementById('pipBtn'),
         mapState: null, mapStatePrev: null, mapHistory: [],
         mapRAFActive: false,
+        renderFps: prefs.renderFps || 60,
         displayMap: null, mapLoadProgress: 0,
-        displayMapLoading: false, displayMapRequestId: 0,
+        displayMapLoading: false, displayMapReady: false, displayMapFailed: false,
         displayMapUrl: '/img/map/map_z7.webp',
+        displayMapNaturalWidth: 0, displayMapNaturalHeight: 0,
         renderPos: null,
         lastJpegImg: null, lastJpegPos: null, prevJpegImg: null, prevJpegPos: null,
         jpegFadeAlpha: 1,
@@ -33,20 +35,56 @@ const prefs = AppCommon.loadPrefs();
     var watchBadge       = document.getElementById('watchBadge');
     var statusStateText  = document.getElementById('statusStateText');
     var broadcastBtn     = document.getElementById('broadcastBtn');
+    var broadcastBtnTitle = document.getElementById('broadcastBtnTitle');
+    var broadcastBtnSub = document.getElementById('broadcastBtnSub');
+    var statusTransportChip = document.getElementById('statusTransportChip');
+    var settingsPanelBtn = document.getElementById('settingsPanelBtn');
+    var toolPanelBtn = document.getElementById('toolPanelBtn');
+    var settingsPanel = document.getElementById('recognizeSettingsPanel');
+    var toolsPanel = document.getElementById('recognizeToolsPanel');
+    var recognizeNameInput = document.getElementById('recognizeNameInput');
 
     /* ── State ── */
     var screenSending = false, useWSMode = true;
+    var _sceneChangeMissCount = 0;   /* 连续 SCENE_CHANGE 帧计数，用于触发校准提示 */
+    var _sceneChangeWarnAt = 0;      /* 避免重复提示的冷却时间戳 */
     var wsReconnectAt = 0, nullBlobWarnAt = 0, S_nullBlobCount = 0;
     var screenAutoRunning = false, screenAutoId = null;
     /* Broadcast */
     var bcastName = null;           // null = 未展示，string = 当前展示名
+    var bcastViewerCount = 0;
     var bcastCanvas = document.getElementById('bcastCanvas');
     var bcastSending = false;
     var bcastAutoId = null;
+    var bcastStarting = false;
     var BCAST_INTERVAL_MS = 100;    // 前端本地节流（10fps），配合服务端节流双保险
+
+    function setBroadcastButtonState(active, name) {
+        broadcastBtn.classList.toggle('is-active', !!active);
+        if (broadcastBtnTitle) broadcastBtnTitle.textContent = active ? '🔴 停止展示' : '📡 展示';
+        if (broadcastBtnSub) broadcastBtnSub.textContent = active
+            ? ('当前：' + (name || '未命名频道'))
+            : '推流给观众';
+    }
+
+    function setFlyoutOpen(panel, trigger, open) {
+        if (!panel || !trigger) return;
+        panel.classList.toggle('is-open', !!open);
+        AppCommon.setInteractiveHiddenState(panel, !open);
+        trigger.classList.toggle('is-active', !!open);
+        trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
+    function closeTransientPanels() {
+        setFlyoutOpen(settingsPanel, settingsPanelBtn, false);
+        setFlyoutOpen(toolsPanel, toolPanelBtn, false);
+    }
 
     /* ── Setup renderer ── */
     RecognizeRenderer.setup(R);
+
+    /* ── 后台静默预载全图（页面级共享 Image，不阻塞 UI） ── */
+    R.prefetchDisplayMap();
 
     /* ── KB/s 统计 ── */
     var _kbBytes = 0, _kbAt = Date.now();
@@ -87,6 +125,7 @@ const prefs = AppCommon.loadPrefs();
         // 重置状态 DOM
         statusStateText.textContent = '待机';
         screenStateChip.textContent = TC.isScreenActive ? '🖥️ 实时追踪中' : '📡 待机中';
+        if (statusTransportChip) statusTransportChip.textContent = '识别中枢';
         ['statusX', 'statusY', 'statusQuality', 'statusFound', 'statusMatches',
          'statusAngle', 'statusHashIndex', 'statusTransport', 'statusKbps'].forEach(function (id) {
             var el = document.getElementById(id);
@@ -152,10 +191,23 @@ const prefs = AppCommon.loadPrefs();
                 if (arrowEl) arrowEl.textContent = result.status.arrow_stopped ? '静止' : '移动中';
                 var tpEl = document.getElementById('statusTransport');
                 if (tpEl) tpEl.textContent = TC.wsConnected ? (TC.wsTransportName || 'WS') : 'HTTP';
+                if (statusTransportChip) statusTransportChip.textContent = (TC.wsConnected ? (TC.wsTransportName || 'WS') : 'HTTP') + ' 通道';
                 var hashEl = document.getElementById('statusHashIndex');
                 if (hashEl) {
                     var src = result.status.source || '';
                     hashEl.textContent = src.indexOf('HASH') >= 0 ? '命中' : '--';
+                }
+
+                /* 连续未检测到小地图时，提示用户校准位置 */
+                if (TC.isScreenActive && result.status.state === 'SCENE_CHANGE' && !result.status.found) {
+                    _sceneChangeMissCount++;
+                    if (_sceneChangeMissCount === 40 && Date.now() >= _sceneChangeWarnAt) {
+                        _sceneChangeWarnAt = Date.now() + 30000;
+                        TC.log('⚠️ 连续 40 帧未检测到小地图圆形。若游戏非全屏请打开「测试工具」→「自动定位小地图」进行校准，否则无法识别。');
+                        AppCommon.toast('未检测到小地图，请点击右上角🧰→自动定位小地图', 'warning');
+                    }
+                } else {
+                    _sceneChangeMissCount = 0;
                 }
             }
         },
@@ -254,7 +306,7 @@ const prefs = AppCommon.loadPrefs();
                 if (Date.now() >= wsReconnectAt) {
                     wsReconnectAt = Date.now() + 3000;
                     TC.connectWS()
-                        .then(function () { TC.log('📶 WS 重连成功'); })
+                        .then(function () { bindRecognizeSocketLifecycle(); TC.log('📶 WS 重连成功'); })
                         .catch(function () { TC.log('⚠️ WS 重连失败'); });
                 }
             } else {
@@ -269,6 +321,8 @@ const prefs = AppCommon.loadPrefs();
     /* ── FPS slider ── */
     var fpsRange = document.getElementById('fpsRange');
     var fpsRangeVal = document.getElementById('fpsRangeVal');
+    var renderFpsRange = document.getElementById('renderFpsRange');
+    var renderFpsRangeVal = document.getElementById('renderFpsRangeVal');
     if (fpsRange) {
         fpsRange.value = prefs.captureFps || 10;
         if (fpsRangeVal) fpsRangeVal.textContent = fpsRange.value;
@@ -278,6 +332,22 @@ const prefs = AppCommon.loadPrefs();
             SCREEN_INTERVAL_MS = Math.round(1000 / fps);
             BCAST_INTERVAL_MS = SCREEN_INTERVAL_MS;
             AppCommon.updatePref('captureFps', fps);
+        });
+    }
+    if (renderFpsRange) {
+        renderFpsRange.value = R.renderFps;
+        if (renderFpsRangeVal) renderFpsRangeVal.textContent = renderFpsRange.value;
+        renderFpsRange.addEventListener('input', function () {
+            var fps = parseInt(renderFpsRange.value, 10) || 60;
+            if (renderFpsRangeVal) renderFpsRangeVal.textContent = fps;
+            if (typeof R.setRenderFps === 'function') R.setRenderFps(fps);
+            AppCommon.updatePref('renderFps', fps);
+        });
+    }
+    if (recognizeNameInput) {
+        recognizeNameInput.value = prefs.bcastName || '';
+        recognizeNameInput.addEventListener('input', function () {
+            AppCommon.updatePref('bcastName', recognizeNameInput.value);
         });
     }
 
@@ -306,7 +376,10 @@ const prefs = AppCommon.loadPrefs();
         screenAutoRunning = !screenAutoRunning;
         if (screenAutoRunning) {
             if (useWSMode && !TC.wsConnected) {
-                try { await TC.connectWS(); }
+                try {
+                    await TC.connectWS();
+                    bindRecognizeSocketLifecycle();
+                }
                 catch (_) { useWSMode = false; TC.log('⚠️ WS 连接失败，回退到 HTTP 模式'); }
             }
             TC.log('📍 屏幕自动追踪已开启');
@@ -369,11 +442,19 @@ const prefs = AppCommon.loadPrefs();
 
     function runBcastLoop() {
         if (!bcastName) return;
+        if (!TC.wsConnected || !TC.wsSocket) {
+            bcastAutoId = null;
+            return;
+        }
+        if (bcastViewerCount <= 0) {
+            bcastAutoId = null;
+            return;
+        }
         if (!bcastSending && !document.hidden) {
             bcastSending = true;
             captureBcastBlob().then(function (blob) {
                 bcastSending = false;
-                if (blob && TC.wsConnected && bcastName) {
+                if (blob && TC.wsConnected && bcastName && bcastViewerCount > 0) {
                     TC.wsSocket.emit('broadcast_frame', blob);
                 }
             }).catch(function () { bcastSending = false; });
@@ -382,16 +463,24 @@ const prefs = AppCommon.loadPrefs();
     }
 
     async function startBroadcast(name) {
+        if (bcastStarting || bcastName) return;
+        bcastStarting = true;
         if (!TC.wsConnected) {
             try { await TC.connectWS(); }
-            catch (e) { AppCommon.toast('WS 连接失败：' + e.message, 'danger'); return; }
+            catch (e) {
+                bcastStarting = false;
+                AppCommon.toast('WS 连接失败：' + e.message, 'danger');
+                return;
+            }
         }
+        bindRecognizeSocketLifecycle();
         TC.wsSocket.emit('broadcast_join', { name: name });
         TC.wsSocket.once('broadcast_joined', function (ack) {
+            bcastStarting = false;
             if (!ack.ok) { AppCommon.toast('展示失败：' + ack.error, 'danger'); return; }
             bcastName = ack.name;
-            broadcastBtn.classList.add('is-active');
-            broadcastBtn.textContent = '🔴 停止展示';
+            bcastViewerCount = 0;
+            setBroadcastButtonState(true, bcastName);
             watchBadge.textContent = '📡 展示中：' + bcastName;
             watchBadge.classList.add('is-visible');
             AppCommon.toast('已开始展示「' + bcastName + '」', 'success');
@@ -403,54 +492,73 @@ const prefs = AppCommon.loadPrefs();
     function stopBroadcast() {
         if (!bcastName) return;
         if (bcastAutoId) { clearTimeout(bcastAutoId); bcastAutoId = null; }
+        bcastSending = false;
         if (TC.wsConnected && TC.wsSocket) {
             TC.wsSocket.emit('broadcast_leave', { name: bcastName });
         }
         TC.log('📡 展示已停止：' + bcastName);
         bcastName = null;
-        broadcastBtn.classList.remove('is-active');
-        broadcastBtn.textContent = '📡 展示';
+        bcastViewerCount = 0;
+        setBroadcastButtonState(false, '');
         watchBadge.classList.remove('is-visible');
     }
 
-    /* ── Modal ── */
-    var broadcastModal = document.getElementById('broadcastModal');
-    var broadcastNameInput = document.getElementById('broadcastNameInput');
-
-    function openBroadcastModal() {
-        broadcastNameInput.value = prefs.bcastName || '';
-        broadcastModal.classList.add('is-open');
-        AppCommon.setInteractiveHiddenState(broadcastModal, false);
-        setTimeout(function () { broadcastNameInput.focus(); }, 80);
+    function resetBroadcastLocalState(reason) {
+        if (bcastAutoId) { clearTimeout(bcastAutoId); bcastAutoId = null; }
+        bcastSending = false;
+        bcastStarting = false;
+        if (!bcastName) return;
+        TC.log('📡 展示已中断' + (reason ? '：' + reason : ''));
+        bcastName = null;
+        bcastViewerCount = 0;
+        setBroadcastButtonState(false, '');
+        watchBadge.classList.remove('is-visible');
     }
 
-    function closeBroadcastModal() {
-        broadcastModal.classList.remove('is-open');
-        AppCommon.setInteractiveHiddenState(broadcastModal, true);
+    function bindRecognizeSocketLifecycle() {
+        var sock = TC.wsSocket;
+        if (!sock || sock.__recognizeLifecycleBound) return;
+        sock.__recognizeLifecycleBound = true;
+        sock.on('broadcast_list', function (data) {
+            var rooms = (data && Array.isArray(data.rooms)) ? data.rooms : [];
+            var prevViewerCount = bcastViewerCount;
+            if (!bcastName) {
+                bcastViewerCount = 0;
+                return;
+            }
+            var ownRoom = null;
+            for (var i = 0; i < rooms.length; i++) {
+                if (rooms[i] && rooms[i].name === bcastName) {
+                    ownRoom = rooms[i];
+                    break;
+                }
+            }
+            bcastViewerCount = ownRoom ? Math.max(0, Number(ownRoom.viewers || 0)) : 0;
+            if (bcastViewerCount <= 0 && bcastAutoId) {
+                clearTimeout(bcastAutoId);
+                bcastAutoId = null;
+                bcastSending = false;
+            } else if (bcastViewerCount > 0 && prevViewerCount <= 0 && !bcastAutoId) {
+                runBcastLoop();
+            }
+        });
+        sock.on('disconnect', function () {
+            resetBroadcastLocalState('连接断开');
+        });
     }
-
-    AppCommon.setInteractiveHiddenState(broadcastModal, true);
-
-    document.getElementById('broadcastCancelBtn').addEventListener('click', closeBroadcastModal);
-    broadcastModal.addEventListener('click', function (e) { if (e.target === broadcastModal) closeBroadcastModal(); });
-
-    document.getElementById('broadcastConfirmBtn').addEventListener('click', function () {
-        var name = broadcastNameInput.value.trim();
-        if (!name) { broadcastNameInput.focus(); AppCommon.toast('请填写展示昵称', 'danger'); return; }
-        AppCommon.updatePref('bcastName', name);
-        closeBroadcastModal();
-        startBroadcast(name);
-    });
-
-    broadcastNameInput.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') document.getElementById('broadcastConfirmBtn').click();
-        if (e.key === 'Escape') closeBroadcastModal();
-    });
 
     broadcastBtn.addEventListener('click', function () {
         if (bcastName) { stopBroadcast(); return; }
         if (!TC.isScreenActive) { AppCommon.toast('请先开始屏幕捕获', 'danger'); return; }
-        openBroadcastModal();
+        var name = AppCommon.loadPrefs().bcastName || '';
+        name = name.trim();
+        if (!name) {
+            setFlyoutOpen(settingsPanel, settingsPanelBtn, true);
+            if (recognizeNameInput) recognizeNameInput.focus();
+            AppCommon.toast('请先在设置中填写展示名称', 'warning');
+            return;
+        }
+        startBroadcast(name);
     });
 
     /* ══════════════════════════════════════════
@@ -463,6 +571,7 @@ const prefs = AppCommon.loadPrefs();
 
     function switchTab(tab) {
         var toAudience = tab === 'audience';
+        var wasAudience = !pageAudience.classList.contains('rec-page-hidden');
         localStorage.setItem('recognize_active_tab', toAudience ? 'audience' : 'track');
         tabTrack.classList.toggle('is-active', !toAudience);
         tabAudience.classList.toggle('is-active', toAudience);
@@ -470,6 +579,9 @@ const prefs = AppCommon.loadPrefs();
         tabAudience.setAttribute('aria-pressed', toAudience ? 'true' : 'false');
         pageTrack.classList.toggle('rec-page-hidden', toAudience);
         pageAudience.classList.toggle('rec-page-hidden', !toAudience);
+        if (wasAudience && !toAudience && typeof RecognizeAudience !== 'undefined') {
+            RecognizeAudience.onLeave();
+        }
         if (toAudience && typeof RecognizeAudience !== 'undefined') {
             RecognizeAudience.onEnter();
         }
@@ -506,6 +618,7 @@ const prefs = AppCommon.loadPrefs();
         rafPasses: 2,
         onResume: function () {
             restoreRecognizePageAfterHistoryNavigation();
+            bindRecognizeSocketLifecycle();
         }
     });
 
@@ -522,6 +635,36 @@ const prefs = AppCommon.loadPrefs();
     document.getElementById('mainScreenBtn').addEventListener('click', handleMainScreenAction);
     document.getElementById('pipBtn').addEventListener('click', R.toggleNativePiP);
     document.getElementById('forceResetBtn').addEventListener('click', forceReset);
+    if (settingsPanelBtn) {
+        AppCommon.setInteractiveHiddenState(settingsPanel, true);
+        settingsPanelBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var next = !settingsPanel.classList.contains('is-open');
+            setFlyoutOpen(settingsPanel, settingsPanelBtn, next);
+            if (next) setFlyoutOpen(toolsPanel, toolPanelBtn, false);
+        });
+    }
+    if (toolPanelBtn) {
+        AppCommon.setInteractiveHiddenState(toolsPanel, true);
+        toolPanelBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var next = !toolsPanel.classList.contains('is-open');
+            setFlyoutOpen(toolsPanel, toolPanelBtn, next);
+            if (next) setFlyoutOpen(settingsPanel, settingsPanelBtn, false);
+        });
+    }
+    var settingsPanelCloseBtn = document.getElementById('settingsPanelCloseBtn');
+    var toolsPanelCloseBtn = document.getElementById('toolsPanelCloseBtn');
+    if (settingsPanelCloseBtn) settingsPanelCloseBtn.addEventListener('click', function () { setFlyoutOpen(settingsPanel, settingsPanelBtn, false); });
+    if (toolsPanelCloseBtn) toolsPanelCloseBtn.addEventListener('click', function () { setFlyoutOpen(toolsPanel, toolPanelBtn, false); });
+    document.addEventListener('click', function (e) {
+        var target = e.target;
+        var inSettings = settingsPanel && settingsPanel.contains(target);
+        var inTools = toolsPanel && toolsPanel.contains(target);
+        var onSettingsBtn = settingsPanelBtn && settingsPanelBtn.contains(target);
+        var onToolsBtn = toolPanelBtn && toolPanelBtn.contains(target);
+        if (!inSettings && !inTools && !onSettingsBtn && !onToolsBtn) closeTransientPanels();
+    });
 
     /* ── 图片上传测试 ── */
     var uploadFileInput = document.getElementById('uploadFileInput');
@@ -763,8 +906,82 @@ const prefs = AppCommon.loadPrefs();
         });
     }
 
+    /* ── 自动定位小地图圆形（从屏幕捕获帧中检测） ── */
+    var autoDetectCircleBtn = document.getElementById('autoDetectCircleBtn');
+    var autoDetectCircleSub = document.getElementById('autoDetectCircleSub');
+    var resetCircleBtn = document.getElementById('resetCircleBtn');
+    var circleCalibStatus = document.getElementById('circleCalibStatus');
+
+    function _updateCircleCalibStatus() {
+        if (!circleCalibStatus) return;
+        var sc = TC.selCircle;
+        var DEF_CX = (1189 + 62.5) / 1362, DEF_CY = (66 + 63.5) / 806;
+        var isDefault = Math.abs(sc.cx - DEF_CX) < 0.001 && Math.abs(sc.cy - DEF_CY) < 0.001;
+        circleCalibStatus.style.display = '';
+        circleCalibStatus.textContent = isDefault
+            ? '📍 当前：内置默认坐标（cx=' + sc.cx.toFixed(3) + ', cy=' + sc.cy.toFixed(3) + '）'
+            : '✅ 已校准：cx=' + sc.cx.toFixed(3) + ', cy=' + sc.cy.toFixed(3) + ', r=' + sc.r.toFixed(3);
+        circleCalibStatus.style.color = isDefault ? 'var(--warning,#d28b36)' : 'var(--success,#4f8a4b)';
+    }
+    _updateCircleCalibStatus();
+
+    if (autoDetectCircleBtn) {
+        autoDetectCircleBtn.addEventListener('click', async function () {
+            if (!TC.isScreenActive) {
+                AppCommon.toast('请先点击"屏幕捕获"开始捕获屏幕', 'warning');
+                return;
+            }
+            autoDetectCircleBtn.disabled = true;
+            if (autoDetectCircleSub) autoDetectCircleSub.textContent = '正在截图并检测...';
+
+            try {
+                /* 截取全帧（不裁剪 selCircle），用于小地图位置检测 */
+                var blob = await TC.captureFullFrameBlob(0.85);
+                if (!blob) throw new Error('屏幕流未就绪，请等待画面出现后再试');
+
+                var fd = new FormData();
+                fd.append('image', blob, 'fullscreen.jpg');
+                var resp = await fetch('/api/detect_minimap_circle', { method: 'POST', body: fd });
+                var data = await resp.json();
+
+                if (!data.ok) {
+                    AppCommon.toast('🔍 ' + (data.error || '未检测到小地图'), 'danger');
+                    if (autoDetectCircleSub) autoDetectCircleSub.textContent = '检测失败，请确保游戏小地图可见';
+                    return;
+                }
+
+                TC.selCircle = { cx: data.cx, cy: data.cy, r: data.r };
+                TC.saveSelCircle();
+                TC.captureCanvas = null;  // 作废旧尺寸 canvas
+
+                var pct = Math.round(data.confidence * 100);
+                AppCommon.toast('✅ 小地图已校准（置信度 ' + pct + '%）', 'success');
+                TC.log('🔍 小地图自动定位成功: cx=' + data.cx.toFixed(3) + ', cy=' + data.cy.toFixed(3) + ', r=' + data.r.toFixed(3) + '（置信度 ' + pct + '%，布局 ' + (data.layout || '--') + '）');
+                if (autoDetectCircleSub) autoDetectCircleSub.textContent = '已校准 ✅ 置信度 ' + pct + '%';
+                _updateCircleCalibStatus();
+            } catch (err) {
+                AppCommon.toast('检测异常: ' + err.message, 'danger');
+                TC.log('⚠️ 自动定位小地图失败: ' + err.message);
+                if (autoDetectCircleSub) autoDetectCircleSub.textContent = '从屏幕捕获中自动识别小地图圆形位置';
+            } finally {
+                autoDetectCircleBtn.disabled = false;
+            }
+        });
+    }
+
+    if (resetCircleBtn) {
+        resetCircleBtn.addEventListener('click', function () {
+            TC.resetSelCircle();
+            AppCommon.toast('已重置为内置默认坐标', 'success');
+            TC.log('↩️ selCircle 已重置为默认值');
+            if (autoDetectCircleSub) autoDetectCircleSub.textContent = '从屏幕捕获中自动识别小地图圆形位置';
+            _updateCircleCalibStatus();
+        });
+    }
+
     /* ── 页面卸载（刷新/关闭）时停止捕获 ── */
     window.addEventListener('beforeunload', function () {
+        if (R.cleanupPiP) R.cleanupPiP();
         TC.stopScreenCapture();
     });
     window.addEventListener('pagehide', function (e) {
@@ -772,7 +989,9 @@ const prefs = AppCommon.loadPrefs();
         if (e.persisted) return;
         R.mapRAFActive = false;
         R.pipRAFActive = false;
+        if (R.cleanupPiP) R.cleanupPiP();
         if (bcastName) stopBroadcast();
+        if (typeof RecognizeAudience !== 'undefined') RecognizeAudience.onLeave();
         if (typeof R.releaseDisplayMap === 'function') R.releaseDisplayMap();
     });
 
@@ -782,4 +1001,6 @@ const prefs = AppCommon.loadPrefs();
     R.updateRenderModeBtn();
     R.renderMapCanvas();
     updateScreenButtons();
+    setBroadcastButtonState(false, '');
+    bindRecognizeSocketLifecycle();
     TC.log('系统就绪：识别台已加载');

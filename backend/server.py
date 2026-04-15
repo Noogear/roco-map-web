@@ -1056,6 +1056,38 @@ def get_map_info():
     })
 
 
+@app.route('/api/detect_minimap_circle', methods=['POST'])
+def detect_minimap_circle_api():
+    """
+    从上传的全屏截图中自动检测小地图圆形位置，返回归一化坐标供前端更新 selCircle。
+    前端"自动定位小地图"按钮调用此接口。
+    """
+    from backend.tracking.autodetect import detect_minimap_circle
+
+    img = _decode_image_from_request()
+    if img is None:
+        return jsonify({'ok': False, 'error': '无法解析图片'}), 400
+
+    h, w = img.shape[:2]
+    if max(h, w) < 200:
+        return jsonify({'ok': False, 'error': '图片太小，请上传全屏截图'}), 400
+
+    det = detect_minimap_circle(img)
+    if det is None:
+        return jsonify({'ok': False, 'error': '未检测到小地图圆形，请确保游戏小地图可见'})
+
+    return jsonify({
+        'ok': True,
+        'cx': round(det['cx'], 6),
+        'cy': round(det['cy'], 6),
+        'r':  round(det['r'],  6),
+        'confidence': det['confidence'],
+        'layout': det.get('layout', ''),
+        'frame_width': det['frame_width'],
+        'frame_height': det['frame_height'],
+    })
+
+
 # ==================== 地图资源数据 API ====================
 
 _MAP_BUILDER_DIR = os.path.join(_BASE_DIR, 'map_builder')
@@ -1437,7 +1469,7 @@ def ws_bcast_unwatch(data):
 def ws_bcast_frame(raw_bytes):
     """
     展示者推送 JPEG 帧。服务端节流（10fps），把帧广播给所有订阅观众。
-    协议：原始 JPEG bytes，无需包头（展示画面，非 SIFT 分析结果）。
+    协议：{name, frame}，frame 为 JPEG 二进制；name 用于观众端精确路由到对应 tile。
 
     节流逻辑：通道内每 100ms 最多发一帧。节流期间收到的帧暂存为 last_frame，
     并调度一次"冲刷任务"，在间隔结束后把 last_frame 补发出去，
@@ -1479,7 +1511,7 @@ def ws_bcast_frame(raw_bytes):
                     dead = set()
                     for vsid in viewers_snap:
                         try:
-                            socketio.emit('broadcast_frame', frame, to=vsid)
+                            socketio.emit('broadcast_frame', {'name': rname, 'frame': frame}, to=vsid)
                         except Exception:
                             dead.add(vsid)
                     if dead:
@@ -1505,7 +1537,7 @@ def ws_bcast_frame(raw_bytes):
     dead = set()
     for vsid in viewers:
         try:
-            socketio.emit('broadcast_frame', raw_bytes, to=vsid)
+            socketio.emit('broadcast_frame', {'name': room_name, 'frame': raw_bytes}, to=vsid)
         except Exception:
             dead.add(vsid)
 

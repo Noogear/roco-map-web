@@ -39,7 +39,20 @@ const TrackerCore = (() => {
         offscreenVid: null,
         videoW: 0,
         videoH: 0,
-        selCircle: { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) },
+        selCircle: (function() {
+            // 优先读取用户持久化的校准值，否则使用默认值
+            var DEF = { cx: (1189 + 62.5) / 1362, cy: (66 + 63.5) / 806, r: Math.max(62.5 / 1362, 63.5 / 806) };
+            try {
+                var raw = localStorage.getItem('tc_selCircle');
+                if (raw) {
+                    var saved = JSON.parse(raw);
+                    if (saved && typeof saved.cx === 'number' && typeof saved.cy === 'number' && typeof saved.r === 'number') {
+                        return saved;
+                    }
+                }
+            } catch (_e) {}
+            return DEF;
+        })(),
         wsSocket: null,
         wsConnected: false,
         wsTransportName: '',
@@ -193,11 +206,25 @@ const TrackerCore = (() => {
         set imageData(v) { S.imageData = v; },
         get selCircle() { return S.selCircle; },
         set selCircle(v) { Object.assign(S.selCircle, v); },
+        /** 持久化 selCircle 到 localStorage，保证刷新后仍有效 */
+        saveSelCircle() {
+            try { localStorage.setItem('tc_selCircle', JSON.stringify({ cx: S.selCircle.cx, cy: S.selCircle.cy, r: S.selCircle.r })); } catch (_e) {}
+        },
+        /** 重置 selCircle 为默认值并清除持久化 */
+        resetSelCircle() {
+            S.selCircle.cx = (1189 + 62.5) / 1362;
+            S.selCircle.cy = (66 + 63.5) / 806;
+            S.selCircle.r  = Math.max(62.5 / 1362, 63.5 / 806);
+            S.captureCanvas = null; /* 旧尺寸 canvas 作废 */
+            try { localStorage.removeItem('tc_selCircle'); } catch (_e) {}
+        },
         get isScreenActive() { return !!S.screenStream; },
         get wsConnected() { return S.wsConnected; },
         get wsSocket() { return S.wsSocket; },
         get wsTransportName() { return S.wsTransportName; },
         get sessionToken() { return S.sessionToken; },
+        /** 外部清理复用 canvas（selCircle 改变后旧尺寸失效） */
+        set captureCanvas(v) { S.captureCanvas = v; },
 
         // ========== 日志 ==========
         log(msg) {
@@ -457,13 +484,13 @@ const TrackerCore = (() => {
             if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
             var c = S.captureCanvas;
             if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
-            var ctx = c.getContext('2d');
+            var ctx = c.getContext('2d', { willReadFrequently: true });
             if (!ctx) {
                 // context 丢失（内存压力等），强制重建 canvas
                 S.captureCanvas = document.createElement('canvas');
                 c = S.captureCanvas;
                 c.width = sz; c.height = sz;
-                ctx = c.getContext('2d');
+                ctx = c.getContext('2d', { willReadFrequently: true });
                 if (!ctx) return null;
             }
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
@@ -494,13 +521,13 @@ const TrackerCore = (() => {
             if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
             var c = S.captureCanvas;
             if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
-            var ctx = c.getContext('2d');
+            var ctx = c.getContext('2d', { willReadFrequently: true });
             if (!ctx) {
                 // context 丢失，强制重建
                 S.captureCanvas = document.createElement('canvas');
                 c = S.captureCanvas;
                 c.width = sz; c.height = sz;
-                ctx = c.getContext('2d');
+                ctx = c.getContext('2d', { willReadFrequently: true });
                 if (!ctx) return Promise.resolve(null);
             }
             ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
@@ -520,6 +547,23 @@ const TrackerCore = (() => {
 
 
         // ========== HTTP API 分析 ==========
+        /**
+         * 截取屏幕流的完整帧（不裁剪 selCircle），返回 Promise<Blob|null>
+         * 用于自动定位小地图等需要全画面的场景。
+         */
+        captureFullFrameBlob(quality) {
+            var vid = S.offscreenVid;
+            if (!vid || !vid.videoWidth) return Promise.resolve(null);
+            var vw = vid.videoWidth, vh = vid.videoHeight;
+            var c = document.createElement('canvas');
+            c.width = vw; c.height = vh;
+            var ctx = c.getContext('2d');
+            if (!ctx) return Promise.resolve(null);
+            ctx.drawImage(vid, 0, 0, vw, vh);
+            return new Promise(function (resolve) {
+                c.toBlob(function (blob) { resolve(blob); }, 'image/jpeg', quality || 0.85);
+            });
+        },
         sendAndDisplay(imageDataURL) {
             var self = this;
             return fetch('/api/upload_minimap', {

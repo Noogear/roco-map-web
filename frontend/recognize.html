@@ -12,10 +12,8 @@
     <main class="app-main">
         <div class="app-page-shell rec-shell">
 
-            <!-- ── 顶部栏 ── -->
             <header class="rec-bar">
                 <div class="rec-bar-left">
-                    <!-- 子页面切换 -->
                     <div class="rec-tab-group">
                         <button class="rec-tab is-active" id="tabTrack" type="button">🖥️ 识别台</button>
                         <button class="rec-tab" id="tabAudience" type="button">📺 观众模式</button>
@@ -28,21 +26,17 @@
                 <div class="rec-bar-right">
                     <span class="rec-watch-badge" id="watchBadge">📡 展示中</span>
                     <button id="renderModeBtn" class="app-chip" type="button">🗺️ 全图</button>
+                    <button id="settingsPanelBtn" class="app-chip rec-top-action-btn" type="button" aria-expanded="false">⚙️ 设置</button>
                 </div>
             </header>
 
-            <!-- ════════════════════════════════════════
-                 页面 A：识别台
-            ════════════════════════════════════════ -->
             <div class="rec-page" id="pageTrack">
                 <div class="rec-body">
 
-                    <!-- 渲染区 -->
                     <div class="rec-stage">
                         <canvas id="resultCanvas" width="400" height="400"></canvas>
                     </div>
 
-                    <!-- 侧栏 -->
                     <aside class="rec-panel" id="recPanel">
                         <div class="rec-panel-header">
                             <span class="rec-panel-title">状态面板</span>
@@ -50,97 +44,165 @@
                         </div>
 
                         <div class="rec-panel-body" id="recPanelBody">
-
-                        <!-- 状态格 -->
-                        <div class="rec-status-grid">
-                            <div class="rec-stat rec-stat-wide">
-                                <div class="rec-stat-label">识别状态</div>
-                                <div class="rec-stat-val" id="statusStateText">待机</div>
-                                <div class="rec-stat-sub status-line">
-                                    <span id="statusDot" class="status-dot dot-yellow"></span>
-                                    <span id="statusDotLabel">等待分析</span>
+                            <section class="rec-panel-section rec-panel-section-status">
+                                <div class="rec-section-head">
+                                    <div>
+                                        <div class="rec-section-kicker">Status</div>
+                                        <div class="rec-section-title">状态总览</div>
+                                    </div>
+                                    <span class="app-chip rec-section-chip" id="statusTransportChip">识别中枢</span>
                                 </div>
-                            </div>
-                            <div class="rec-stat">
-                                <div class="rec-stat-label">坐标 X</div>
-                                <div class="rec-stat-val" id="statusX">--</div>
-                            </div>
-                            <div class="rec-stat">
-                                <div class="rec-stat-label">坐标 Y</div>
-                                <div class="rec-stat-val" id="statusY">--</div>
-                            </div>
-                            <div class="rec-stat">
-                                <div class="rec-stat-label">匹配质量</div>
-                                <div class="rec-stat-val" id="statusQuality">--</div>
-                                <div class="rec-stat-sub">引擎：<span id="statusMode">SIFT</span></div>
-                            </div>
-                            <div class="rec-stat">
-                                <div class="rec-stat-label">命中</div>
-                                <div class="rec-stat-val" id="statusFound">--</div>
-                                <div class="rec-stat-sub">点：<span id="statusMatches">--</span></div>
-                            </div>
-                            <div class="rec-stat">
-                                <div class="rec-stat-label">方向角</div>
-                                <div class="rec-stat-val" id="statusAngle">--</div>
-                                <div class="rec-stat-sub" id="statusArrowState">--</div>
-                            </div>
-                            <div class="rec-stat">
-                                <div class="rec-stat-label">哈希定位</div>
-                                <div class="rec-stat-val" id="statusHashIndex">--</div>
-                                <div class="rec-stat-sub" id="statusHashIndexWrap" style="display:none;"></div>
-                            </div>
-                            <div class="rec-stat">
-                                <div class="rec-stat-label">传输</div>
-                                <div class="rec-stat-val" id="statusTransport">--</div>
-                                <div class="rec-stat-sub" id="statusKbps">--</div>
-                            </div>
-                        </div>
 
-                        <!-- 快捷设置 -->
-                        <div class="rec-settings">
+                                <div class="rec-status-grid">
+                                    <div class="rec-stat rec-stat-wide rec-stat-hero">
+                                        <div class="rec-stat-label">识别状态</div>
+                                        <div class="rec-stat-val" id="statusStateText">待机</div>
+                                        <div class="rec-stat-sub status-line">
+                                            <span id="statusDot" class="status-dot dot-yellow"></span>
+                                            <span id="statusDotLabel">等待分析</span>
+                                        </div>
+                                    </div>
+                                    <div class="rec-stat">
+                                        <div class="rec-stat-label">坐标 X</div>
+                                        <div class="rec-stat-val" id="statusX">--</div>
+                                    </div>
+                                    <div class="rec-stat">
+                                        <div class="rec-stat-label">坐标 Y</div>
+                                        <div class="rec-stat-val" id="statusY">--</div>
+                                    </div>
+                                    <div class="rec-stat">
+                                        <div class="rec-stat-label">匹配质量</div>
+                                        <div class="rec-stat-val" id="statusQuality">--</div>
+                                        <div class="rec-stat-sub">引擎：<span id="statusMode">SIFT</span></div>
+                                    </div>
+                                    <div class="rec-stat">
+                                        <div class="rec-stat-label">命中</div>
+                                        <div class="rec-stat-val" id="statusFound">--</div>
+                                        <div class="rec-stat-sub">点：<span id="statusMatches">--</span></div>
+                                    </div>
+                                    <div class="rec-stat">
+                                        <div class="rec-stat-label">方向角</div>
+                                        <div class="rec-stat-val" id="statusAngle">--</div>
+                                        <div class="rec-stat-sub" id="statusArrowState">--</div>
+                                    </div>
+                                    <div class="rec-stat">
+                                        <div class="rec-stat-label">哈希定位</div>
+                                        <div class="rec-stat-val" id="statusHashIndex">--</div>
+                                        <div class="rec-stat-sub" id="statusHashIndexWrap" style="display:none;"></div>
+                                    </div>
+                                    <div class="rec-stat">
+                                        <div class="rec-stat-label">传输</div>
+                                        <div class="rec-stat-val" id="statusTransport">--</div>
+                                        <div class="rec-stat-sub" id="statusKbps">--</div>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <section class="rec-panel-section rec-panel-section-actions">
+                                <div class="rec-section-head">
+                                    <div>
+                                        <div class="rec-section-kicker">Actions</div>
+                                        <div class="rec-section-title">操作控制</div>
+                                    </div>
+                                </div>
+
+                                <div class="rec-actions">
+                                    <button class="app-btn rec-action-btn rec-btn-main" id="mainScreenBtn" type="button">
+                                        <strong>🖥️ 屏幕捕获</strong>
+                                        <small id="mainScreenBtnSub">开始追踪</small>
+                                    </button>
+                                    <div class="rec-btn-row">
+                                        <button class="app-btn-soft rec-action-btn rec-btn-sub" id="pipBtn" type="button">
+                                            <strong>🎠 画中画</strong>
+                                            <small>悬浮查看</small>
+                                        </button>
+                                        <button class="app-btn-ghost rec-action-btn rec-btn-sub" id="broadcastBtn" type="button">
+                                            <strong id="broadcastBtnTitle">📡 展示</strong>
+                                            <small id="broadcastBtnSub">推流给观众</small>
+                                        </button>
+                                    </div>
+                                    <button class="app-btn-danger rec-action-btn rec-btn-reset" id="forceResetBtn" type="button">
+                                        <strong>🔄 强制重置</strong>
+                                        <small>清空前后端状态</small>
+                                    </button>
+                                </div>
+                            </section>
+                        </div>
+                    </aside>
+                </div>
+
+                <section class="rec-flyout rec-flyout-settings" id="recognizeSettingsPanel" aria-hidden="true">
+                    <div class="rec-flyout-head">
+                        <div>
+                            <div class="rec-section-kicker">Settings</div>
+                            <div class="rec-section-title">识别台设置</div>
+                        </div>
+                        <button class="rec-flyout-close" id="settingsPanelCloseBtn" type="button" title="关闭设置">✕</button>
+                    </div>
+                    <div class="rec-flyout-body">
+                        <label class="rec-form-field">
+                            <span class="rec-form-label">展示名称</span>
+                            <input class="app-field rec-form-input" id="recognizeNameInput" type="text" maxlength="16" placeholder="输入展示昵称，例如：一号机">
+                            <small class="rec-form-hint">用于“展示”功能的默认名称。</small>
+                        </label>
+                        <div class="rec-settings rec-settings-sheet">
                             <div class="rec-setting-row">
                                 <label class="rec-setting-label" for="fpsRange">捕获帧率</label>
                                 <input type="range" id="fpsRange" class="rec-setting-range" min="2" max="60" step="1">
                                 <span class="rec-setting-val" id="fpsRangeVal">10</span>
                                 <span class="rec-setting-unit">fps</span>
                             </div>
-                        </div>
-
-                        <!-- 操作按钮 -->
-                        <div class="rec-actions">
-                            <button class="app-btn rec-btn-main" id="mainScreenBtn" type="button">
-                                <strong>🖥️ 屏幕捕获</strong>
-                                <small id="mainScreenBtnSub">开始追踪</small>
-                            </button>
-                            <div class="rec-btn-row">
-                                <button class="app-btn-soft rec-btn-sub" id="pipBtn" type="button">🎠 画中画</button>
-                                <button class="app-btn-ghost rec-btn-sub" id="broadcastBtn" type="button">📡 展示</button>
+                            <div class="rec-setting-row">
+                                <label class="rec-setting-label" for="renderFpsRange">绘制帧率</label>
+                                <input type="range" id="renderFpsRange" class="rec-setting-range" min="10" max="60" step="1">
+                                <span class="rec-setting-val" id="renderFpsRangeVal">60</span>
+                                <span class="rec-setting-unit">fps</span>
                             </div>
-
-                            <!-- 图片上传测试入口 -->
-                            <div class="rec-upload-group">
-                                <label class="app-btn-soft rec-btn-upload" id="uploadLabel" for="uploadFileInput">
-                                    📂 上传截图测试
-                                    <input type="file" id="uploadFileInput" accept="image/*" multiple hidden>
-                                </label>
-                                <small class="rec-upload-hint">支持游戏全屏截图，自动裁剪小地图识别</small>
-                            </div>
-
-                            <button class="app-btn-ghost rec-btn-reset" id="forceResetBtn" type="button">🔄 强制重置</button>
                         </div>
+                    </div>
+                </section>
 
-                        </div><!-- /rec-panel-body -->
-                    </aside>
-                </div>
+                <section class="rec-flyout rec-flyout-tools" id="recognizeToolsPanel" aria-hidden="true">
+                    <div class="rec-flyout-head">
+                        <div>
+                            <div class="rec-section-kicker">Tools</div>
+                            <div class="rec-section-title">测试工具板块</div>
+                        </div>
+                        <button class="rec-flyout-close" id="toolsPanelCloseBtn" type="button" title="关闭工具板">✕</button>
+                    </div>
+                    <div class="rec-flyout-body">
+                        <label class="app-btn-ghost rec-action-btn rec-btn-upload" id="uploadLabel" for="uploadFileInput">
+                            <strong>📂 上传截图测试</strong>
+                            <small>本地图片识别 / 自动裁剪小地图</small>
+                            <input type="file" id="uploadFileInput" accept="image/*" multiple hidden>
+                        </label>
+                        <small class="rec-upload-hint">支持批量选择图片，会按顺序进行无状态识别测试。</small>
+
+                        <hr style="border:none;border-top:1px solid var(--line,#e8ddd2);margin:10px 0;">
+
+                        <button class="app-btn-ghost rec-action-btn" id="autoDetectCircleBtn" type="button">
+                            <strong>🔍 自动定位小地图</strong>
+                            <small id="autoDetectCircleSub">从屏幕捕获中自动识别小地图圆形位置</small>
+                        </button>
+                        <small class="rec-upload-hint">点击后需先开启屏幕捕获，系统自动检测游戏小地图的屏幕位置并保存校准值。游戏非全屏时必须先校准。</small>
+
+                        <button class="app-btn-ghost rec-action-btn" id="resetCircleBtn" type="button" style="margin-top:6px;">
+                            <strong>↩️ 重置为默认位置</strong>
+                            <small>清除校准，恢复内置坐标</small>
+                        </button>
+
+                        <div id="circleCalibStatus" style="font-size:12px;color:var(--text-soft);margin-top:6px;display:none;"></div>
+                    </div>
+                </section>
+
+                <button class="rec-tools-fab" id="toolPanelBtn" type="button" aria-expanded="false">
+                    <span>🧰</span>
+                    <strong>测试工具</strong>
+                </button>
             </div>
 
-            <!-- ════════════════════════════════════════
-                 页面 B：观众模式（监控室）
-            ════════════════════════════════════════ -->
             <div class="rec-page rec-page-hidden" id="pageAudience">
                 <div class="rec-audience-body">
-
-                    <!-- 频道列表 -->
                     <aside class="rec-channel-list">
                         <div class="rec-channel-header">
                             <span>🎙️ 直播频道</span>
@@ -151,38 +213,21 @@
                         </div>
                     </aside>
 
-                    <!-- 观看区域（支持多画面）-->
                     <div class="rec-audience-grid" id="audienceGrid">
                         <div class="rec-audience-placeholder">
                             <div style="font-size:48px;">📺</div>
                             <div>从左侧选择频道开始观看</div>
                         </div>
                     </div>
-
                 </div>
             </div>
 
         </div>
     </main>
 
-    <!-- 展示确认弹窗 -->
-    <div class="rec-modal-overlay" id="broadcastModal">
-        <div class="rec-modal">
-            <h3>开始展示</h3>
-            <p class="app-note">填写展示名称后，其他人可在观众模式中看到你的实时画面。</p>
-            <input class="app-field rec-modal-input" id="broadcastNameInput" type="text"
-                   placeholder="你的展示昵称（1-16字）" maxlength="16" autocomplete="off">
-            <div class="rec-modal-actions">
-                <button class="app-btn-ghost" id="broadcastCancelBtn" type="button">取消</button>
-                <button class="app-btn" id="broadcastConfirmBtn" type="button">确认展示</button>
-            </div>
-        </div>
-    </div>
-
-    <video id="screenOffscreen" autoplay playsinline muted style="position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;"></video>
-    <canvas id="pipCanvas" width="400" height="400" style="position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;"></canvas>
-    <video id="pipVideo" autoplay playsinline muted style="position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;"></video>
-    <!-- 展示者截图复用 canvas（不挂载到 DOM 渲染树，避免 GPU 资源泄漏） -->
+    <video id="screenOffscreen" autoplay playsinline muted style="position:fixed;left:0;top:0;width:100%;height:auto;opacity:0;pointer-events:none;z-index:-9999;"></video>
+    <canvas id="pipCanvas" width="400" height="400" style="position:fixed;left:0;top:0;width:400px;height:400px;opacity:0;pointer-events:none;z-index:-9999;"></canvas>
+    <video id="pipVideo" autoplay playsinline muted style="position:fixed;left:0;top:0;width:400px;height:300px;opacity:0;pointer-events:none;z-index:-9999;"></video>
     <canvas id="bcastCanvas" style="display:none;"></canvas>
 
     <script src="/js/socket.io.min.js"></script>

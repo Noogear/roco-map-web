@@ -210,6 +210,7 @@ class MapTrackerWeb:
         eng._watchdog_last_sift_y = None
         eng._watchdog_consecutive_ok = 0
         eng._watchdog_static_streak = 0
+        eng._watchdog_cooldown = 0
         eng._watchdog_triggered = False
         eng._last_arrow_angle = 0.0
         eng._last_arrow_stopped = True
@@ -401,9 +402,12 @@ class MapTrackerWeb:
 
         result = self.sift_engine.match(minimap_bgr)
 
-        # 看门狗触发：清空 pos_history，阻断异常值过滤回滚循环
+        # 看门狗触发：连同 Kalman/EMA 一并清空，避免旧坐标继续被预测器“续命”。
         if result.get('_watchdog_triggered'):
-            self._smoother.clear_position_history()
+            if hasattr(self._smoother, 'clear_runtime_state'):
+                self._smoother.clear_runtime_state(clear_persisted=True)
+            else:
+                self._smoother.clear_position_history()
 
         found = result['found']
         cx, cy = result['center_x'], result['center_y']
@@ -423,6 +427,8 @@ class MapTrackerWeb:
         )
         if measurement_rejected and found and not is_inertial and not tp_confirmed and not result.get('_watchdog_triggered'):
             self.sift_engine.restore_tracking_state(engine_snapshot)
+            if hasattr(self.sift_engine, 'mark_measurement_rejected'):
+                self.sift_engine.mark_measurement_rejected()
             prev = self.sift_engine.last_position
             prev_x, prev_y = prev if prev is not None else (None, None)
             arrow_angle, arrow_stopped = self.sift_engine.last_arrow_state

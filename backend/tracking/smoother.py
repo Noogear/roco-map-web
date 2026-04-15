@@ -176,7 +176,19 @@ class CoordSmoother:
         self._tp_candidate_buffer.clear()
 
     def clear_state(self) -> None:
-        """清空所有平滑状态（历史/缓冲/Kalman/EMA/传送候选）。"""
+        """清空所有平滑状态（历史/缓冲/Kalman/EMA/传送候选），并删除磁盘持久化文件。"""
+        self.clear_runtime_state(clear_persisted=True)
+
+    def clear_position_history(self) -> None:
+        """仅清空异常值过滤历史，保留其他平滑状态。"""
+        self.pos_history.clear()
+
+    def clear_runtime_state(self, clear_persisted: bool = False) -> None:
+        """清空运行期平滑状态。
+
+        用于看门狗解锁或其他“当前基点已不可信”的场景，
+        防止 Kalman / EMA / TP 候选继续把旧坐标往后带。
+        """
         self.pos_history.clear()
         self.smooth_buffer_x.clear()
         self.smooth_buffer_y.clear()
@@ -185,10 +197,16 @@ class CoordSmoother:
         self._display_x = None
         self._display_y = None
         self._tp_candidate_buffer.clear()
-
-    def clear_position_history(self) -> None:
-        """仅清空异常值过滤历史，保留其他平滑状态。"""
-        self.pos_history.clear()
+        self._last_save_time = 0.0
+        if clear_persisted:
+            path = self._smooth_buffer_path
+            if path:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    print(f"[平滑缓冲] 清除文件失败: {e}")
 
     def predict_position(self) -> tuple[int, int] | None:
         """对外暴露 Kalman 预测位置，供场景切换等编排逻辑使用。"""

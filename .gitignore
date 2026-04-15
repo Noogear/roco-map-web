@@ -15,7 +15,7 @@ _debug/
 
 # 临时环境/实验目录
 .tmp_prebuilt_env/
-tests/
+test*/
 
 # 忽略 IDE 配置文件
 .idea/

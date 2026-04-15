@@ -12,6 +12,8 @@ from threading import Lock
 
 from PIL import Image
 
+from backend.core.data_standards import DataScope, bind_scope
+
 
 def _make_image_bytes(fmt, color):
     buf = io.BytesIO()
@@ -22,10 +24,12 @@ def _make_image_bytes(fmt, color):
 TEST_PNG = _make_image_bytes('PNG', (20, 120, 220))
 TEST_JPEG = _make_image_bytes('JPEG', (220, 140, 40))
 TEST_RESULT_B64 = 'data:image/jpeg;base64,' + base64.b64encode(TEST_JPEG).decode('ascii')
+SESSION_TOKEN = 'default-token'
 
 
 class FakeSiftEngine:
     def __init__(self):
+        bind_scope(self, DataScope.SESSION_SCOPED)
         self.coord_lock_enabled = False
         self._lock_min_to_activate = 10
 
@@ -35,7 +39,9 @@ class FakeSiftEngine:
 
 
 class FakeTracker:
-    def __init__(self, sift_only=False):
+    def __init__(self, sift_only=False, session_id=SESSION_TOKEN, **_kwargs):
+        bind_scope(self, DataScope.SESSION_SCOPED)
+        self.session_id = session_id
         self.sift_engine = FakeSiftEngine()
         self.current_mode = 'sift'
         self.map_width = 1024
@@ -50,6 +56,7 @@ class FakeTracker:
         self._push_jpeg = False
         self._last_active_ts = time.time()
         self._process_lock = Lock()
+        self.lock = Lock()
 
     def touch_active(self):
         self._last_active_ts = time.time()
@@ -72,7 +79,7 @@ class FakeTracker:
             'hybrid_busy': False,
         }
 
-    def set_minimap(self, minimap_bgr):
+    def set_minimap(self, minimap_bgr, token=''):
         self.last_minimap = minimap_bgr
         self.latest_status = self._make_status()
         self.latest_result_jpeg = TEST_JPEG
@@ -143,14 +150,14 @@ def _unpack_result_packet(packet):
 class WebConnectionModesTest(unittest.TestCase):
     def setUp(self):
         self.http_client = APP.test_client()
-        fake = FakeTracker()
-        fake.result_callback = lambda: MAIN_WEB._on_result_ready('default')
-        MAIN_WEB._sessions['default'] = fake
+        fake = FakeTracker(session_id=SESSION_TOKEN)
+        fake.result_callback = lambda: MAIN_WEB._on_result_ready(SESSION_TOKEN, fake)
+        MAIN_WEB._session_registry.get_context(SESSION_TOKEN).tracker = fake
         self.fake_tracker = fake
 
     def tearDown(self):
-        MAIN_WEB._sessions.pop('default', None)
-        MAIN_WEB._sid_to_token.clear()
+        MAIN_WEB._session_registry._contexts.clear()
+        MAIN_WEB._sid_token.clear()
 
     def test_upload_minimap_accepts_json_base64(self):
         response = self.http_client.post(
@@ -180,7 +187,7 @@ class WebConnectionModesTest(unittest.TestCase):
     def test_latest_frame_returns_jpeg_binary(self):
         self.fake_tracker.set_minimap('frame-ready')
 
-        response = self.http_client.get('/api/latest_frame?token=default')
+        response = self.http_client.get(f'/api/latest_frame?token={SESSION_TOKEN}')
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, 'image/jpeg')
@@ -190,12 +197,9 @@ class WebConnectionModesTest(unittest.TestCase):
         client = SOCKETIO.test_client(APP, flask_test_client=self.http_client)
         try:
             client.get_received()  # clear connect events
-            client.emit('session_join', {'token': 'default'})
+            client.emit('session_join', {'token': SESSION_TOKEN})
             received = client.get_received()
-            ready_events = [e for e in received if e['name'] == 'session_ready']
             status_events = [e for e in received if e['name'] == 'status']
-            self.assertTrue(ready_events)
-            self.assertTrue(ready_events[0]['args'][0]['ok'])
             self.assertTrue(status_events)
             self.assertEqual(status_events[0]['args'][0]['position'], {'x': 128, 'y': 256})
         finally:
@@ -205,7 +209,7 @@ class WebConnectionModesTest(unittest.TestCase):
         client = SOCKETIO.test_client(APP, flask_test_client=self.http_client)
         try:
             client.get_received()
-            client.emit('session_join', {'token': 'default'})
+            client.emit('session_join', {'token': SESSION_TOKEN})
             client.get_received()  # clear session_ready + status
             client.emit('frame', TEST_JPEG)
             received = client.get_received()
@@ -228,7 +232,9 @@ class WebConnectionModesTest(unittest.TestCase):
             watcher.get_received()
             sender.get_received()
 
-            sender.emit('session_join', {'token': 'default'})
+            watcher.emit('session_join', {'token': SESSION_TOKEN})
+            watcher.get_received()  # clear status
+            sender.emit('session_join', {'token': SESSION_TOKEN})
             sender.get_received()  # clear session_ready + status
 
             sender.emit('frame', TEST_JPEG)

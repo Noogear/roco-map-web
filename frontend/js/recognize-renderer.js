@@ -71,6 +71,16 @@ export const RecognizeRenderer = {
 
         /* ── 初始化活跃策略 ── */
         R.modeStrategy = R.renderMode === 'jpeg' ? RenderModeJpeg : RenderModeFullmap;
+        R.renderFps = Math.max(10, Math.min(60, parseInt(R.renderFps, 10) || 60));
+        R.renderIntervalMs = 1000 / R.renderFps;
+        R.lastRenderAt = 0;
+
+        R.setRenderFps = function (fps) {
+            R.renderFps = Math.max(10, Math.min(60, parseInt(fps, 10) || 60));
+            R.renderIntervalMs = 1000 / R.renderFps;
+            R.lastRenderAt = 0;
+            if (typeof R.updateRenderModeBtn === 'function') R.updateRenderModeBtn();
+        };
 
         /* ── 主渲染：委托给当前策略 ── */
         R.renderMapCanvas = function () {
@@ -83,12 +93,16 @@ export const RecognizeRenderer = {
         R.startMapRAF = function () {
             if (R.mapRAFActive) return;
             R.mapRAFActive = true;
-            (function loop() {
+            (function loop(now) {
                 if (!R.mapRAFActive) return;
                 /* Skip rendering when tab is hidden to avoid GPU work piling up */
                 if (document.hidden) { requestAnimationFrame(loop); return; }
-                try { R.renderMapCanvas(); } catch (e) { console.error(e); }
-                if (R.pipRAFActive) { try { R.updatePiPCanvas(); } catch (_) {} }
+                var ts = typeof now === 'number' ? now : performance.now();
+                if (!R.lastRenderAt || ts - R.lastRenderAt >= R.renderIntervalMs - 1) {
+                    R.lastRenderAt = ts;
+                    try { R.renderMapCanvas(); } catch (e) { console.error(e); }
+                    if (R.pipRAFActive) { try { R.updatePiPCanvas(); } catch (_) {} }
+                }
                 requestAnimationFrame(loop);
             })();
         };
@@ -101,6 +115,22 @@ export const RecognizeRenderer = {
 
         function stopPiPRefresh() { R.pipRAFActive = false; }
 
+        function stopPiPStream() {
+            var pipVideo = document.getElementById('pipVideo');
+            var stream = pipVideo && pipVideo.srcObject;
+            if (stream && typeof stream.getTracks === 'function') {
+                stream.getTracks().forEach(function (track) {
+                    try { track.stop(); } catch (_) {}
+                });
+            }
+            if (pipVideo) {
+                try { pipVideo.pause(); } catch (_) {}
+                pipVideo.srcObject = null;
+                pipVideo.removeAttribute('src');
+                try { pipVideo.load(); } catch (_) {}
+            }
+        }
+
         function isNativePiPActive() {
             var v = document.getElementById('pipVideo');
             return document.pictureInPictureElement === v || v.webkitPresentationMode === 'picture-in-picture';
@@ -111,21 +141,39 @@ export const RecognizeRenderer = {
             stopPiPRefresh();
         };
 
+        R.cleanupPiP = function () {
+            var pipVideo = document.getElementById('pipVideo');
+            R.resetPiPButtonState();
+            if (pipVideo) {
+                try {
+                    if (document.pictureInPictureElement === pipVideo && typeof document.exitPictureInPicture === 'function') {
+                        document.exitPictureInPicture().catch(function () {});
+                    } else if (typeof pipVideo.webkitSetPresentationMode === 'function' && pipVideo.webkitPresentationMode === 'picture-in-picture') {
+                        pipVideo.webkitSetPresentationMode('inline');
+                    }
+                } catch (_) {}
+            }
+            stopPiPStream();
+        };
+
         R.toggleNativePiP = async function () {
             try {
                 if (isNativePiPActive()) {
                     if (document.pictureInPictureElement) await document.exitPictureInPicture();
                     else document.getElementById('pipVideo').webkitSetPresentationMode('inline');
-                    R.resetPiPButtonState(); return;
+                    R.cleanupPiP(); return;
                 }
                 var pipCanvas = document.getElementById('pipCanvas');
                 var pipVideo = document.getElementById('pipVideo');
+                stopPiPStream();
                 R.updatePiPCanvas();
                 pipVideo.srcObject = pipCanvas.captureStream(30);
                 if (!R.pipEventsBound) {
                     R.pipEventsBound = true;
-                    pipVideo.addEventListener('leavepictureinpicture', function () { R.resetPiPButtonState(); TC.log('✅ 原生画中画已关闭'); });
-                    pipVideo.addEventListener('webkitpresentationmodechanged', function () { if (pipVideo.webkitPresentationMode !== 'picture-in-picture') R.resetPiPButtonState(); });
+                    pipVideo.addEventListener('leavepictureinpicture', function () { R.cleanupPiP(); TC.log('✅ 原生画中画已关闭'); });
+                    pipVideo.addEventListener('webkitpresentationmodechanged', function () {
+                        if (pipVideo.webkitPresentationMode !== 'picture-in-picture') R.cleanupPiP();
+                    });
                 }
                 await pipVideo.play();
                 var support = R.getPiPSupport();
@@ -136,7 +184,7 @@ export const RecognizeRenderer = {
                 (function pipLoop() { if (!R.pipRAFActive) return; if (!R.mapRAFActive) R.updatePiPCanvas(); requestAnimationFrame(pipLoop); })();
                 TC.log('✅ 原生浏览器画中画已开启');
             } catch (err) {
-                R.resetPiPButtonState();
+                R.cleanupPiP();
                 AppCommon.toast('画中画启动失败：' + err.message, 'danger');
             }
         };
@@ -147,8 +195,8 @@ export const RecognizeRenderer = {
             var isFullmap = R.modeStrategy.id === 'fullmap';
             btn.textContent = isFullmap ? '🗺️ 全图' : '📸 JPEG';
             btn.title = isFullmap
-                ? '当前：全图模式（60fps平滑，无边界）\n点击切换到 JPEG 模式（轻量低流量）'
-                : '当前：JPEG 模式（轻量低流量）\n点击切换到全图模式（60fps平滑，无边界）';
+                ? '当前：全图模式（目标绘制 ' + R.renderFps + 'fps，无边界）\n点击切换到 JPEG 模式（轻量低流量）'
+                : '当前：JPEG 模式（目标绘制 ' + R.renderFps + 'fps）\n点击切换到全图模式（无边界）';
         };
 
         R.toggleRenderMode = function () {

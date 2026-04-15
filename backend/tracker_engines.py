@@ -22,7 +22,7 @@ from backend.core.features import (CircularMaskCache, create_flann,
                                    extract_map_features_tiled, extract_minimap_features,
                                    sift_match_region)
 from backend.core.flow import LKTracker
-from backend.core.ecc import ecc_align
+from backend.core.ecc import ecc_align, phase_correlate
 from backend.core.hash_index import MapHashIndex
 from backend.core.data_standards import DataScope, bind_scope
 from backend.tracking.direction import ArrowDirectionSystem
@@ -89,6 +89,57 @@ class SharedSIFTResources:
             map_height=self.map_height,
         )
         print(f"🔑 哈希索引条目: {len(self._hash_index._xs)} 个")
+
+        # ---- S 通道辅助索引（低纹理/海洋场景补充特征）----
+        # 内存策略: BGR → HSV 转换后立即释放 BGR/HSV，仅保留 S 通道和其增强副本
+        # 峰值: gray(1x) + BGR(3x) + HSV(3x) ≈ 7x gray，随后降至 gray(1x) + S_clahe(1x)
+        self.kp_big_sat = None
+        self.des_big_sat = None
+        self.kp_coords_sat = None
+        self.flann_global_sat = None
+        self._logic_map_sat_clahe = None
+        _sat_enabled = getattr(config, 'SIFT_SAT_ENABLED', True)
+        if _sat_enabled:
+            print("正在提取饱和度通道辅助特征（低纹理/海洋场景）...")
+            _map_bgr = cv2.imread(config.LOGIC_MAP_PATH)
+            if _map_bgr is not None:
+                _map_hsv = cv2.cvtColor(_map_bgr, cv2.COLOR_BGR2HSV)
+                del _map_bgr                               # 立即释放 BGR
+                _map_sat_raw = _map_hsv[:, :, 1].copy()   # 提取 S 通道
+                del _map_hsv                               # 立即释放 HSV
+                # 对 S 通道做逐块 CLAHE（不走 enhance_minimap 以避免灰度专用的双边滤波）
+                _clahe_sat_init = cv2.createCLAHE(clipLimit=6.0, tileGridSize=(8, 8))
+                _sat_tile_patch = 512
+                _h_sat, _w_sat = _map_sat_raw.shape[:2]
+                _map_sat_clahe = np.empty_like(_map_sat_raw)
+                for _sy in range(0, _h_sat, _sat_tile_patch):
+                    for _sx in range(0, _w_sat, _sat_tile_patch):
+                        _patch = _map_sat_raw[_sy:_sy + _sat_tile_patch, _sx:_sx + _sat_tile_patch]
+                        _map_sat_clahe[_sy:_sy + _sat_tile_patch, _sx:_sx + _sat_tile_patch] = \
+                            _clahe_sat_init.apply(_patch)
+                del _map_sat_raw                           # raw S 通道不再需要
+                self._logic_map_sat_clahe = _map_sat_clahe
+                # 分块提取 SIFT 特征，缩小每块 tile 特征数限制内存峰值
+                _sat_tile_size = getattr(config, 'SIFT_SAT_TILE_SIZE', 1536)
+                _sat_cap = getattr(config, 'SIFT_SAT_MAX_FEATURES_PER_TILE', 600)
+                print(f"  S通道分块提取... (tile={_sat_tile_size}, cap/tile={_sat_cap})")
+                _kp_sat, _des_sat = extract_map_features_tiled(
+                    _map_sat_clahe, self.sift,
+                    tile_size=_sat_tile_size,
+                    overlap=_global_tile_overlap,
+                    max_features_per_tile=_sat_cap,
+                )
+                if _des_sat is not None and _kp_sat:
+                    self.kp_big_sat = _kp_sat
+                    self.des_big_sat = _des_sat
+                    self.kp_coords_sat = np.array([kp.pt for kp in _kp_sat], dtype=np.float32)
+                    self.flann_global_sat = create_flann(_des_sat)
+                    print(f"✅ S通道特征点: {len(_kp_sat)} 个")
+                else:
+                    print("⚠️ S通道特征提取失败，将跳过 SAT 辅助匹配")
+            else:
+                print("⚠️ 无法加载彩色地图，跳过 S 通道索引")
+
         print("=" * 50)
 
 
@@ -127,6 +178,24 @@ class EngineTrackingSnapshot:
     arrow_dir_last_angle: float
     arrow_dir_is_stopped: bool
     arrow_dir_stop_streak: int
+    lk_prev_gray: np.ndarray | None
+    lk_prev_pts: np.ndarray | None
+    lk_map_scale: float
+    lk_frame_num: int
+    last_sift_scale: float
+    relocalize_cd: int
+    local_success_streak: int
+    force_global_revalidate: bool
+    force_global_revalidate_frame: int
+    watchdog_accum_dx: float
+    watchdog_accum_dy: float
+    watchdog_suspect_streak: int
+    watchdog_last_sift_x: int | None
+    watchdog_last_sift_y: int | None
+    watchdog_consecutive_ok: int
+    watchdog_static_streak: int
+    watchdog_cooldown: int
+    pending_freeze_resume_hint: dict | None
 
 
 def classify_scene(texture_std: float) -> str:
@@ -156,6 +225,16 @@ class SIFTMapTracker:
         self.kp_coords = shared.kp_coords
         self.flann_global = shared.flann_global
         self._hash_index = shared._hash_index
+
+        # S 通道辅助资源（只读共享，低纹理/海洋场景）
+        self.kp_big_sat = shared.kp_big_sat
+        self.des_big_sat = shared.des_big_sat
+        self.kp_coords_sat = shared.kp_coords_sat
+        self.flann_global_sat = shared.flann_global_sat
+        self._logic_map_sat_clahe = shared._logic_map_sat_clahe
+        # per-session：CLAHE 有内部状态不能共享，仅在 SAT 可用时创建
+        self._clahe_sat = (cv2.createCLAHE(clipLimit=6.0, tileGridSize=(8, 8))
+                           if self.flann_global_sat is not None else None)
 
         # per-session: CLAHE 有内部状态，不能共享
         self._clahe_normal, self._clahe_low = make_clahe_pair()
@@ -215,6 +294,7 @@ class SIFTMapTracker:
         self._watchdog_last_sift_y: int | None = None
         self._watchdog_consecutive_ok: int = 0
         self._watchdog_static_streak: int = 0
+        self._watchdog_cooldown: int = 0
 
         # 附近搜索 FLANN 缓存（OrderedDict LRU，避免每帧重建）
         self._nearby_flann_cache: OrderedDict = OrderedDict()
@@ -426,6 +506,25 @@ class SIFTMapTracker:
             arrow_dir_last_angle=arrow_dir._last_angle,
             arrow_dir_is_stopped=arrow_dir._is_stopped,
             arrow_dir_stop_streak=arrow_dir._stop_streak,
+            lk_prev_gray=(None if self._lk.prev_gray is None else self._lk.prev_gray.copy()),
+            lk_prev_pts=(None if self._lk.prev_pts is None else self._lk.prev_pts.copy()),
+            lk_map_scale=self._lk.map_scale,
+            lk_frame_num=self._lk.frame_num,
+            last_sift_scale=self._last_sift_scale,
+            relocalize_cd=self._relocalize_cd,
+            local_success_streak=self._local_success_streak,
+            force_global_revalidate=self._force_global_revalidate,
+            force_global_revalidate_frame=self._force_global_revalidate_frame,
+            watchdog_accum_dx=self._watchdog_accum_dx,
+            watchdog_accum_dy=self._watchdog_accum_dy,
+            watchdog_suspect_streak=self._watchdog_suspect_streak,
+            watchdog_last_sift_x=self._watchdog_last_sift_x,
+            watchdog_last_sift_y=self._watchdog_last_sift_y,
+            watchdog_consecutive_ok=self._watchdog_consecutive_ok,
+            watchdog_static_streak=self._watchdog_static_streak,
+            watchdog_cooldown=self._watchdog_cooldown,
+            pending_freeze_resume_hint=(None if self._pending_freeze_resume_hint is None
+                                        else dict(self._pending_freeze_resume_hint)),
         )
 
     def restore_tracking_state(self, snapshot: EngineTrackingSnapshot) -> None:
@@ -448,6 +547,57 @@ class SIFTMapTracker:
             arrow_dir._last_angle = snapshot.arrow_dir_last_angle
             arrow_dir._is_stopped = snapshot.arrow_dir_is_stopped
             arrow_dir._stop_streak = snapshot.arrow_dir_stop_streak
+            self._lk.prev_gray = (None if snapshot.lk_prev_gray is None
+                                  else snapshot.lk_prev_gray.copy())
+            self._lk.prev_pts = (None if snapshot.lk_prev_pts is None
+                                 else snapshot.lk_prev_pts.copy())
+            self._lk.map_scale = snapshot.lk_map_scale
+            self._lk.frame_num = snapshot.lk_frame_num
+            self._last_sift_scale = snapshot.last_sift_scale
+            self._relocalize_cd = snapshot.relocalize_cd
+            self._local_success_streak = snapshot.local_success_streak
+            self._force_global_revalidate = snapshot.force_global_revalidate
+            self._force_global_revalidate_frame = snapshot.force_global_revalidate_frame
+            self._watchdog_accum_dx = snapshot.watchdog_accum_dx
+            self._watchdog_accum_dy = snapshot.watchdog_accum_dy
+            self._watchdog_suspect_streak = snapshot.watchdog_suspect_streak
+            self._watchdog_last_sift_x = snapshot.watchdog_last_sift_x
+            self._watchdog_last_sift_y = snapshot.watchdog_last_sift_y
+            self._watchdog_consecutive_ok = snapshot.watchdog_consecutive_ok
+            self._watchdog_static_streak = snapshot.watchdog_static_streak
+            self._watchdog_cooldown = snapshot.watchdog_cooldown
+            self._pending_freeze_resume_hint = (None if snapshot.pending_freeze_resume_hint is None
+                                                else dict(snapshot.pending_freeze_resume_hint))
+            self._watchdog_triggered = False
+
+    def mark_measurement_rejected(self) -> None:
+        """登记一次被上层拒绝的测量，避免无限沿用旧基点并强制进入更保守的重定位路径。"""
+        with self._lock:
+            self._local_success_streak = 0
+            self._force_global_revalidate = True
+            self._force_global_revalidate_frame = self._lk.frame_num
+            self._watchdog_accum_dx = 0.0
+            self._watchdog_accum_dy = 0.0
+            self._watchdog_last_sift_x = None
+            self._watchdog_last_sift_y = None
+            self._watchdog_consecutive_ok = 0
+            self._watchdog_static_streak = 0
+            self._watchdog_cooldown = 0
+            self._watchdog_triggered = False
+
+            self.lost_frames += 1
+            if self.using_local:
+                self.local_fail_count += 1
+                if self.local_fail_count >= self.LOCAL_FAIL_LIMIT:
+                    self._switch_to_global()
+                    self._nearby_flann_cache.clear()
+
+            if self.lost_frames > config.MAX_LOST_FRAMES:
+                self.last_x = None
+                self.last_y = None
+                self._switch_to_global()
+                self._nearby_flann_cache.clear()
+                self._lk.reset()
 
     def sync_external_position(self, x: int, y: int) -> None:
         """让外部确认后的坐标立即成为引擎新基点。"""
@@ -490,6 +640,24 @@ class SIFTMapTracker:
         self._watchdog_last_sift_y = None
         self._watchdog_consecutive_ok = 0
         self._watchdog_static_streak = 0
+
+    def _trigger_watchdog_unlock(self, reason: str) -> None:
+        """统一执行看门狗解锁，并进入短冷却避免刚解锁又被同一批脏状态连环触发。"""
+        self._switch_to_global()
+        self._nearby_flann_cache.clear()
+        self._lk.reset()
+        self._force_global_revalidate = True
+        self._force_global_revalidate_frame = self._lk.frame_num
+        self._watchdog_suspect_streak = 0
+        self._watchdog_triggered = True
+        self.last_x = None
+        self.last_y = None
+        self.lost_frames = 0
+        self._watchdog_cooldown = max(
+            self._watchdog_cooldown,
+            int(getattr(config, 'WATCHDOG_TRIGGER_COOLDOWN', 24)),
+        )
+        print(f"[看门狗] {reason} → 进入 {self._watchdog_cooldown} 帧冷却")
 
     def _resolve_local_revalidation(self, local_match, global_match, tp_far_candidate):
         """
@@ -592,6 +760,9 @@ class SIFTMapTracker:
         self._lk.frame_num += 1
         run_sift = self._lk.should_run_sift()
 
+        if self._watchdog_cooldown > 0:
+            self._watchdog_cooldown -= 1
+
         if self._relocalize_cd > 0:
             self._relocalize_cd -= 1
 
@@ -628,8 +799,9 @@ class SIFTMapTracker:
             kp_mini, des_mini = extract_minimap_features(minimap_gray, self.sift, self._mask_cache,
                                                            texture_std=texture_std)
 
-            # 超低纹理 + 特征过少 → 更激进的预处理重试
-            if scene == 'ocean' and (des_mini is None or len(kp_mini) < 15):
+            # 超低/低纹理 + 特征过少 → 更激进的预处理重试
+            # 方案A: 扩展到 low_texture（海岸线），不只限于 ocean
+            if scene in ('ocean', 'low_texture') and (des_mini is None or len(kp_mini) < 15):
                 enhanced = enhance_minimap(minimap_gray_raw, 5,
                                            self._clahe_normal, self._clahe_low,
                                            self._low_texture_thresh)
@@ -729,14 +901,98 @@ class SIFTMapTracker:
                         if avg_scale is not None:
                             self._last_sift_scale = avg_scale
                             self._lk.map_scale = avg_scale
+            # ---- phaseCorrelate：频域互相关（有位置提示时的低纹理/海洋兜底）----
+            # 在 SIFT+ECC 全失败后触发；FFT 全局最优，不受重复纹理/描述子歧义影响
+            # 约 1-2ms；需要 last_x/last_y 作为搜索中心
+            if (not found and scene in ('ocean', 'low_texture')
+                    and self.last_x is not None
+                    and getattr(config, 'PHASE_CORRELATE_ENABLED', True)):
+                _pc_min = getattr(config, 'PHASE_CORRELATE_MIN_RESPONSE', 0.05)
+                _pc_ratio = getattr(config, 'PHASE_CORRELATE_CROP_RATIO', 2.0)
+                # 1. 灰度通道
+                _pc = phase_correlate(
+                    minimap_gray, self._logic_map_gray_clahe,
+                    self.last_x, self.last_y,
+                    self._last_sift_scale, self.map_width, self.map_height,
+                       self.JUMP_THRESHOLD * 2, _pc_min, _pc_ratio)
+                if _pc is not None:
+                    found, center_x, center_y = True, _pc[0], _pc[1]
+                    match_quality = 0.35
+                    source = 'PHASE_CORRELATE'
+                # 2. S 通道（海洋场景辨别力更强）
+                if not found and self._logic_map_sat_clahe is not None \
+                        and self._clahe_sat is not None:
+                    _hsv_pc = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+                    _sat_mini_pc = self._clahe_sat.apply(_hsv_pc[:, :, 1])
+                    _pc_s = phase_correlate(
+                        _sat_mini_pc, self._logic_map_sat_clahe,
+                        self.last_x, self.last_y,
+                        self._last_sift_scale, self.map_width, self.map_height,
+                           self.JUMP_THRESHOLD * 2, _pc_min, _pc_ratio)
+                    if _pc_s is not None:
+                        found, center_x, center_y = True, _pc_s[0], _pc_s[1]
+                        match_quality = 0.30
+                        source = 'PHASE_CORRELATE_SAT'
 
+            # ---- 方案B: S通道辅助匹配（低纹理/海洋场景最终兜底）----
+            # 灰度 SIFT 全链路失败后才触发，运行时开销 ~3-5ms（含 cvtColor + SIFT）
+            if not found and scene in ('ocean', 'low_texture') and self._clahe_sat is not None:
+                _hsv_mini = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+                _sat_mini = self._clahe_sat.apply(_hsv_mini[:, :, 1])
+                # inner_ratio 固定用 hard 值，排除玩家箭头对 S 通道的干扰
+                kp_sat_mini, des_sat_mini = extract_minimap_features(
+                    _sat_mini, self.sift, self._mask_cache,
+                    texture_std=None, inner_ratio=0.18)
+                if des_sat_mini is not None:
+                    _sat_ratio = getattr(config, 'SIFT_SAT_MATCH_RATIO', 0.90)
+                    _sat_min = getattr(config, 'SIFT_SAT_MIN_MATCH', 3)
+                    _res_sat = sift_match_region(
+                        kp_sat_mini, des_sat_mini, _sat_mini.shape,
+                        self.kp_big_sat, self.flann_global_sat,
+                        _sat_ratio, _sat_min,
+                        self.map_width, self.map_height)
+                    if _res_sat is not None:
+                        tx, ty, inlier_count, quality, avg_scale = _res_sat
+                        _jmp_ok = (self.last_x is None
+                                   or abs(tx - self.last_x) + abs(ty - self.last_y) < self.JUMP_THRESHOLD)
+                        if _jmp_ok:
+                            found, center_x, center_y = True, tx, ty
+                            match_quality = quality * 0.85  # 轻微折扣：S 通道描述子空间与灰度不同
+                            match_count = inlier_count
+                            source = 'SIFT_SAT'
+                            if avg_scale is not None:
+                                self._last_sift_scale = avg_scale
+                                self._lk.map_scale = avg_scale
+
+                # ---- S通道 ECC 兜底（有位置提示、SAT SIFT 依然失败时）----
+                # _sat_mini 已在上方计算，直接复用，无额外 cvtColor 开销
+                if not found and self.last_x is not None \
+                        and self._logic_map_sat_clahe is not None and self._ecc_enabled:
+                    _sat_ecc_min = getattr(config, 'SIFT_SAT_ECC_MIN_CC', 0.28)
+                    _ecc_sat = ecc_align(
+                        _sat_mini, self._logic_map_sat_clahe,
+                        self.last_x, self.last_y,
+                        self._last_sift_scale, self.map_width, self.map_height,
+                        self.JUMP_THRESHOLD, _sat_ecc_min)
+                    if _ecc_sat is not None:
+                        found, center_x, center_y = True, _ecc_sat[0], _ecc_sat[1]
+                        match_quality = 0.25
+                        source = 'ECC_SAT'
         # 看门狗：用 LK 累积位移检测“SIFT 卡在错位置但看起来还活着”的局部死锁。
         _wd_min_move = getattr(config, 'WATCHDOG_LK_MIN_MOVE', 60)
         _wd_limit = getattr(config, 'WATCHDOG_SUSPECT_LIMIT', 3)
         if run_sift:
             _accum_dist = abs(self._watchdog_accum_dx) + abs(self._watchdog_accum_dy)
             _wd_sift_src = source in ('SIFT_LOCAL', 'SIFT_GLOBAL', 'SIFT_GLOBAL_REVALIDATED')
-            if found and not is_inertial and _wd_sift_src and self._watchdog_last_sift_x is not None:
+            _wd_on_cooldown = self._watchdog_cooldown > 0
+            if _wd_on_cooldown:
+                if found and not is_inertial and _wd_sift_src:
+                    self._watchdog_last_sift_x = center_x
+                    self._watchdog_last_sift_y = center_y
+                self._watchdog_suspect_streak = 0
+                self._watchdog_consecutive_ok = 0
+                self._watchdog_static_streak = 0
+            elif found and not is_inertial and _wd_sift_src and self._watchdog_last_sift_x is not None:
                 if _accum_dist > _wd_min_move:
                     _sift_moved = (abs(center_x - self._watchdog_last_sift_x)
                                    + abs(center_y - self._watchdog_last_sift_y))
@@ -750,16 +1006,7 @@ class SIFTMapTracker:
                         if self._watchdog_suspect_streak >= _wd_limit:
                             print(f"[看门狗] 死锁解除! 连续{self._watchdog_suspect_streak}次不一致 "
                                   f"→ 清空基点+切全局重定位")
-                            self._switch_to_global()       # 内部同时清除看门狗累积/基准点
-                            self._nearby_flann_cache.clear()
-                            self._lk.reset()
-                            self._force_global_revalidate = True
-                            self._force_global_revalidate_frame = self._lk.frame_num
-                            self._watchdog_suspect_streak = 0
-                            self._watchdog_triggered = True  # 通知上层清空 pos_history
-                            self.last_x = None             # 摆脱错误基点，下帧全局无阈值接受
-                            self.last_y = None
-                            self.lost_frames = 0
+                            self._trigger_watchdog_unlock('死锁解除后强制全局重定位')
                             found = False
                     else:
                         # SIFT 位移正常；需连续多帧正常才清除可疑计数（防 ABAB 交替绕过）
@@ -779,7 +1026,7 @@ class SIFTMapTracker:
                         self._force_global_revalidate = True
                         self._force_global_revalidate_frame = self._lk.frame_num
                         self._watchdog_static_streak = 0
-            elif found and not is_inertial and _wd_sift_src:
+            elif not _wd_on_cooldown and found and not is_inertial and _wd_sift_src:
                 # 首次 SIFT 命中：初始化看门狗基准点
                 self._watchdog_last_sift_x = center_x
                 self._watchdog_last_sift_y = center_y
@@ -788,21 +1035,13 @@ class SIFTMapTracker:
             self._watchdog_accum_dy = 0.0
 
             # 哈希校验补充“视觉内容与当前位置是否匹配”这条证据链。
-            if found and not is_inertial and _wd_sift_src and center_x is not None:
+            if (not _wd_on_cooldown and found and not is_inertial
+                    and _wd_sift_src and center_x is not None):
                 if not self._hash_index.check_consistency(minimap_gray_raw, center_x, center_y):
                     self._watchdog_suspect_streak += 1
                     if self._watchdog_suspect_streak >= _wd_limit:
                         print(f'[看门狗-哈希] 视觉不一致触发解锁! SIFT报告({center_x},{center_y})与哈希索引不匹配')
-                        self._switch_to_global()
-                        self._nearby_flann_cache.clear()
-                        self._lk.reset()
-                        self._force_global_revalidate = True
-                        self._force_global_revalidate_frame = self._lk.frame_num
-                        self._watchdog_suspect_streak = 0
-                        self._watchdog_triggered = True
-                        self.last_x = None
-                        self.last_y = None
-                        self.lost_frames = 0
+                        self._trigger_watchdog_unlock('哈希视觉不一致后强制全局重定位')
                         found = False
 
         # 粗定位回退：低纹理或完全丢失时，先用哈希索引给出廉价候选。

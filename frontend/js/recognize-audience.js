@@ -15,7 +15,7 @@ const RecognizeAudience = (function () {
 
     /* ── 状态 ── */
     var _ready = false;       // WS 已连接
-    var _entered = false;     // 已经 onEnter 过一次
+    var _active = false;      // 当前是否处于观众页
 
     /* 订阅集合：name → { canvas, ctx, lastRender, decoding, fps, fpsTs, fpsCount } */
     var _tiles = {};
@@ -29,7 +29,11 @@ const RecognizeAudience = (function () {
 
     /* ── 连接 WS 并绑定事件（幂等） ── */
     function _ensureWS() {
-        if (_ready) return Promise.resolve();
+        if (TC.wsConnected && TC.wsSocket) {
+            _ready = true;
+            _bindWS();
+            return Promise.resolve();
+        }
         return TC.connectWS().then(function () {
             _ready = true;
             _bindWS();
@@ -39,6 +43,16 @@ const RecognizeAudience = (function () {
     function _bindWS() {
         var sock = TC.wsSocket;
         if (!sock) return;
+        if (sock.__recognizeAudienceBound) return;
+        sock.__recognizeAudienceBound = true;
+
+        sock.on('connect', function () {
+            _ready = true;
+            if (_active) {
+                _rewatchAllChannels();
+                _scheduleList();
+            }
+        });
 
         /* 服务端广播列表更新（展示者上下线、观众数变化） */
         sock.on('broadcast_list', function (data) {
@@ -52,30 +66,12 @@ const RecognizeAudience = (function () {
             _scheduleList();
         });
 
-        /* 收到帧：仅更新正在订阅的 tile */
-        sock.on('broadcast_frame', function (raw) {
-            /* raw 可能是 ArrayBuffer / TypedArray / Blob */
-            var blob;
-            if (raw instanceof Blob) {
-                blob = raw;
-            } else if (raw instanceof ArrayBuffer) {
-                blob = new Blob([raw], { type: 'image/jpeg' });
-            } else if (ArrayBuffer.isView(raw)) {
-                blob = new Blob([raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength)], { type: 'image/jpeg' });
-            } else {
-                return;
-            }
-            /* broadcast_frame 到达时服务端已按 name 路由；
-               但客户端同一 socket 可能订阅多个频道，
-               服务端目前按 viewer sid 定向 emit，
-               所以这里把帧分发给所有活跃 tile（同一观众订阅多频道时各 emit 独立） */
-            /* 实际上服务端直接 to(vsid) emit，
-               所以这里只要更新 "最近一次 emit 对应的 tile" —
-               因为服务端不携带 sender name，前端需要依赖订阅关系：
-               若只订阅一个频道，直接更新；若多频道，逐个尝试 */
-            Object.keys(_tiles).forEach(function (name) {
-                _renderTile(name, blob);
-            });
+        /* 收到帧：服务端显式携带频道名，精确更新对应 tile，避免多频道串台 */
+        sock.on('broadcast_frame', function (packet) {
+            if (!packet || !packet.name) return;
+            var blob = _normalizeFrameBlob(packet.frame);
+            if (!blob) return;
+            _renderTile(packet.name, blob);
         });
 
         sock.on('broadcast_watch_ack', function (ack) {
@@ -210,6 +206,37 @@ const RecognizeAudience = (function () {
         }
     }
 
+    function _rewatchAllChannels() {
+        if (!TC.wsConnected || !TC.wsSocket) return;
+        Object.keys(_tiles).forEach(function (name) {
+            TC.wsSocket.emit('broadcast_watch', { name: name });
+        });
+    }
+
+    function _normalizeFrameBlob(raw) {
+        if (!raw) return null;
+        if (raw instanceof Blob) {
+            return raw;
+        }
+        if (raw instanceof ArrayBuffer) {
+            return new Blob([raw], { type: 'image/jpeg' });
+        }
+        if (ArrayBuffer.isView(raw)) {
+            return new Blob([raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength)], { type: 'image/jpeg' });
+        }
+        return null;
+    }
+
+    function _clearAllTiles(unwatchRemote) {
+        var names = Object.keys(_tiles);
+        names.forEach(function (name) {
+            if (unwatchRemote && TC.wsConnected && TC.wsSocket) {
+                TC.wsSocket.emit('broadcast_unwatch', { name: name });
+            }
+            _removeTile(name);
+        });
+    }
+
     /* ── 渲染帧到 tile ──
        使用 createImageBitmap（硬件解码，比 Image 快，不阻塞主线程）
        节流：若上一帧还在解码则跳过，防止积压 */
@@ -269,21 +296,29 @@ const RecognizeAudience = (function () {
     return {
         /** 切换到观众模式时调用（幂等） */
         onEnter: function () {
-            if (_entered) {
-                /* 已经进入过，只刷新列表 */
+            _active = true;
+            _ensureWS().then(function () {
                 _scheduleList();
-                return;
-            }
-            _entered = true;
+                _rewatchAllChannels();
+            }).catch(function (e) {
+                AppCommon.toast('WS 连接失败：' + e.message, 'danger');
+            });
+        },
+
+        /** 离开观众模式时调用：取消订阅并释放 tile DOM/解码负担 */
+        onLeave: function () {
+            _active = false;
+            _clearAllTiles(true);
+        },
+
+        /** 手动刷新频道列表 */
+        refresh: function () {
             _ensureWS().then(function () {
                 _scheduleList();
             }).catch(function (e) {
                 AppCommon.toast('WS 连接失败：' + e.message, 'danger');
             });
         },
-
-        /** 手动刷新频道列表 */
-        refresh: function () { _scheduleList(); },
     };
 })();
 
