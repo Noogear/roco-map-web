@@ -61,6 +61,12 @@ class CoordSmoother:
 
         # 传送检测候选缓冲
         self._tp_candidate_buffer: deque[tuple[int, int]] = deque(maxlen=10)
+        
+        # === 新增：惯性帧质量监控和自适应衰减 ===
+        # 连续惯性帧计数（用于判断是否应更激进地衰减速度）
+        self._inertial_frame_count: int = 0
+        # 最后一个真实匹配的质量（用于调整速度衰减的激进程度）
+        self._last_real_match_quality: float = 1.0
 
     # ------------------------------------------------------------------
     # 公开主接口
@@ -105,16 +111,36 @@ class CoordSmoother:
         # ② Kalman 平滑
         if not is_inertial:
             smooth_x, smooth_y = self._kalman_update(cx, cy, match_quality)
+            self._last_real_match_quality = match_quality
+            self._inertial_frame_count = 0  # 重置惯性帧计数
         else:
             predicted = self._kalman_predict()
             if predicted is not None:
                 smooth_x, smooth_y = predicted
-                # 惯性帧只做预测不做矫正，避免预测值喂回自身形成自环。
-                # 逐帧衰减速度估计，使惯性外推自然减速到停。
-                self._kalman.statePost[2, 0] *= 0.92
-                self._kalman.statePost[3, 0] *= 0.92
+                self._inertial_frame_count += 1
+                
+                # === 自适应速度衰减：低质量环境更激进 ===
+                # 基础衰减系数（低质量时更激进）
+                # quality=1.0 → 0.88（正常环保守）
+                # quality=0.5 → 0.80（低纹理激保方）
+                # quality=0.2 → 0.75（极低纹理最激进）
+                base_decay = 0.88 - 0.13 * (1.0 - max(0.0, min(1.0, self._last_real_match_quality)))
+                
+                # 连续惯性帧越多，衰减越激进（防止预测过度外推）
+                # 3 帧惯性后开始额外加剧衰减
+                if self._inertial_frame_count > 3:
+                    extra_decay_factor = 0.98 ** (self._inertial_frame_count - 3)
+                    base_decay *= extra_decay_factor
+                
+                # 避免衰减过度（不低于 0.70）
+                base_decay = max(0.70, base_decay)
+                
+                # 应用衰减：速度 *= base_decay
+                self._kalman.statePost[2, 0] *= base_decay
+                self._kalman.statePost[3, 0] *= base_decay
             else:
                 smooth_x, smooth_y = cx, cy
+                self._inertial_frame_count = 0
 
         # ③ 持久化（节流：warmup 完成后最多每 5 秒保存一次，避免每帧 spawn 线程）
         self.smooth_buffer_x.append(smooth_x)
@@ -174,6 +200,9 @@ class CoordSmoother:
         self._display_x = x
         self._display_y = y
         self._tp_candidate_buffer.clear()
+        # 重置惯性帧计数，新传送位置重新建立基线
+        self._inertial_frame_count = 0
+        self._last_real_match_quality = 1.0
 
     def clear_state(self) -> None:
         """清空所有平滑状态（历史/缓冲/Kalman/EMA/传送候选），并删除磁盘持久化文件。"""
@@ -198,6 +227,9 @@ class CoordSmoother:
         self._display_y = None
         self._tp_candidate_buffer.clear()
         self._last_save_time = 0.0
+        # 重置新增的自适应参数
+        self._inertial_frame_count = 0
+        self._last_real_match_quality = 1.0
         if clear_persisted:
             path = self._smooth_buffer_path
             if path:

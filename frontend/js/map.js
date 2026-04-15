@@ -43,6 +43,10 @@ const prefs = AppCommon.loadPrefs();
         playerLerp: { tx: 0, ty: 0, cx: 0, cy: 0, running: false },
         dragMoved: false, isDragging: false,
 
+        /* 玩家箭头方向状态 */
+        playerArrowAngle: 0,
+        playerArrowStopped: true,
+
         TELEPORT_TYPE: '17310030038',
         routeWaypoints: [], routeResult: null,
         boxSelectEl: null, boxStart: null,
@@ -280,6 +284,21 @@ const prefs = AppCommon.loadPrefs();
         A.PLAYER_ARROW.style.transform = 'translate(' + sx + 'px,' + sy + 'px) translate(-50%, -50%)';
     }
 
+    function updateArrowRotation(angle, stopped) {
+        A.playerArrowAngle = angle;
+        A.playerArrowStopped = stopped;
+        /* 更新箭头旋转角度。rotate property 会自动应用 CSS transition */
+        A.PLAYER_ARROW.style.rotate = Math.round(angle) + 'deg';
+        /* 根据停止状态切换箭头形状 */
+        if (stopped) {
+            A.PLAYER_ARROW_POLY.style.display = 'none';
+            A.PLAYER_ARROW_CIRCLE.style.display = '';
+        } else {
+            A.PLAYER_ARROW_POLY.style.display = '';
+            A.PLAYER_ARROW_CIRCLE.style.display = 'none';
+        }
+    }
+
     function playerLerpTick() {
         if (A.isLowPowerMode) {
             A.playerLerp.cx = A.playerLerp.tx;
@@ -304,8 +323,8 @@ const prefs = AppCommon.loadPrefs();
         var sx = x * A.scale + A.offsetX, sy = y * A.scale + A.offsetY;
         A.PLAYER_DOT.style.display = '';
         A.PLAYER_ARROW.style.opacity = '0.95';
-        A.PLAYER_ARROW_POLY.style.display = 'none';
-        A.PLAYER_ARROW_CIRCLE.style.display = '';
+        /* 初始化箭头为停止状态（显示圆形） */
+        updateArrowRotation(A.playerArrowAngle, true);
         var lp = A.playerLerp;
         if (!animate || A.isZooming || A.isLowPowerMode) {
             lp.tx = sx; lp.ty = sy; lp.cx = sx; lp.cy = sy; lp.running = false; applyPlayerPos(sx, sy);
@@ -319,6 +338,7 @@ const prefs = AppCommon.loadPrefs();
         document.getElementById('coordState').textContent = '已定位';
     }
     A.setPlayer = setPlayer;
+    A.updateArrowRotation = updateArrowRotation;
 
     function placePlayerAt(clientX, clientY) {
         var rect = A.MC.getBoundingClientRect();

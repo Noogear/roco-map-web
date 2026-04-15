@@ -245,8 +245,15 @@ class SIFTMapTracker:
         # 上一帧箭头角度
         self._last_arrow_angle = 0.0
         self._last_arrow_stopped = True
-        # 箭头方向系统（纯坐标驱动）
-        self._arrow_dir = ArrowDirectionSystem()
+        # 箭头方向系统（纯坐标驱动，支持小变化防抖 + 大方向敏感）
+        self._arrow_dir = ArrowDirectionSystem(
+            history_size=getattr(config, 'ARROW_POS_HISTORY_LEN', 4),
+            ema_alpha=getattr(config, 'ARROW_ANGLE_SMOOTH_ALPHA', 0.35),
+            stop_speed_px=getattr(config, 'ARROW_MOVE_MIN_DISPLACEMENT', 6),
+            stop_debounce=getattr(config, 'ARROW_STOPPED_DEBOUNCE', 20),
+            small_change_threshold=getattr(config, 'ARROW_SMALL_CHANGE_THRESHOLD', 12.0),
+            big_change_threshold=getattr(config, 'ARROW_BIG_CHANGE_THRESHOLD', 45.0),
+        )
 
         # 线程锁（防止并发请求导致 kp_local / flann 竞态）
         self._lock = Lock()
@@ -605,11 +612,57 @@ class SIFTMapTracker:
                 self._lk.reset()
 
     def sync_external_position(self, x: int, y: int) -> None:
-        """让外部确认后的坐标立即成为引擎新基点。"""
+        """传送后立即重置引擎状态，确保不被旧基点干扰。
+        
+        调用场景：传送确认 → 坐标已由外部验证，立即应用并清理所有旧状态
+        特别清理冻结状态和待恢复提示，避免下一帧被冻结前的信息误导。
+        """
         with self._lock:
+            # === 重置后续追踪基点 ===
             self.last_x = x
             self.last_y = y
             self.lost_frames = 0
+            self.local_fail_count = 0
+            
+            # === 清空冻结相关状态 ===
+            # 传送极有可能跨场景，必须彻底断绝冻结前的任何恢复参考
+            self._frozen = False
+            self._frozen_last_x = None
+            self._frozen_last_y = None
+            self._frozen_local_kp = None
+            self._frozen_local_flann = None
+            self._pending_freeze_resume_hint = None
+            
+            # === 重置活体追踪状态（避免与传送前混混） ===
+            # LK 光流上一帧状态（下一帧前将被重算）
+            self._lk.reset()
+            self.using_local = False  # 从全局模式开始，逐帧建立局部信心
+            
+            # 清空 local 特征快照，后续会根据新坐标重建
+            self.kp_local = None
+            self.des_local = None
+            self.flann_local = None
+            self._local_center = None
+            
+            # === 重置看门狗和重定位状态 ===
+            # Watchdog / 重定位冷却等都应该刷新，给下一帧充分的探索空间
+            self._relocalize_cd = 0
+            self._watchdog_accum_dx = 0.0
+            self._watchdog_accum_dy = 0.0
+            self._watchdog_suspect_streak = 0
+            self._watchdog_last_sift_x = None
+            self._watchdog_last_sift_y = None
+            self._watchdog_consecutive_ok = 0
+            self._watchdog_static_streak = 0
+            self._watchdog_hash_mismatch_streak = 0
+            self._watchdog_cooldown = 0
+            self._watchdog_triggered = False
+            self._force_global_revalidate = False
+            
+            # === 清空缓存 ===
+            self._nearby_flann_cache.clear()
+            
+            # === 最后：建立新的局部追踪基点（从全局特征坐标开始） ===
             self._switch_to_local(x, y)
 
     # ---- 局部/全局搜索切换 ----

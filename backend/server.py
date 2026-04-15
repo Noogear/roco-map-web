@@ -625,8 +625,14 @@ def _apply_runtime_config_updates(updates: dict):
     def _apply_to_tracker(tracker_obj: MapTrackerWeb):
         engine = tracker_obj.sift_engine
         process_lock = getattr(tracker_obj, '_process_lock', None)
+        # 使用带超时的 acquire() 避免无限期阻塞导致 UI 卡顿
+        # 如果后台处理线程正在运行，至多等待 2 秒；超时则跳过此 tracker
+        lock_acquired = False
         if process_lock is not None:
-            process_lock.acquire()
+            lock_acquired = process_lock.acquire(timeout=2.0)
+            if not lock_acquired:
+                print(f"[config] 无法获得后台处理锁（超时），跳过 tracker 配置更新")
+                return  # 跳过此 tracker，避免竞态条件
         try:
             with engine._lock:
                 if 'SEARCH_RADIUS' in updates:
@@ -673,7 +679,7 @@ def _apply_runtime_config_updates(updates: dict):
                         history = list(arrow_dir._history)
                         arrow_dir._history = deque(history[-config.ARROW_POS_HISTORY_LEN:], maxlen=config.ARROW_POS_HISTORY_LEN)
         finally:
-            if process_lock is not None:
+            if lock_acquired and process_lock is not None:
                 process_lock.release()
 
     for ctx in _session_registry.snapshot_contexts():
