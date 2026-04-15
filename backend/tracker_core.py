@@ -213,6 +213,8 @@ class MapTrackerWeb:
         eng._watchdog_hash_mismatch_streak = 0
         eng._watchdog_cooldown = 0
         eng._watchdog_triggered = False
+        if hasattr(eng, '_bridge') and eng._bridge is not None:
+            eng._bridge.reset()
         eng._last_arrow_angle = 0.0
         eng._last_arrow_stopped = True
         eng._arrow_dir._history.clear()

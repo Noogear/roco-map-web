@@ -117,6 +117,13 @@ const FRONTEND_PREFS_META = [
         if (!dock || dock.dataset.dragReady === '1') return;
         dock.dataset.dragReady = '1';
 
+        function updateDockTooltipPlacement() {
+            var rect = dock.getBoundingClientRect();
+            var centerX = rect.left + rect.width / 2;
+            dock.classList.toggle('dock-tooltips-right', centerX < window.innerWidth * 0.5);
+            dock.classList.toggle('dock-tooltips-left', centerX >= window.innerWidth * 0.5);
+        }
+
         if (!dock.querySelector('.app-dock-grip')) {
             var grip = document.createElement('button');
             grip.type = 'button'; grip.className = 'app-dock-grip';
@@ -134,6 +141,7 @@ const FRONTEND_PREFS_META = [
             if (!dragging) return;
             var next = applyDockPosition(dock, { x: event.clientX - dragging.offsetX, y: event.clientY - dragging.offsetY });
             dragging.last = next;
+            updateDockTooltipPlacement();
         }
         function onUp() {
             if (!dragging) return;
@@ -159,10 +167,12 @@ const FRONTEND_PREFS_META = [
         requestAnimationFrame(function () {
             var saved = loadDockPosition();
             applyDockPosition(dock, saved || getDefaultDockPosition(dock));
+            updateDockTooltipPlacement();
         });
         window.addEventListener('resize', debounce(function () {
             persistCurrentPosition();
             applyDockPosition(dock, loadDockPosition() || getDefaultDockPosition(dock));
+            updateDockTooltipPlacement();
         }, 60));
     }
 

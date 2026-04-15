@@ -49,13 +49,30 @@ export const RecognizeRenderer = {
             } else {
                 rx = prev.x + t * jdx; ry = prev.y + t * jdy;
             }
-            return { x: rx, y: ry, angle: curr.angle, stopped: curr.stopped, found: curr.found, isInertial: curr.isInertial, isSceneChange: curr.isSceneChange };
+            
+            // 角度进行平滑插值 (短路径插值)，避免每秒十帧的生硬跳变
+            var prevAngle = prev.angle || 0;
+            var currAngle = curr.angle || 0;
+            var angleDiff = ((currAngle - prevAngle) % 360 + 540) % 360 - 180;
+            var rAngle = (prevAngle + angleDiff * t + 360) % 360;
+
+            return { 
+                x: rx, y: ry, 
+                angle: rAngle, 
+                stopped: curr.stopped, 
+                found: curr.found, 
+                isInertial: curr.isInertial, 
+                isSceneChange: curr.isSceneChange 
+            };
         }
 
-        function drawArrow(ctx, cx, cy, angle, stopped) {
+        function drawArrow(ctx, cx, cy, angle, stopped, isInertial) {
             var size = 12;
             ctx.save(); ctx.translate(cx, cy); ctx.rotate((angle || 0) * Math.PI / 180);
-            ctx.fillStyle = 'rgba(48,182,254,0.86)';
+            
+            // 正常状态为天蓝色，惯性模式(无有效位点)为黄色警告
+            ctx.fillStyle = isInertial ? 'rgba(255,204,0,0.86)' : 'rgba(48,182,254,0.86)';
+            
             if (stopped) {
                 ctx.beginPath(); ctx.arc(0, 0, Math.round(size * 0.6), 0, Math.PI * 2); ctx.fill();
                 ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
@@ -230,6 +247,8 @@ export const RecognizeRenderer = {
             var btn = document.getElementById('renderModeBtn');
             var isFullmap = R.modeStrategy.id === 'fullmap';
             btn.textContent = isFullmap ? '🗺️ 全图' : '📸 JPEG';
+            btn.classList.toggle('is-fullmap', isFullmap);
+            btn.classList.toggle('is-jpeg', !isFullmap);
             btn.title = isFullmap
                 ? '当前：全图模式（目标绘制 ' + R.renderFps + 'fps，无边界）\n点击切换到 JPEG 模式（轻量低流量）'
                 : '当前：JPEG 模式（目标绘制 ' + R.renderFps + 'fps）\n点击切换到全图模式（无边界）';

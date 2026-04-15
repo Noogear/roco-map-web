@@ -70,11 +70,14 @@ const RenderModeJpeg = (function () {
             }
 
             if (ext) {
-                ctx.fillStyle = !ext.found ? '#ff3333' : (ext.isInertial ? '#ffff00' : '#00ff00');
-                ctx.beginPath(); ctx.arc(half, half + 6, 4, 0, Math.PI * 2); ctx.fill();
-                ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
-                ctx.beginPath(); ctx.arc(half, half + 6, 7, 0, Math.PI * 2); ctx.stroke();
-                if (ext.found) drawArrow(ctx, half, half, ext.angle, ext.stopped);
+                if (ext.found) {
+                    drawArrow(ctx, half, half, ext.angle, ext.stopped, ext.isInertial);
+                } else {
+                    ctx.fillStyle = '#ff3333';
+                    ctx.beginPath(); ctx.arc(half, half, 4, 0, Math.PI * 2); ctx.fill();
+                    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+                    ctx.beginPath(); ctx.arc(half, half, 7, 0, Math.PI * 2); ctx.stroke();
+                }
                 if (ext.isSceneChange) {
                     ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(0, 0, V, 24);
                     ctx.fillStyle = '#ffcc44'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';

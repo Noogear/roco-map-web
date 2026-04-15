@@ -187,11 +187,22 @@ button { border: none; cursor: pointer; }
 .app-dock-btn.is-active { outline: 3px solid rgba(255, 255, 255, 0.48); }
 .app-dock-btn span { font-size: 22px; }
 .app-dock-btn small {
-    position: absolute; right: calc(100% + 10px); left: auto; white-space: nowrap;
+    position: absolute; top: 50%; right: calc(100% + 10px); left: auto; white-space: nowrap;
     background: rgba(60, 38, 26, 0.88); color: #fff7ef; padding: 6px 10px; border-radius: 10px;
-    font-size: 12px; opacity: 0; pointer-events: none; transform: translateX(6px); transition: all .16s ease;
+    font-size: 12px; opacity: 0; pointer-events: none; transform: translate(6px, -50%); transition: all .16s ease;
 }
-.app-dock-btn:hover small, .app-dock-btn:focus-visible small { opacity: 1; transform: translateX(0); }
+.app-dock-btn:hover small, .app-dock-btn:focus-visible small { opacity: 1; transform: translate(0, -50%); }
+
+.app-dock.dock-tooltips-right .app-dock-btn small {
+    right: auto;
+    left: calc(100% + 10px);
+    transform: translate(-6px, -50%);
+}
+
+.app-dock.dock-tooltips-right .app-dock-btn:hover small,
+.app-dock.dock-tooltips-right .app-dock-btn:focus-visible small {
+    transform: translate(0, -50%);
+}
 
 /* ─── Toast ─── */
 .app-toast-stack { position: fixed; right: 116px; bottom: 24px; z-index: 300; display: flex; flex-direction: column; gap: 10px; }

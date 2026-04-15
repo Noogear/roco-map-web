@@ -70,9 +70,43 @@ const prefs = AppCommon.loadPrefs();
     function setFlyoutOpen(panel, trigger, open) {
         if (!panel || !trigger) return;
         panel.classList.toggle('is-open', !!open);
+        if (open) positionFlyoutToTrigger(panel, trigger);
         AppCommon.setInteractiveHiddenState(panel, !open);
         trigger.classList.toggle('is-active', !!open);
         trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
+    function positionFlyoutToTrigger(panel, trigger) {
+        if (!panel || !trigger) return;
+
+        var margin = 12;
+        var triggerRect = trigger.getBoundingClientRect();
+
+        panel.style.left = '0px';
+        panel.style.top = '0px';
+        panel.style.right = 'auto';
+
+        var panelRect = panel.getBoundingClientRect();
+        var panelWidth = Math.min(Math.max(panelRect.width || 340, 280), Math.max(280, window.innerWidth - margin * 2));
+
+        panel.style.width = panelWidth + 'px';
+
+        var left = triggerRect.right - panelWidth;
+        left = Math.max(margin, Math.min(left, window.innerWidth - panelWidth - margin));
+
+        var top = triggerRect.bottom + 8;
+        var maxHeightDown = window.innerHeight - top - margin;
+        var maxPanelHeight = Math.max(220, window.innerHeight - margin * 2);
+        var shouldOpenUp = maxHeightDown < 220;
+
+        if (shouldOpenUp) {
+            var desiredTop = triggerRect.top - Math.min(panelRect.height || 420, maxPanelHeight) - 8;
+            top = Math.max(margin, desiredTop);
+        }
+
+        panel.style.left = left + 'px';
+        panel.style.top = top + 'px';
+        panel.style.maxHeight = Math.max(220, window.innerHeight - top - margin) + 'px';
     }
 
     function closeTransientPanels() {
@@ -600,6 +634,13 @@ const prefs = AppCommon.loadPrefs();
         applyCapabilityGuards();
         updateScreenButtons();
 
+        if (settingsPanel && settingsPanel.classList.contains('is-open')) {
+            positionFlyoutToTrigger(settingsPanel, settingsPanelBtn);
+        }
+        if (toolsPanel && toolsPanel.classList.contains('is-open')) {
+            positionFlyoutToTrigger(toolsPanel, toolPanelBtn);
+        }
+
         if (R.resultCanvas && (R.resultCanvas.width < 64 || R.resultCanvas.height < 64)) {
             R.resultCanvas.width = 400;
             R.resultCanvas.height = 400;
@@ -668,6 +709,14 @@ const prefs = AppCommon.loadPrefs();
         var onSettingsBtn = settingsPanelBtn && settingsPanelBtn.contains(target);
         var onToolsBtn = toolPanelBtn && toolPanelBtn.contains(target);
         if (!inSettings && !inTools && !onSettingsBtn && !onToolsBtn) closeTransientPanels();
+    });
+    window.addEventListener('resize', function () {
+        if (settingsPanel && settingsPanel.classList.contains('is-open')) {
+            positionFlyoutToTrigger(settingsPanel, settingsPanelBtn);
+        }
+        if (toolsPanel && toolsPanel.classList.contains('is-open')) {
+            positionFlyoutToTrigger(toolsPanel, toolPanelBtn);
+        }
     });
 
     /* ── 图片上传测试 ── */

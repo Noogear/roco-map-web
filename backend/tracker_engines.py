@@ -24,6 +24,7 @@ from backend.core.features import (CircularMaskCache, create_flann,
 from backend.core.flow import LKTracker
 from backend.core.ecc import ecc_align, phase_correlate
 from backend.core.hash_index import MapHashIndex
+from backend.core.temporal_bridge import LowTextureTemporalBridge, BridgeObservation
 from backend.core.data_standards import DataScope, bind_scope
 from backend.tracking.direction import ArrowDirectionSystem
 
@@ -309,6 +310,17 @@ class SIFTMapTracker:
         self._nearby_flann_cache: OrderedDict = OrderedDict()
         self._nearby_flann_bucket = 200  # 网格粒度（地图像素）
 
+        # 低纹理时序桥接（多假设轨迹）
+        self._bridge = LowTextureTemporalBridge(
+            enabled=getattr(config, 'LOW_TEXTURE_BRIDGE_ENABLED', True),
+            top_k=getattr(config, 'LOW_TEXTURE_BRIDGE_TOP_K', 8),
+            decay=getattr(config, 'LOW_TEXTURE_BRIDGE_DECAY', 0.92),
+            transition_penalty=getattr(config, 'LOW_TEXTURE_BRIDGE_TRANSITION_PENALTY', 0.002),
+            min_obs_quality=getattr(config, 'LOW_TEXTURE_BRIDGE_MIN_OBS_QUALITY', 0.08),
+            strong_source_bonus=getattr(config, 'LOW_TEXTURE_BRIDGE_STRONG_SOURCE_BONUS', 0.12),
+            exit_min_quality=getattr(config, 'LOW_TEXTURE_BRIDGE_EXIT_MIN_QUALITY', 0.55),
+        )
+
         # 惯性导航状态
         self.last_x = None
         self.last_y = None
@@ -340,6 +352,9 @@ class SIFTMapTracker:
 
         # 进入冻结后，活体状态清空，只保留一次性恢复所需快照，避免跨场景脏状态续算。
         self._lk.reset()
+        _bridge = getattr(self, '_bridge', None)
+        if _bridge is not None:
+            _bridge.reset()
         self.last_x = None
         self.last_y = None
         self._switch_to_global()
@@ -405,7 +420,7 @@ class SIFTMapTracker:
 
     def _try_nearby_match_stack(self, kp_mini, des_mini, minimap_gray, hint_x, hint_y,
                                 radius, allow_ecc=True, source_prefix=''):
-        """复用的附近搜索链：SIFT nearby → 可选 ECC。"""
+        """复用的附近搜索链：SIFT nearby → 可选 ECC → Template Matching兜底。"""
         nearby_kp, nearby_des, nearby_flann = self._get_or_build_nearby_flann(hint_x, hint_y, radius)
         if nearby_flann is not None:
             result = sift_match_region(
@@ -427,6 +442,32 @@ class SIFTMapTracker:
             if ecc_result is not None:
                 src = (source_prefix + '_ECC') if source_prefix else 'ECC'
                 return ecc_result[0], ecc_result[1], 0.3, None, src, 0
+
+        # === 模板匹配兜底 (The CPU King for Low Texture) ===
+        # 即使 SIFT 和 ECC 在充满 UI 图标的低纹理区域被干扰而失败，
+        # 截取大图范围的 ROI 利用 TM_CCOEFF_NORMED 进行全局相关性匹配，
+        # 能依靠 95% 的地形纹理压倒性地忽略 5% 图标的影响。
+        try:
+            roi_h = int(minimap_gray.shape[0] * 3.5)
+            roi_w = int(minimap_gray.shape[1] * 3.5)
+            y0 = max(0, int(hint_y - roi_h // 2))
+            y1 = min(self.map_height, int(hint_y + roi_h // 2))
+            x0 = max(0, int(hint_x - roi_w // 2))
+            x1 = min(self.map_width, int(hint_x + roi_w // 2))
+            
+            if (y1 - y0) >= minimap_gray.shape[0] and (x1 - x0) >= minimap_gray.shape[1]:
+                roi_patch = self._logic_map_gray_clahe[y0:y1, x0:x1]
+                res = cv2.matchTemplate(roi_patch, minimap_gray, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                # 设定 0.40 的及格线，对于 CCOEFF_NORMED 来说，能够过滤掉完全随机的情况
+                if max_val > 0.40:
+                    tx = x0 + max_loc[0] + minimap_gray.shape[1] // 2
+                    ty = y0 + max_loc[1] + minimap_gray.shape[0] // 2
+                    if abs(tx - hint_x) + abs(ty - hint_y) < self.JUMP_THRESHOLD * 2:
+                        src = (source_prefix + '_TEMPLATE') if source_prefix else 'TEMPLATE_NEARBY'
+                        return tx, ty, max_val * 0.7, None, src, 0
+        except Exception as e:
+            pass
 
         return None
 
@@ -596,6 +637,7 @@ class SIFTMapTracker:
             self._watchdog_hash_mismatch_streak = 0
             self._watchdog_cooldown = 0
             self._watchdog_triggered = False
+            self._bridge.reset()
 
             self.lost_frames += 1
             if self.using_local:
@@ -658,6 +700,7 @@ class SIFTMapTracker:
             self._watchdog_cooldown = 0
             self._watchdog_triggered = False
             self._force_global_revalidate = False
+            self._bridge.reset()
             
             # === 清空缓存 ===
             self._nearby_flann_cache.clear()
@@ -794,6 +837,96 @@ class SIFTMapTracker:
             '_watchdog_triggered': _watchdog_triggered,
         }
 
+    def _collect_bridge_observations(
+        self,
+        scene: str,
+        minimap_gray_raw: np.ndarray,
+        found: bool,
+        center_x: int | None,
+        center_y: int | None,
+        match_quality: float,
+        source: str,
+    ) -> list[BridgeObservation]:
+        observations: list[BridgeObservation] = []
+
+        if found and center_x is not None and center_y is not None:
+            observations.append(BridgeObservation(
+                x=int(center_x),
+                y=int(center_y),
+                quality=float(max(0.0, match_quality)),
+                source=str(source or 'OBS'),
+            ))
+
+        if scene not in ('ocean', 'low_texture'):
+            return observations
+
+        max_hash_obs = int(getattr(config, 'LOW_TEXTURE_BRIDGE_HASH_CANDIDATES', 4))
+        if max_hash_obs <= 0:
+            return observations
+
+        radius = int(getattr(config, 'LOW_TEXTURE_BRIDGE_HASH_RADIUS', 900))
+        hash_candidates = self._hash_index.locate(
+            minimap_gray_raw,
+            last_x=self.last_x,
+            last_y=self.last_y,
+            radius=radius if self.last_x is not None and self.last_y is not None else 0,
+            max_results=max_hash_obs,
+        )
+        for hx, hy, hdist in hash_candidates:
+            h_quality = max(0.08, 0.35 - hdist * 0.02)
+            observations.append(BridgeObservation(
+                x=int(hx),
+                y=int(hy),
+                quality=float(h_quality),
+                source='HASH_INDEX',
+            ))
+
+        return observations
+
+    def _apply_low_texture_bridge(
+        self,
+        scene: str,
+        minimap_gray_raw: np.ndarray,
+        found: bool,
+        center_x: int | None,
+        center_y: int | None,
+        match_quality: float,
+        source: str,
+        lk_result,
+    ) -> tuple[bool, int | None, int | None, float, str]:
+        observations = self._collect_bridge_observations(
+            scene,
+            minimap_gray_raw,
+            found,
+            center_x,
+            center_y,
+            match_quality,
+            source,
+        )
+
+        motion_hint = (0.0, 0.0)
+        if lk_result is not None:
+            dx_map, dy_map, lk_conf = lk_result
+            if lk_conf >= self._lk.min_conf:
+                motion_hint = (float(dx_map), float(dy_map))
+
+        bridged = self._bridge.step(
+            scene=scene,
+            observations=observations,
+            motion_hint=motion_hint,
+            map_width=self.map_width,
+            map_height=self.map_height,
+        )
+
+        if bridged is None:
+            return found, center_x, center_y, match_quality, source
+
+        should_override = (not found) or (bridged.quality >= match_quality)
+        if not should_override:
+            return found, center_x, center_y, match_quality, source
+
+        return True, bridged.x, bridged.y, float(bridged.quality), bridged.source
+
     # ---- 核心匹配 ----
     def match(self, minimap_bgr):
         with self._lock:
@@ -874,11 +1007,11 @@ class SIFTMapTracker:
 
             # 动态匹配参数：按场景分类路由
             if scene == 'ocean':
-                eff_match_ratio = 0.88
-                eff_min_match = 3
+                eff_match_ratio = 0.82
+                eff_min_match = max(8, getattr(config, 'SIFT_MIN_MATCH_COUNT', 4) * 2) # 极其严格
             elif scene == 'low_texture':
-                eff_match_ratio = 0.86
-                eff_min_match = 3
+                eff_match_ratio = 0.84
+                eff_min_match = max(6, getattr(config, 'SIFT_MIN_MATCH_COUNT', 4) * 2) # 严格
             else:
                 eff_match_ratio = config.SIFT_MATCH_RATIO  # 0.82
                 eff_min_match = config.SIFT_MIN_MATCH_COUNT
@@ -910,6 +1043,10 @@ class SIFTMapTracker:
                         current_kp, current_flann = self.kp_big_all, self.flann_global
                     else:
                         if not self.using_local:
+                            break
+                        if scene in ('ocean', 'low_texture'):
+                            # 纯色区域绝对禁止回退到全图盲搜，必定找错！
+                            # 直接 break，交给接下来的 Template Matching 或航迹推算兜底
                             break
                         current_kp, current_flann = self.kp_big_all, self.flann_global
 
@@ -1038,97 +1175,115 @@ class SIFTMapTracker:
                         self.JUMP_THRESHOLD, _sat_ecc_min)
                     if _ecc_sat is not None:
                         found, center_x, center_y = True, _ecc_sat[0], _ecc_sat[1]
-                        match_quality = 0.25
-                        source = 'ECC_SAT'
-        # 看门狗：用 LK 累积位移检测“SIFT 卡在错位置但看起来还活着”的局部死锁。
-        _wd_min_move = getattr(config, 'WATCHDOG_LK_MIN_MOVE', 60)
+        # =========================================================
+        # 🐶 看门狗异常检测系统 (Watchdog) - 帧差法重用重设版本
+        # 职责：检测“游戏画面在滚动，但识别坐标死死卡住”的明确死锁状态
+        # 特性：抛弃脆弱且易漏的 LK 位移累加，采用绝对强硬的中心画面 MAD (像素差) 确认法
+        # =========================================================
+        _wd_is_sift_source = source in ('SIFT_LOCAL', 'SIFT_GLOBAL', 'SIFT_GLOBAL_REVALIDATED')
         _wd_limit = getattr(config, 'WATCHDOG_SUSPECT_LIMIT', 3)
+        _hash_limit = int(getattr(config, 'WATCHDOG_HASH_MISMATCH_LIMIT', _wd_limit * 2))
+
         if run_sift:
-            _accum_dist = abs(self._watchdog_accum_dx) + abs(self._watchdog_accum_dy)
-            _wd_sift_src = source in ('SIFT_LOCAL', 'SIFT_GLOBAL', 'SIFT_GLOBAL_REVALIDATED')
-            _wd_on_cooldown = self._watchdog_cooldown > 0
-            if _wd_on_cooldown:
-                if found and not is_inertial and _wd_sift_src:
+            if self._watchdog_cooldown > 0:
+                # 冷却中，仅保持同步基准
+                if found and not is_inertial and _wd_is_sift_source:
                     self._watchdog_last_sift_x = center_x
                     self._watchdog_last_sift_y = center_y
+                    self._watchdog_anchor_gray = minimap_gray_raw.copy()
                 self._watchdog_suspect_streak = 0
                 self._watchdog_hash_mismatch_streak = 0
-                self._watchdog_consecutive_ok = 0
                 self._watchdog_static_streak = 0
-            elif found and not is_inertial and _wd_sift_src and self._watchdog_last_sift_x is not None:
-                if _accum_dist > _wd_min_move:
-                    _sift_moved = (abs(center_x - self._watchdog_last_sift_x)
-                                   + abs(center_y - self._watchdog_last_sift_y))
-                    if _sift_moved < _wd_min_move * 0.35:
-                        # 玩家移动但 SIFT 原地不动 → 可疑
-                        self._watchdog_suspect_streak += 1
-                        self._watchdog_consecutive_ok = 0
-                        self._watchdog_static_streak = 0
-                        print(f"[看门狗] 可疑帧 #{self._watchdog_suspect_streak}: "
-                              f"LK累积={_accum_dist:.0f}px, SIFT位移={_sift_moved:.0f}px")
-                        if self._watchdog_suspect_streak >= _wd_limit:
-                            print(f"[看门狗] 死锁解除! 连续{self._watchdog_suspect_streak}次不一致 "
-                                  f"→ 清空基点+切全局重定位")
-                            self._trigger_watchdog_unlock('死锁解除后强制全局重定位')
-                            found = False
-                    else:
-                        # SIFT 位移正常；需连续多帧正常才清除可疑计数（防 ABAB 交替绕过）
-                        self._watchdog_consecutive_ok += 1
-                        self._watchdog_static_streak = 0
-                        if self._watchdog_consecutive_ok >= 3:
-                            self._watchdog_suspect_streak = 0
-                        self._watchdog_last_sift_x = center_x
-                        self._watchdog_last_sift_y = center_y
-                else:
-                    # LK 累积不足（玩家静止/慢走），更新基准点并计数静止帧
+            
+            elif found and not is_inertial and _wd_is_sift_source:
+                if self._watchdog_last_sift_x is None or not hasattr(self, '_watchdog_anchor_gray'):
+                    # 舒适初始化第一帧基准
                     self._watchdog_last_sift_x = center_x
                     self._watchdog_last_sift_y = center_y
-                    self._watchdog_static_streak += 1
-                    _wd_static_limit = getattr(config, 'WATCHDOG_STATIC_LIMIT', 8)
-                    if self._watchdog_static_streak >= _wd_static_limit:
-                        self._force_global_revalidate = True
-                        self._force_global_revalidate_frame = self._lk.frame_num
+                    self._watchdog_anchor_gray = minimap_gray_raw.copy()
+                else:
+                    _sift_moved = abs(center_x - self._watchdog_last_sift_x) + abs(center_y - self._watchdog_last_sift_y)
+                    
+                    if _sift_moved < 15:
+                        self._watchdog_suspect_streak += 1
+                        
+                        # SIFT 连续几帧卡在同一个极小的坐标内
+                        if self._watchdog_suspect_streak >= _wd_limit:
+                            # 终极拷问：既然坐标没变，那游戏小地图内的画面到底动没动？
+                            # 提取中心 160x160 区域计算像素平差 (MAD)
+                            h_mm, w_mm = minimap_gray_raw.shape[:2]
+                            ch, cw = h_mm // 2, w_mm // 2
+                            p = 80
+                            
+                            # 防御性保护：确保不会越界
+                            if ch - p >= 0 and cw - p >= 0 and ch + p <= h_mm and cw + p <= w_mm:
+                                roi_now = minimap_gray_raw[ch-p:ch+p, cw-p:cw+p]
+                                roi_old = self._watchdog_anchor_gray[ch-p:ch+p, cw-p:cw+p]
+                                mad = float(np.mean(cv2.absdiff(roi_now, roi_old)))
+                            else:
+                                mad = 0.0 # 异常小地图时不触发死锁
+
+                            if mad > 18.0:
+                                # 实锤死锁：画面变化极大（玩家在动）但 SIFT 坐标卡死
+                                print(f"[看门狗-死锁确诊] 画面剧烈波动(MAD={mad:.1f}) 但 SIFT 坐标卡死在({center_x},{center_y})!")
+                                self._trigger_watchdog_unlock('基于全图真差的死锁确诊强制解绑')
+                                found = False
+                                self._watchdog_suspect_streak = 0
+                            else:
+                                # 玩家真正挂机静止：MAD 极低，证明此时不需要移动，SIFT 卡着是对的
+                                self._watchdog_static_streak += 1
+                                _wd_static_limit = getattr(config, 'WATCHDOG_STATIC_LIMIT', 8)
+                                if self._watchdog_static_streak >= _wd_static_limit:
+                                    self._force_global_revalidate = True
+                                    self._force_global_revalidate_frame = self._lk.frame_num
+                                    self._watchdog_static_streak = 0
+                                    # 定期更新基准，防止极缓慢的环境变化积累成假性变化
+                                    self._watchdog_anchor_gray = minimap_gray_raw.copy()
+                                    self._watchdog_last_sift_x = center_x
+                                    self._watchdog_last_sift_y = center_y
+                    else:
+                        # 识别结果产生了实际位移，打破死锁循环，重置锚点
+                        self._watchdog_suspect_streak = 0
                         self._watchdog_static_streak = 0
-            elif not _wd_on_cooldown and found and not is_inertial and _wd_sift_src:
-                # 首次 SIFT 命中：初始化看门狗基准点
-                self._watchdog_last_sift_x = center_x
-                self._watchdog_last_sift_y = center_y
-            # 每个 SIFT 帧结束后重置 LK 累积（不论本帧是否命中）
+                        self._watchdog_last_sift_x = center_x
+                        self._watchdog_last_sift_y = center_y
+                        self._watchdog_anchor_gray = minimap_gray_raw.copy()
+
+                    # =========================================================
+                    # 当处于移动时再检查哈希。防止静止且弹出全屏 UI 导致哈希崩坏触发误解。
+                    # =========================================================
+                    _hash_min_quality = float(getattr(config, 'WATCHDOG_HASH_MIN_MATCH_QUALITY', 0.55))
+                    _hash_min_matches = int(getattr(config, 'WATCHDOG_HASH_MIN_MATCH_COUNT', 6))
+                    
+                    if match_quality >= _hash_min_quality and match_count >= _hash_min_matches:
+                        if _sift_moved >= 15 or self._watchdog_suspect_streak == 0:
+                            _hash_radius = int(getattr(config, 'WATCHDOG_HASH_CHECK_RADIUS', 320))
+                            _hash_margin = int(getattr(config, 'WATCHDOG_HASH_HAMMING_MARGIN', 6))
+                            consistent, best_dist, _ = self._hash_index.check_consistency_details(
+                                minimap_gray_raw, center_x, center_y, check_radius=_hash_radius)
+                            
+                            if consistent:
+                                self._watchdog_hash_mismatch_streak = 0
+                            else:
+                                _thresh = int(getattr(self._hash_index, '_hamming_thresh', 12))
+                                _effective_dist = best_dist if best_dist is not None else (_thresh + _hash_margin + 1)
+                                if _effective_dist > _thresh + _hash_margin:
+                                    self._watchdog_hash_mismatch_streak += 1
+                                    if self._watchdog_hash_mismatch_streak >= _hash_limit:
+                                        print(f'[看门狗-哈希幻觉] 视觉不一致确诊! dist={_effective_dist}, streak={self._watchdog_hash_mismatch_streak}')
+                                        self._trigger_watchdog_unlock('移动中检测到哈希极度偏离产生幻觉')
+                                        found = False
+                                else:
+                                    self._watchdog_hash_mismatch_streak = 0
+                        else:
+                            self._watchdog_hash_mismatch_streak = 0
+
+            # 每个周期清理无用的 LK 历史，防止副作用累积
             self._watchdog_accum_dx = 0.0
             self._watchdog_accum_dy = 0.0
 
-            # 哈希校验补充“视觉内容与当前位置是否匹配”这条证据链。
-            if (not _wd_on_cooldown and found and not is_inertial
-                    and _wd_sift_src and center_x is not None):
-                _hash_min_quality = float(getattr(config, 'WATCHDOG_HASH_MIN_MATCH_QUALITY', 0.55))
-                _hash_min_matches = int(getattr(config, 'WATCHDOG_HASH_MIN_MATCH_COUNT', 6))
-                if match_quality < _hash_min_quality or match_count < _hash_min_matches:
-                    # 低可信测量不参与哈希看门狗计数，避免把“本来就不可靠”的 SIFT 结果继续放大。
-                    self._watchdog_hash_mismatch_streak = 0
-                else:
-                    _hash_radius = int(getattr(config, 'WATCHDOG_HASH_CHECK_RADIUS', 320))
-                    _hash_margin = int(getattr(config, 'WATCHDOG_HASH_HAMMING_MARGIN', 6))
-                    _hash_limit = int(getattr(config, 'WATCHDOG_HASH_MISMATCH_LIMIT', _wd_limit * 2))
-                    consistent, best_dist, _cand_count = self._hash_index.check_consistency_details(
-                        minimap_gray_raw, center_x, center_y, check_radius=_hash_radius)
-                    if consistent:
-                        self._watchdog_hash_mismatch_streak = 0
-                    else:
-                        # “边缘不一致”先不累计，只有明显超阈值才计入触发计数
-                        _thresh = int(getattr(self._hash_index, '_hamming_thresh', 12))
-                        _effective_dist = best_dist if best_dist is not None else (_thresh + _hash_margin + 1)
-                        if _effective_dist <= _thresh + _hash_margin:
-                            self._watchdog_hash_mismatch_streak = 0
-                        else:
-                            self._watchdog_hash_mismatch_streak += 1
-                            if self._watchdog_hash_mismatch_streak >= _hash_limit:
-                                print(f'[看门狗-哈希] 视觉不一致触发解锁! '
-                                      f'SIFT报告({center_x},{center_y})与哈希索引不匹配 '
-                                      f'(dist={_effective_dist}, streak={self._watchdog_hash_mismatch_streak}/{_hash_limit})')
-                                self._trigger_watchdog_unlock('哈希视觉不一致后强制全局重定位')
-                                found = False
-
-        # 粗定位回退：低纹理或完全丢失时，先用哈希索引给出廉价候选。
+        # =========================================================
+        # 粗定位回退...
         _semi_lost = (self.last_x is not None and self.lost_frames >= 8
                       and scene in ('ocean', 'low_texture'))
         _fully_lost = (self.last_x is None)
@@ -1152,6 +1307,14 @@ class SIFTMapTracker:
                 self._relocalize_cd = 40
             else:
                 self._relocalize_cd = 15
+
+        # 低纹理时序桥接：融合弱观测 + 运动先验，避免逐帧贪心导致错误吸附。
+        found, center_x, center_y, match_quality, source = self._apply_low_texture_bridge(
+            scene, minimap_gray_raw,
+            found, center_x, center_y,
+            match_quality, source,
+            lk_result,
+        )
 
         # 更新 LK 上一帧（不论用哪层跟踪，都更新灰度图）
         self._lk.prev_gray = minimap_gray.copy()
@@ -1183,12 +1346,28 @@ class SIFTMapTracker:
                     self._switch_to_global()
                     self._nearby_flann_cache.clear()  # 切全局时清缓存
             if self.last_x is not None and self.lost_frames <= config.MAX_LOST_FRAMES:
-                found, center_x, center_y = True, self.last_x, self.last_y
+                found = True
                 is_inertial = True
+                
+                # 在纯色区如果因 UI 干扰或无特征导致失焦，强制引入基于 Arrow 箭头的航迹推算 (Dead Reckoning)
+                if scene in ('ocean', 'low_texture') and not self._arrow_dir._is_stopped:
+                    rad = math.radians(self._arrow_dir._last_angle)
+                    speed = 4.0  # 游戏默认推算步幅 (pixels per frame)
+                    dx = speed * math.sin(rad)
+                    dy = -speed * math.cos(rad)
+                    center_x = int(round(self.last_x + dx))
+                    center_y = int(round(self.last_y + dy))
+                    
+                    # 为了允许长途越野不断，如果一直在用推算，冻结丢帧计数
+                    # 防止因为一直提取不出 SIFT 特征而触发清空
+                    self.lost_frames = max(1, self.lost_frames - 1)
+                else:
+                    center_x, center_y = self.last_x, self.last_y
             elif self.lost_frames > config.MAX_LOST_FRAMES:
                 self.last_x = self.last_y = None
                 self._lk.prev_gray = None
                 self._lk.prev_pts = None
+                self._bridge.reset()
                 if self.using_local:
                     self._switch_to_global()
 

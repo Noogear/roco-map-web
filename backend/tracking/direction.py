@@ -19,37 +19,35 @@ def _angular_diff(a: float, b: float) -> float:
 
 class ArrowDirectionSystem:
     """
-    基于位置历史估计移动方向，返回 (angle_deg, is_stopped)。
+    纯坐标驱动的方向系统。
 
-    防抖策略：
-    1. 停止检测：速度 < stop_speed_px 时递增 streak，达到 stop_debounce 后标记为停止
-    2. 大方向防抖：角度变化 < small_change_threshold 时抑制输出，保持上次方向
-    3. 大方向敏感：角度变化 >= big_change_threshold 时立即切换，不平滑
-    4. 中等变化：使用 EMA 平滑指数衰减平均
-    
-    这样既能防止小摇晃导致的敏感抖动，又对大方向偏转保持敏锐反应。
+    核心思路:
+      - 每帧接收地图坐标，根据坐标历史累积位移的方向计算箭头朝向
+      - 多帧累积位移 + EMA 平滑，过滤单帧抖动
+      - 瞬间反向转向时快速跟随（角度差超阈值则跳过平滑直接赋值）
+      - 静止不动时标记 is_stopped，前端渲染为圆点
     """
 
     def __init__(
         self,
-        history_size: int = 8,
-        ema_alpha: float = 0.3,
-        stop_speed_px: float = 2.0,
-        stop_debounce: int = 6,
-        small_change_threshold: float = 12.0,
-        big_change_threshold: float = 45.0,
+        history_size: int = 4,
+        ema_alpha: float = 0.35,
+        stop_speed_px: float = 6.0,
+        stop_debounce: int = 20,
+        small_change_threshold: float = 12.0,  # 兼容旧参数名
+        big_change_threshold: float = 90.0,
     ) -> None:
         self._history: deque[tuple[int, int]] = deque(maxlen=history_size)
+        
         self._ema_alpha = ema_alpha
-        self._stop_speed_px = stop_speed_px
+        self._move_threshold = stop_speed_px
         self._stop_debounce = stop_debounce
-        self._small_change_threshold = small_change_threshold
-        self._big_change_threshold = big_change_threshold
+        self._snap_threshold = big_change_threshold
 
         self._last_angle: float = 0.0
+        self._ema_angle: float | None = None
         self._is_stopped: bool = True
-        self._stop_streak: int = 0
-        self._suppressed_angle: float | None = None  # 被抑制的角度候选，用于累积大变化
+        self._low_move_streak: int = 0
 
     # ------------------------------------------------------------------
     def update(
@@ -69,38 +67,34 @@ class ArrowDirectionSystem:
         if len(self._history) < 2:
             return self._last_angle, self._is_stopped
 
-        # 用最近两点估计即时速度
-        (px, py), (cx, cy) = self._history[-2], self._history[-1]
-        dx, dy = cx - px, cy - py
-        speed = math.sqrt(dx * dx + dy * dy)
+        # 累积位移：最旧帧 → 当前帧
+        old_x, old_y = self._history[0]
+        cum_dx = map_x - old_x
+        cum_dy = map_y - old_y
+        cum_dist = math.sqrt(cum_dx * cum_dx + cum_dy * cum_dy)
 
-        if speed < self._stop_speed_px:
-            self._stop_streak += 1
+        if cum_dist < self._move_threshold:
+            # 低位移，累加静止计数
+            self._low_move_streak += 1
+            if self._low_move_streak >= self._stop_debounce:
+                self._is_stopped = True
+            return self._last_angle, self._is_stopped
+
+        # 有效移动 → 重置静止计数
+        self._low_move_streak = 0
+        self._is_stopped = False
+
+        raw_angle = math.degrees(math.atan2(cum_dx, -cum_dy)) % 360
+
+        # 平滑 or 急转快跳
+        if self._ema_angle is None:
+            self._ema_angle = raw_angle
         else:
-            self._stop_streak = 0
-
-        is_stopped = self._stop_streak >= self._stop_debounce
-        
-        if not is_stopped:
-            raw_angle = math.degrees(math.atan2(dx, -dy)) % 360
-            diff = abs(_angular_diff(raw_angle, self._last_angle))
-            
-            # 大方向敏感：差异 >= big_change_threshold 时立即切换
-            if diff >= self._big_change_threshold:
-                self._last_angle = raw_angle
-                self._suppressed_angle = None
-            # 小变化防抖：差异 < small_change_threshold 时抑制更新
-            elif diff < self._small_change_threshold:
-                # 抑制更新，但记录候选角度用于检测是否会累积到大变化
-                self._suppressed_angle = raw_angle
-                # 保持 _last_angle 不变
-            # 中等变化：使用 EMA 平滑
+            diff = _angular_diff(raw_angle, self._ema_angle)
+            if abs(diff) >= self._snap_threshold:
+                self._ema_angle = raw_angle
             else:
-                d = _angular_diff(raw_angle, self._last_angle)
-                self._last_angle = (self._last_angle + self._ema_alpha * d) % 360
-                self._suppressed_angle = None
-        else:
-            self._suppressed_angle = None
+                self._ema_angle = (self._ema_angle + self._ema_alpha * diff) % 360
 
-        self._is_stopped = is_stopped
-        return self._last_angle, is_stopped
+        self._last_angle = self._ema_angle
+        return self._last_angle, self._is_stopped

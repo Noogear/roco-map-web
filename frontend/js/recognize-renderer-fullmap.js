@@ -257,11 +257,7 @@ const RenderModeFullmap = (function () {
             /* ── 玩家指示器 ── */
             var lx = Math.round(pos.x - sx), ly = Math.round(pos.y - sy);
             if (hasTrackPos) {
-                ctx.fillStyle = pos.isInertial ? '#ffff00' : '#00ff00';
-                ctx.beginPath(); ctx.arc(lx, ly + 6, 4, 0, Math.PI * 2); ctx.fill();
-                ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
-                ctx.beginPath(); ctx.arc(lx, ly + 6, 7, 0, Math.PI * 2); ctx.stroke();
-                drawArrow(ctx, lx, ly, pos.angle, pos.stopped);
+                drawArrow(ctx, lx, ly, pos.angle, pos.stopped, pos.isInertial);
             } else {
                 ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(0, 0, V, 24);
                 ctx.fillStyle = '#ffd27a'; ctx.font = '12px sans-serif'; ctx.textAlign = 'left';

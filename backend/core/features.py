@@ -86,9 +86,9 @@ def extract_minimap_features(
     texture_std: float | None = None,
     inner_ratio: float | None = None,
 ) -> tuple[list | None, np.ndarray | None]:
-    """提取小地图特征（带圆形掩码）。返回 (kp, des) 或 (None, None)。
+    """提取小地图特征（带圆形掩码及纯色区动态 UI 剔除）。返回 (kp, des) 或 (None, None)。
 
-    texture_std: 当提供时，按场景分类（ocean/low_texture/mixed/urban）自动选择挖空比例。
+    texture_std: 当提供时，按场景分类（ocean/low_texture/mixed/urban）自动选择挖空比例，并决定是否启动动态 UI 掩码。
     inner_ratio:  直接指定挖空比例，覆盖 config 及 texture_std 逻辑（多用于测试）。
     """
     h, w = minimap_gray.shape[:2]
@@ -105,7 +105,22 @@ def extract_minimap_features(
                 inner_ratio = r_urban
         else:
             inner_ratio = r_urban
-    mask = mask_cache.get(h, w, inner_ratio=inner_ratio)
+            
+    # 获取基础几何掩码（排除中心人物箭头以及外圈黑边）
+    mask = mask_cache.get(h, w, inner_ratio=inner_ratio).copy()
+    
+    # 动态 UI 掩码过滤：在草地/水域等极低纹理区域，强行剔除 UI 图标
+    # 避免突兀的资源图标被 SIFT 视作最强“特征对”导致坐标漂移。
+    if texture_std is not None and texture_std < 35:
+        median_val = float(np.median(minimap_gray))
+        diff = cv2.absdiff(minimap_gray, median_val)
+        # 偏离背景中线超 45 的像素视为覆盖层 UI
+        _, ui_mask = cv2.threshold(diff, 45, 255, cv2.THRESH_BINARY)
+        # 膨胀处理，吃掉图标的光晕与半透明抗锯齿边缘
+        ui_mask = cv2.dilate(ui_mask, np.ones((5, 5), np.uint8), iterations=2)
+        # 挖出黑洞
+        cv2.bitwise_and(mask, cv2.bitwise_not(ui_mask), dst=mask)
+
     kp, des = sift.detectAndCompute(minimap_gray, mask)
     if des is None or len(kp) < 2:
         return None, None
