@@ -46,6 +46,7 @@ const prefs = AppCommon.loadPrefs();
         TELEPORT_TYPE: '17310030038',
         routeWaypoints: [], routeResult: null,
         boxSelectEl: null, boxStart: null,
+        isLowPowerMode: !!(typeof document !== 'undefined' && document.hidden),
     };
 
     function getViewportOcclusionInsets() {
@@ -280,6 +281,13 @@ const prefs = AppCommon.loadPrefs();
     }
 
     function playerLerpTick() {
+        if (A.isLowPowerMode) {
+            A.playerLerp.cx = A.playerLerp.tx;
+            A.playerLerp.cy = A.playerLerp.ty;
+            applyPlayerPos(A.playerLerp.cx, A.playerLerp.cy);
+            A.playerLerp.running = false;
+            return;
+        }
         var lp = A.playerLerp, dx = lp.tx - lp.cx, dy = lp.ty - lp.cy;
         if (Math.abs(dx) < 0.3 && Math.abs(dy) < 0.3) {
             lp.cx = lp.tx; lp.cy = lp.ty; applyPlayerPos(lp.cx, lp.cy); lp.running = false; return;
@@ -299,7 +307,7 @@ const prefs = AppCommon.loadPrefs();
         A.PLAYER_ARROW_POLY.style.display = 'none';
         A.PLAYER_ARROW_CIRCLE.style.display = '';
         var lp = A.playerLerp;
-        if (!animate || A.isZooming) {
+        if (!animate || A.isZooming || A.isLowPowerMode) {
             lp.tx = sx; lp.ty = sy; lp.cx = sx; lp.cy = sy; lp.running = false; applyPlayerPos(sx, sy);
         } else {
             if (lp.cx === 0 && lp.cy === 0) { lp.cx = sx; lp.cy = sy; }
@@ -763,6 +771,29 @@ const prefs = AppCommon.loadPrefs();
         markMapUiReady();
     }
 
+    function applyMapPowerMode(lowPower) {
+        var next = !!lowPower;
+        if (A.isLowPowerMode === next) return;
+        A.isLowPowerMode = next;
+
+        if (next) {
+            stopViewportAnimation();
+            A.playerLerp.running = false;
+            if (A.stopRippleAnim) A.stopRippleAnim();
+            if (A.stopNavAnim) A.stopNavAnim();
+            if (A.cancelMapBackgroundWork) A.cancelMapBackgroundWork();
+            if (A.syncRoutePowerMode) A.syncRoutePowerMode(true);
+            return;
+        }
+
+        if (A.syncMapPowerMode) A.syncMapPowerMode(false);
+        if (A.syncRoutePowerMode) A.syncRoutePowerMode(false);
+        if (A.latestX != null && A.latestY != null) A.setPlayer(A.latestX, A.latestY, false);
+        if (A.requestMarkerRender) A.requestMarkerRender();
+        if (A.scheduleVisibleChunkSync) A.scheduleVisibleChunkSync(true);
+    }
+    A.applyMapPowerMode = applyMapPowerMode;
+
     /* ── Boot ── */
     window.addEventListener('beforeunload', function () {
         A.playerLerp.running = false;
@@ -774,7 +805,12 @@ const prefs = AppCommon.loadPrefs();
         rafPasses: 2,
         onResume: function () {
             restoreMapPageAfterHistoryNavigation();
+            applyMapPowerMode(false);
         }
+    });
+
+    document.addEventListener('visibilitychange', function () {
+        applyMapPowerMode(document.hidden);
     });
 
     bindMapEvents();

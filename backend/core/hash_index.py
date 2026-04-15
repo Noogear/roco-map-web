@@ -219,10 +219,31 @@ class MapHashIndex:
 
         用于辅助看门狗：若返回 False，说明视觉内容与当前认为的位置不匹配。
         """
-        if len(self._hashes) == 0:
-            return True  # 无索引时不阻断
+        consistent, _, _ = self.check_consistency_details(
+            minimap_gray=minimap_gray,
+            expected_x=expected_x,
+            expected_y=expected_y,
+            check_radius=check_radius,
+        )
+        return consistent
 
-        query_patch, _ = _prepare_query_patch(minimap_gray, self._patch_size)
+    # ------------------------------------------------------------------
+    def check_consistency_details(
+        self,
+        minimap_gray: np.ndarray,
+        expected_x: int,
+        expected_y: int,
+        check_radius: int = 0,
+    ) -> tuple[bool, int | None, int]:
+        """一致性细节版本。
+
+        Returns:
+            (consistent, best_distance, evaluated_count)
+        """
+        if len(self._hashes) == 0:
+            return True, None, 0  # 无索引时不阻断
+
+        query_patch, query_mean = _prepare_query_patch(minimap_gray, self._patch_size)
         query_hash = _phash64(query_patch)
 
         r = check_radius or self._step * 3
@@ -230,13 +251,26 @@ class MapHashIndex:
                 (np.abs(self._ys - expected_y) < r))
         indices = np.where(mask)[0]
         if len(indices) == 0:
-            return True  # 附近无索引条目
+            return True, None, 0  # 附近无索引条目
+
+        # 与 locate 同步：先按亮度均值做粗过滤，避免明显不可能候选干扰距离判断。
+        color_thresh = getattr(config, 'HASH_INDEX_COLOR_THRESH', 50)
+        local_means = self._means[indices]
+        mean_mask = np.abs(local_means - query_mean) < color_thresh
+        if np.any(mean_mask):
+            indices = indices[mean_mask]
+
+        if len(indices) == 0:
+            return True, None, 0
 
         candidate_hashes = self._hashes[indices]
         dists = _compute_hamming_distances(candidate_hashes, query_hash)
+        best = int(np.min(dists)) if len(dists) > 0 else None
+        if best is None:
+            return True, None, 0
 
         # 最近邻的距离 ≤ 阈值则一致
-        return int(np.min(dists)) <= self._hamming_thresh
+        return best <= self._hamming_thresh, best, int(len(dists))
 
 
 # popcount 查找表（256 字节）

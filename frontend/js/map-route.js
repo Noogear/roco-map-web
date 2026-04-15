@@ -947,16 +947,26 @@ export const MapRoute = {
         }
 
         function startNavAnim() {
+            if (A.isLowPowerMode) return;
             if (navAnimId !== null) return;
             var lastRender = 0;
             (function loop(ts) {
                 if (!routeNavMode) { navAnimId = null; return; }
+                if (A.isLowPowerMode) { navAnimId = null; return; }
                 /* throttle to ~30fps to avoid pointless full canvas redraws */
                 if (ts - lastRender > 33) { A.requestMarkerRender(); lastRender = ts; }
                 navAnimId = requestAnimationFrame(loop);
             })(0);
         }
         function stopNavAnim() { if (navAnimId !== null) { cancelAnimationFrame(navAnimId); navAnimId = null; } }
+        A.stopNavAnim = stopNavAnim;
+        A.syncRoutePowerMode = function (isLowPower) {
+            if (isLowPower) {
+                stopNavAnim();
+                return;
+            }
+            if (routeNavMode) startNavAnim();
+        };
 
         function checkNavProgress(px, py) {
             if (!routeNavMode || !navOrder.length) return;

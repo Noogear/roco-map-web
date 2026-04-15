@@ -368,7 +368,11 @@ const prefs = AppCommon.loadPrefs();
 
     function runScreenAutoLoop() {
         if (!screenAutoRunning || TC.mode !== 'screen') return;
-        if (!document.hidden) captureAndSendScreenFrame();
+        if (!document.hidden || R.pipRAFActive) captureAndSendScreenFrame();
+        if (document.hidden && R.pipRAFActive) {
+            screenAutoId = setTimeout(runScreenAutoLoop, SCREEN_INTERVAL_MS);
+            return;
+        }
         screenAutoId = setTimeout(function () { requestAnimationFrame(runScreenAutoLoop); }, SCREEN_INTERVAL_MS);
     }
 

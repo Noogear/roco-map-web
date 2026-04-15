@@ -74,6 +74,7 @@ export const RecognizeRenderer = {
         R.renderFps = Math.max(10, Math.min(60, parseInt(R.renderFps, 10) || 60));
         R.renderIntervalMs = 1000 / R.renderFps;
         R.lastRenderAt = 0;
+        R.pipKeepAliveTimer = null;
 
         R.setRenderFps = function (fps) {
             R.renderFps = Math.max(10, Math.min(60, parseInt(fps, 10) || 60));
@@ -89,6 +90,45 @@ export const RecognizeRenderer = {
             R.modeStrategy.render(ctx, R, ext, drawArrow);
         };
 
+        function stopPiPKeepAlive() {
+            if (R.pipKeepAliveTimer) {
+                clearTimeout(R.pipKeepAliveTimer);
+                R.pipKeepAliveTimer = null;
+            }
+        }
+
+        function schedulePiPKeepAlive() {
+            if (!R.pipRAFActive) {
+                stopPiPKeepAlive();
+                return;
+            }
+            if (!document.hidden) {
+                stopPiPKeepAlive();
+                return;
+            }
+            if (R.pipKeepAliveTimer) return;
+
+            function tick() {
+                R.pipKeepAliveTimer = null;
+                if (!R.pipRAFActive || !document.hidden) return;
+                try { R.renderMapCanvas(); } catch (e) { console.error(e); }
+                schedulePiPKeepAlive();
+            }
+
+            R.pipKeepAliveTimer = setTimeout(tick, Math.max(16, Math.round(R.renderIntervalMs)));
+        }
+
+        if (!R.pipVisibilityBound) {
+            R.pipVisibilityBound = true;
+            document.addEventListener('visibilitychange', function () {
+                if (R.pipRAFActive && document.hidden) {
+                    schedulePiPKeepAlive();
+                } else {
+                    stopPiPKeepAlive();
+                }
+            });
+        }
+
         /* ── RAF 循环 ── */
         R.startMapRAF = function () {
             if (R.mapRAFActive) return;
@@ -96,24 +136,22 @@ export const RecognizeRenderer = {
             (function loop(now) {
                 if (!R.mapRAFActive) return;
                 /* Skip rendering when tab is hidden to avoid GPU work piling up */
-                if (document.hidden) { requestAnimationFrame(loop); return; }
+                if (document.hidden && !R.pipRAFActive) { requestAnimationFrame(loop); return; }
                 var ts = typeof now === 'number' ? now : performance.now();
                 if (!R.lastRenderAt || ts - R.lastRenderAt >= R.renderIntervalMs - 1) {
                     R.lastRenderAt = ts;
                     try { R.renderMapCanvas(); } catch (e) { console.error(e); }
-                    if (R.pipRAFActive) { try { R.updatePiPCanvas(); } catch (_) {} }
+                    if (R.pipRAFActive) schedulePiPKeepAlive();
                 }
                 requestAnimationFrame(loop);
             })();
         };
 
         /* ── PiP ── */
-        R.updatePiPCanvas = function () {
-            var ctx = document.getElementById('pipCanvas').getContext('2d');
-            ctx.drawImage(R.resultCanvas, 0, 0, 400, 400);
-        };
-
-        function stopPiPRefresh() { R.pipRAFActive = false; }
+        function stopPiPRefresh() {
+            R.pipRAFActive = false;
+            stopPiPKeepAlive();
+        }
 
         function stopPiPStream() {
             var pipVideo = document.getElementById('pipVideo');
@@ -163,11 +201,9 @@ export const RecognizeRenderer = {
                     else document.getElementById('pipVideo').webkitSetPresentationMode('inline');
                     R.cleanupPiP(); return;
                 }
-                var pipCanvas = document.getElementById('pipCanvas');
                 var pipVideo = document.getElementById('pipVideo');
                 stopPiPStream();
-                R.updatePiPCanvas();
-                pipVideo.srcObject = pipCanvas.captureStream(30);
+                pipVideo.srcObject = R.resultCanvas.captureStream(Math.max(10, Math.min(60, R.renderFps || 30)));
                 if (!R.pipEventsBound) {
                     R.pipEventsBound = true;
                     pipVideo.addEventListener('leavepictureinpicture', function () { R.cleanupPiP(); TC.log('✅ 原生画中画已关闭'); });
@@ -181,7 +217,7 @@ export const RecognizeRenderer = {
                 else pipVideo.webkitSetPresentationMode('picture-in-picture');
                 R.pipBtn.classList.add('is-active');
                 R.pipRAFActive = true;
-                (function pipLoop() { if (!R.pipRAFActive) return; if (!R.mapRAFActive) R.updatePiPCanvas(); requestAnimationFrame(pipLoop); })();
+                schedulePiPKeepAlive();
                 TC.log('✅ 原生浏览器画中画已开启');
             } catch (err) {
                 R.cleanupPiP();

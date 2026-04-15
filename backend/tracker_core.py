@@ -210,6 +210,7 @@ class MapTrackerWeb:
         eng._watchdog_last_sift_y = None
         eng._watchdog_consecutive_ok = 0
         eng._watchdog_static_streak = 0
+        eng._watchdog_hash_mismatch_streak = 0
         eng._watchdog_cooldown = 0
         eng._watchdog_triggered = False
         eng._last_arrow_angle = 0.0

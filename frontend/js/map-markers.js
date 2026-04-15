@@ -61,9 +61,11 @@ export const MapMarkers = {
         }
 
         function startRippleAnim() {
+            if (A.isLowPowerMode) return;
             if (rippleAnimId !== null) return;
             (function loop() {
                 if (!A.selectedMarkerId) { rippleAnimId = null; return; }
+                if (A.isLowPowerMode) { rippleAnimId = null; return; }
                 if ((++rippleFrameTick & 1) === 0) requestMarkerRender();
                 rippleAnimId = requestAnimationFrame(loop);
             })();
@@ -359,6 +361,10 @@ export const MapMarkers = {
         A.ensureMarkerCanvasSize = ensureMarkerCanvasSize;
 
         function requestMarkerRender() {
+            if (A.isLowPowerMode) {
+                A.markerRenderQueued = false;
+                return;
+            }
             var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
             var holdUntil = Number(A.uiAnimationHoldUntil || 0);
             if (holdUntil > now) {
@@ -714,6 +720,7 @@ export const MapMarkers = {
             if (!A.markerDataVersion) return;
             if (visibleChunkSyncTimer) { clearTimeout(visibleChunkSyncTimer); visibleChunkSyncTimer = null; }
             cancelScheduledAdjacentChunkPrefetch();
+            if (A.isLowPowerMode && !forceNow) return;
             if (forceNow) { ensureVisibleMarkerChunks({ generation: currentMarkerLoadGeneration() }); return; }
             visibleChunkSyncTimer = window.setTimeout(function () {
                 visibleChunkSyncTimer = null;
@@ -721,6 +728,26 @@ export const MapMarkers = {
             }, A.dragging ? 120 : 60);
         }
         A.scheduleVisibleChunkSync = scheduleVisibleChunkSync;
+
+        A.cancelMapBackgroundWork = function () {
+            if (visibleChunkSyncTimer) {
+                clearTimeout(visibleChunkSyncTimer);
+                visibleChunkSyncTimer = null;
+            }
+            cancelSearchIndexWarmup();
+            cancelScheduledAdjacentChunkPrefetch();
+            stopRippleAnim();
+        };
+
+        A.syncMapPowerMode = function (isLowPower) {
+            if (isLowPower) {
+                A.cancelMapBackgroundWork();
+                return;
+            }
+            if (A.selectedMarkerId) startRippleAnim();
+            scheduleVisibleChunkSync(true);
+            scheduleSearchIndexWarmup();
+        };
 
         function ensureMarkerChunkLoadedForMarker(marker) {
             if (!marker) return Promise.resolve([]);
@@ -1233,12 +1260,10 @@ export const MapMarkers = {
         if (typeof document !== 'undefined') {
             document.addEventListener('visibilitychange', function () {
                 if (document.hidden) {
-                    cancelSearchIndexWarmup();
-                    cancelScheduledAdjacentChunkPrefetch();
+                    if (A.cancelMapBackgroundWork) A.cancelMapBackgroundWork();
                     return;
                 }
-                scheduleVisibleChunkSync(true);
-                scheduleSearchIndexWarmup();
+                if (A.syncMapPowerMode) A.syncMapPowerMode(false);
             });
         }
 

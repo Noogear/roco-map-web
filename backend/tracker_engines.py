@@ -194,6 +194,7 @@ class EngineTrackingSnapshot:
     watchdog_last_sift_y: int | None
     watchdog_consecutive_ok: int
     watchdog_static_streak: int
+    watchdog_hash_mismatch_streak: int
     watchdog_cooldown: int
     pending_freeze_resume_hint: dict | None
 
@@ -294,6 +295,7 @@ class SIFTMapTracker:
         self._watchdog_last_sift_y: int | None = None
         self._watchdog_consecutive_ok: int = 0
         self._watchdog_static_streak: int = 0
+        self._watchdog_hash_mismatch_streak: int = 0
         self._watchdog_cooldown: int = 0
 
         # 附近搜索 FLANN 缓存（OrderedDict LRU，避免每帧重建）
@@ -522,6 +524,7 @@ class SIFTMapTracker:
             watchdog_last_sift_y=self._watchdog_last_sift_y,
             watchdog_consecutive_ok=self._watchdog_consecutive_ok,
             watchdog_static_streak=self._watchdog_static_streak,
+            watchdog_hash_mismatch_streak=self._watchdog_hash_mismatch_streak,
             watchdog_cooldown=self._watchdog_cooldown,
             pending_freeze_resume_hint=(None if self._pending_freeze_resume_hint is None
                                         else dict(self._pending_freeze_resume_hint)),
@@ -565,6 +568,7 @@ class SIFTMapTracker:
             self._watchdog_last_sift_y = snapshot.watchdog_last_sift_y
             self._watchdog_consecutive_ok = snapshot.watchdog_consecutive_ok
             self._watchdog_static_streak = snapshot.watchdog_static_streak
+            self._watchdog_hash_mismatch_streak = snapshot.watchdog_hash_mismatch_streak
             self._watchdog_cooldown = snapshot.watchdog_cooldown
             self._pending_freeze_resume_hint = (None if snapshot.pending_freeze_resume_hint is None
                                                 else dict(snapshot.pending_freeze_resume_hint))
@@ -582,6 +586,7 @@ class SIFTMapTracker:
             self._watchdog_last_sift_y = None
             self._watchdog_consecutive_ok = 0
             self._watchdog_static_streak = 0
+            self._watchdog_hash_mismatch_streak = 0
             self._watchdog_cooldown = 0
             self._watchdog_triggered = False
 
@@ -640,19 +645,23 @@ class SIFTMapTracker:
         self._watchdog_last_sift_y = None
         self._watchdog_consecutive_ok = 0
         self._watchdog_static_streak = 0
+        self._watchdog_hash_mismatch_streak = 0
 
     def _trigger_watchdog_unlock(self, reason: str) -> None:
-        """统一执行看门狗解锁，并进入短冷却避免刚解锁又被同一批脏状态连环触发。"""
+        """统一执行看门狗解锁，并进入短冷却避免刚解锁又被同一批脏状态连环触发。
+
+        设计约束：看门狗是“死锁解锁器”，不是“坐标重置器”。
+        触发后只重置局部跟踪链路（local/LK/cache/revalidate），保留坐标锚点，
+        由后续常规状态机走 inertial/全局复核，避免坐标因看门狗本身乱飘。
+        """
         self._switch_to_global()
         self._nearby_flann_cache.clear()
         self._lk.reset()
         self._force_global_revalidate = True
         self._force_global_revalidate_frame = self._lk.frame_num
         self._watchdog_suspect_streak = 0
+        self._watchdog_hash_mismatch_streak = 0
         self._watchdog_triggered = True
-        self.last_x = None
-        self.last_y = None
-        self.lost_frames = 0
         self._watchdog_cooldown = max(
             self._watchdog_cooldown,
             int(getattr(config, 'WATCHDOG_TRIGGER_COOLDOWN', 24)),
@@ -990,6 +999,7 @@ class SIFTMapTracker:
                     self._watchdog_last_sift_x = center_x
                     self._watchdog_last_sift_y = center_y
                 self._watchdog_suspect_streak = 0
+                self._watchdog_hash_mismatch_streak = 0
                 self._watchdog_consecutive_ok = 0
                 self._watchdog_static_streak = 0
             elif found and not is_inertial and _wd_sift_src and self._watchdog_last_sift_x is not None:
@@ -1037,12 +1047,33 @@ class SIFTMapTracker:
             # 哈希校验补充“视觉内容与当前位置是否匹配”这条证据链。
             if (not _wd_on_cooldown and found and not is_inertial
                     and _wd_sift_src and center_x is not None):
-                if not self._hash_index.check_consistency(minimap_gray_raw, center_x, center_y):
-                    self._watchdog_suspect_streak += 1
-                    if self._watchdog_suspect_streak >= _wd_limit:
-                        print(f'[看门狗-哈希] 视觉不一致触发解锁! SIFT报告({center_x},{center_y})与哈希索引不匹配')
-                        self._trigger_watchdog_unlock('哈希视觉不一致后强制全局重定位')
-                        found = False
+                _hash_min_quality = float(getattr(config, 'WATCHDOG_HASH_MIN_MATCH_QUALITY', 0.55))
+                _hash_min_matches = int(getattr(config, 'WATCHDOG_HASH_MIN_MATCH_COUNT', 6))
+                if match_quality < _hash_min_quality or match_count < _hash_min_matches:
+                    # 低可信测量不参与哈希看门狗计数，避免把“本来就不可靠”的 SIFT 结果继续放大。
+                    self._watchdog_hash_mismatch_streak = 0
+                else:
+                    _hash_radius = int(getattr(config, 'WATCHDOG_HASH_CHECK_RADIUS', 320))
+                    _hash_margin = int(getattr(config, 'WATCHDOG_HASH_HAMMING_MARGIN', 6))
+                    _hash_limit = int(getattr(config, 'WATCHDOG_HASH_MISMATCH_LIMIT', _wd_limit * 2))
+                    consistent, best_dist, _cand_count = self._hash_index.check_consistency_details(
+                        minimap_gray_raw, center_x, center_y, check_radius=_hash_radius)
+                    if consistent:
+                        self._watchdog_hash_mismatch_streak = 0
+                    else:
+                        # “边缘不一致”先不累计，只有明显超阈值才计入触发计数
+                        _thresh = int(getattr(self._hash_index, '_hamming_thresh', 12))
+                        _effective_dist = best_dist if best_dist is not None else (_thresh + _hash_margin + 1)
+                        if _effective_dist <= _thresh + _hash_margin:
+                            self._watchdog_hash_mismatch_streak = 0
+                        else:
+                            self._watchdog_hash_mismatch_streak += 1
+                            if self._watchdog_hash_mismatch_streak >= _hash_limit:
+                                print(f'[看门狗-哈希] 视觉不一致触发解锁! '
+                                      f'SIFT报告({center_x},{center_y})与哈希索引不匹配 '
+                                      f'(dist={_effective_dist}, streak={self._watchdog_hash_mismatch_streak}/{_hash_limit})')
+                                self._trigger_watchdog_unlock('哈希视觉不一致后强制全局重定位')
+                                found = False
 
         # 粗定位回退：低纹理或完全丢失时，先用哈希索引给出廉价候选。
         _semi_lost = (self.last_x is not None and self.lost_frames >= 8

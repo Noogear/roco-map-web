@@ -33,6 +33,31 @@
 .rec-tab:not(.is-active):hover { color: var(--text); background: rgba(255,255,255,0.3); }
 
 .rec-state-label { font-size: 13px; color: var(--text-soft); font-weight: 600; }
+
+/* Status-bar flat action buttons */
+.rec-bar-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 36px;
+    padding: 0 16px;
+    border-radius: 9px;
+    border: none;
+    background: rgba(154, 105, 72, 0.09);
+    color: var(--accent-deep);
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background .14s, color .14s;
+    white-space: nowrap;
+}
+.rec-bar-btn:hover { background: rgba(154, 105, 72, 0.17); }
+.rec-bar-btn.is-active {
+    background: var(--accent-deep);
+    color: #fff;
+}
+
 .rec-watch-badge {
     display: none; align-items: center;
     height: 30px; padding: 0 12px; border-radius: 999px;
@@ -251,13 +276,13 @@
     pointer-events: auto;
 }
 .rec-flyout-settings {
-    top: 74px;
-    right: 20px;
+    top: 60px;
+    right: 16px;
     background: linear-gradient(180deg, rgba(255, 251, 245, 0.97), rgba(246, 235, 222, 0.95));
 }
 .rec-flyout-tools {
-    right: calc(var(--dock-size) + 48px);
-    bottom: 88px;
+    top: 60px;
+    right: 16px;
     background: linear-gradient(180deg, rgba(253, 249, 242, 0.97), rgba(237, 227, 214, 0.95));
 }
 .rec-flyout-head {
@@ -309,31 +334,8 @@
 .rec-settings-sheet .rec-setting-row {
     background: rgba(255,255,255,0.74);
 }
-.rec-tools-fab {
-    position: absolute;
-    right: calc(var(--dock-size) + 44px);
-    bottom: 22px;
-    z-index: 35;
-    min-height: 52px;
-    padding: 0 16px;
-    border-radius: 999px;
-    border: 1px solid rgba(113, 78, 55, 0.14);
-    background: linear-gradient(180deg, rgba(255, 251, 246, 0.96), rgba(240, 228, 212, 0.94));
-    box-shadow: 0 8px 20px rgba(79, 54, 33, 0.16);
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    color: var(--accent-deep);
-}
-.rec-tools-fab span { font-size: 18px; }
-.rec-tools-fab strong { font-size: 13px; }
-.rec-tools-fab:hover {
-    transform: translateY(-1px);
-}
-.rec-tools-fab.is-active,
 .rec-top-action-btn.is-active {
-    outline: 2px solid rgba(154, 105, 72, 0.18);
-    background: linear-gradient(180deg, #b98562 0%, #996447 100%);
+    background: var(--accent-deep);
     color: #fff;
 }
 
@@ -460,12 +462,8 @@
     .rec-flyout-tools {
         left: 14px;
         right: 14px;
-        bottom: 86px;
+        top: 60px;
         width: auto;
-    }
-
-    .rec-tools-fab {
-        right: 14px;
     }
 }
 
