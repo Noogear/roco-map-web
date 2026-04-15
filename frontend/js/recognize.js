@@ -5,6 +5,7 @@ import { RecognizeRenderer } from './recognize-renderer.js';
 import RecognizeAudience from './recognize-audience.js';
 
 AppCommon.buildDock();
+AppCommon.initTooltip();
 
 const prefs = AppCommon.loadPrefs();
 
@@ -82,31 +83,45 @@ const prefs = AppCommon.loadPrefs();
         var margin = 12;
         var triggerRect = trigger.getBoundingClientRect();
 
+        /* Reset to allow clean measurement */
         panel.style.left = '0px';
-        panel.style.top = '0px';
+        panel.style.top = '-9999px';
         panel.style.right = 'auto';
+        panel.style.maxHeight = '';
 
-        var panelRect = panel.getBoundingClientRect();
-        var panelWidth = Math.min(Math.max(panelRect.width || 340, 280), Math.max(280, window.innerWidth - margin * 2));
-
+        var panelWidth = Math.min(Math.max(340, 280), Math.max(280, window.innerWidth - margin * 2));
         panel.style.width = panelWidth + 'px';
 
+        /* Horizontal: right-align to trigger button, clamped to viewport */
         var left = triggerRect.right - panelWidth;
         left = Math.max(margin, Math.min(left, window.innerWidth - panelWidth - margin));
 
-        var top = triggerRect.bottom + 8;
-        var maxHeightDown = window.innerHeight - top - margin;
-        var maxPanelHeight = Math.max(220, window.innerHeight - margin * 2);
-        var shouldOpenUp = maxHeightDown < 220;
+        var spaceBelow = window.innerHeight - triggerRect.bottom - 8 - margin;
+        var spaceAbove = triggerRect.top - 8 - margin;
+        var shouldOpenUp = spaceBelow < 220 && spaceAbove > spaceBelow;
+
+        var bodyEl = panel.querySelector('.rec-flyout-body');
 
         if (shouldOpenUp) {
-            var desiredTop = triggerRect.top - Math.min(panelRect.height || 420, maxPanelHeight) - 8;
-            top = Math.max(margin, desiredTop);
+            panel.setAttribute('data-opens-upward', '1');
+            var bodyMaxH = Math.max(160, spaceAbove - 72);
+            if (bodyEl) bodyEl.style.maxHeight = bodyMaxH + 'px';
+            var topUp = Math.max(margin, triggerRect.top - (bodyMaxH + 80) - 8);
+            panel.style.top = topUp + 'px';
+        } else {
+            panel.removeAttribute('data-opens-upward');
+            var topDown = triggerRect.bottom + 8;
+            var bodyMaxHDown = Math.max(160, spaceBelow - 72);
+            if (bodyEl) bodyEl.style.maxHeight = bodyMaxHDown + 'px';
+            panel.style.top = topDown + 'px';
         }
 
         panel.style.left = left + 'px';
-        panel.style.top = top + 'px';
-        panel.style.maxHeight = Math.max(220, window.innerHeight - top - margin) + 'px';
+
+        /* Caret: map trigger button center onto the panel's X axis */
+        var caretX = triggerRect.left + triggerRect.width / 2 - left;
+        caretX = Math.max(24, Math.min(caretX, panelWidth - 24));
+        panel.style.setProperty('--caret-x', caretX + 'px');
     }
 
     function closeTransientPanels() {

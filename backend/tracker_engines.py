@@ -11,6 +11,7 @@ tracker_engines.py - 识别引擎主流程（无 Web 框架依赖）
 
 import cv2
 import numpy as np
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
 from threading import Lock
@@ -442,32 +443,6 @@ class SIFTMapTracker:
             if ecc_result is not None:
                 src = (source_prefix + '_ECC') if source_prefix else 'ECC'
                 return ecc_result[0], ecc_result[1], 0.3, None, src, 0
-
-        # === 模板匹配兜底 (The CPU King for Low Texture) ===
-        # 即使 SIFT 和 ECC 在充满 UI 图标的低纹理区域被干扰而失败，
-        # 截取大图范围的 ROI 利用 TM_CCOEFF_NORMED 进行全局相关性匹配，
-        # 能依靠 95% 的地形纹理压倒性地忽略 5% 图标的影响。
-        try:
-            roi_h = int(minimap_gray.shape[0] * 3.5)
-            roi_w = int(minimap_gray.shape[1] * 3.5)
-            y0 = max(0, int(hint_y - roi_h // 2))
-            y1 = min(self.map_height, int(hint_y + roi_h // 2))
-            x0 = max(0, int(hint_x - roi_w // 2))
-            x1 = min(self.map_width, int(hint_x + roi_w // 2))
-            
-            if (y1 - y0) >= minimap_gray.shape[0] and (x1 - x0) >= minimap_gray.shape[1]:
-                roi_patch = self._logic_map_gray_clahe[y0:y1, x0:x1]
-                res = cv2.matchTemplate(roi_patch, minimap_gray, cv2.TM_CCOEFF_NORMED)
-                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                # 设定 0.40 的及格线，对于 CCOEFF_NORMED 来说，能够过滤掉完全随机的情况
-                if max_val > 0.40:
-                    tx = x0 + max_loc[0] + minimap_gray.shape[1] // 2
-                    ty = y0 + max_loc[1] + minimap_gray.shape[0] // 2
-                    if abs(tx - hint_x) + abs(ty - hint_y) < self.JUMP_THRESHOLD * 2:
-                        src = (source_prefix + '_TEMPLATE') if source_prefix else 'TEMPLATE_NEARBY'
-                        return tx, ty, max_val * 0.7, None, src, 0
-        except Exception as e:
-            pass
 
         return None
 
@@ -905,10 +880,24 @@ class SIFTMapTracker:
         )
 
         motion_hint = (0.0, 0.0)
+        use_arrow_fallback = False
+        
         if lk_result is not None:
             dx_map, dy_map, lk_conf = lk_result
             if lk_conf >= self._lk.min_conf:
                 motion_hint = (float(dx_map), float(dy_map))
+            else:
+                use_arrow_fallback = True
+        else:
+            use_arrow_fallback = True
+            
+        # 巧妙复用已有的低纹理桥接器 (TemporalBridge)：
+        # 如果 LK 光流在纯色区宣告失效（通常因为没提取到角点），我们把方向系统的推算结果
+        # 直接作为先验（motion_hint）喂给桥接器，这样桥接器内部的假设轨迹就会顺着箭头滑行！
+        if use_arrow_fallback and scene in ('ocean', 'low_texture') and not self._arrow_dir._is_stopped:
+            rad = math.radians(self._arrow_dir._last_angle)
+            speed = 4.0  # 游戏默认推算是常量步幅
+            motion_hint = (float(speed * math.sin(rad)), float(-speed * math.cos(rad)))
 
         bridged = self._bridge.step(
             scene=scene,
@@ -1007,11 +996,11 @@ class SIFTMapTracker:
 
             # 动态匹配参数：按场景分类路由
             if scene == 'ocean':
-                eff_match_ratio = 0.82
-                eff_min_match = max(8, getattr(config, 'SIFT_MIN_MATCH_COUNT', 4) * 2) # 极其严格
+                eff_match_ratio = 0.86
+                eff_min_match = 4  # 稍微提高一点以防御UI干扰，但保持灵活
             elif scene == 'low_texture':
                 eff_match_ratio = 0.84
-                eff_min_match = max(6, getattr(config, 'SIFT_MIN_MATCH_COUNT', 4) * 2) # 严格
+                eff_min_match = 4
             else:
                 eff_match_ratio = config.SIFT_MATCH_RATIO  # 0.82
                 eff_min_match = config.SIFT_MIN_MATCH_COUNT
@@ -1043,10 +1032,6 @@ class SIFTMapTracker:
                         current_kp, current_flann = self.kp_big_all, self.flann_global
                     else:
                         if not self.using_local:
-                            break
-                        if scene in ('ocean', 'low_texture'):
-                            # 纯色区域绝对禁止回退到全图盲搜，必定找错！
-                            # 直接 break，交给接下来的 Template Matching 或航迹推算兜底
                             break
                         current_kp, current_flann = self.kp_big_all, self.flann_global
 
@@ -1349,17 +1334,15 @@ class SIFTMapTracker:
                 found = True
                 is_inertial = True
                 
-                # 在纯色区如果因 UI 干扰或无特征导致失焦，强制引入基于 Arrow 箭头的航迹推算 (Dead Reckoning)
+                # 终极冷启动推演网：如果玩家上线就在海面，Bridge 因为没有任何初始信标而无法启动，
+                # 此时全链路崩溃。我们直接在此进行终极接管，更新 last_x，确保系统能在盲态下起步。
                 if scene in ('ocean', 'low_texture') and not self._arrow_dir._is_stopped:
                     rad = math.radians(self._arrow_dir._last_angle)
-                    speed = 4.0  # 游戏默认推算步幅 (pixels per frame)
-                    dx = speed * math.sin(rad)
-                    dy = -speed * math.cos(rad)
-                    center_x = int(round(self.last_x + dx))
-                    center_y = int(round(self.last_y + dy))
-                    
-                    # 为了允许长途越野不断，如果一直在用推算，冻结丢帧计数
-                    # 防止因为一直提取不出 SIFT 特征而触发清空
+                    speed = 4.0
+                    center_x = int(round(self.last_x + speed * math.sin(rad)))
+                    center_y = int(round(self.last_y - speed * math.cos(rad)))
+                    self.last_x = center_x
+                    self.last_y = center_y
                     self.lost_frames = max(1, self.lost_frames - 1)
                 else:
                     center_x, center_y = self.last_x, self.last_y

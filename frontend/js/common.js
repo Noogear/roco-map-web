@@ -210,6 +210,64 @@ const FRONTEND_PREFS_META = [
         if (!host) { host = document.createElement('div'); host.id = 'appToastStack'; host.className = 'app-toast-stack'; document.body.appendChild(host); }
         return host;
     }
+    function initTooltip() {
+        if (document.getElementById('appTooltip')) return; // already initialized
+        var tip = document.createElement('div');
+        tip.id = 'appTooltip';
+        tip.className = 'app-tooltip';
+        tip.setAttribute('role', 'tooltip');
+        tip.setAttribute('aria-hidden', 'true');
+        document.body.appendChild(tip);
+
+        var current = null;
+        var showTimer = null;
+
+        function position(el) {
+            var rect = el.getBoundingClientRect();
+            var tw = tip.offsetWidth || 200;
+            var th = tip.offsetHeight || 36;
+            var margin = 10;
+            var gap = 7;
+            var top = (rect.top - th - gap >= margin)
+                ? rect.top - th - gap
+                : rect.bottom + gap;
+            var left = rect.left + rect.width / 2 - tw / 2;
+            left = Math.max(margin, Math.min(left, window.innerWidth - tw - margin));
+            tip.style.top = top + 'px';
+            tip.style.left = left + 'px';
+        }
+
+        function show(el) {
+            var text = el.getAttribute('data-tip');
+            if (!text) return;
+            tip.textContent = text;
+            tip.classList.add('is-visible');
+            tip.setAttribute('aria-hidden', 'false');
+            position(el);
+        }
+
+        function hide() {
+            clearTimeout(showTimer);
+            tip.classList.remove('is-visible');
+            tip.setAttribute('aria-hidden', 'true');
+            current = null;
+        }
+
+        document.addEventListener('mouseover', function (e) {
+            var el = e.target && e.target.closest('[data-tip]');
+            if (!el || el === current || el.disabled) return;
+            current = el;
+            clearTimeout(showTimer);
+            showTimer = setTimeout(function () { show(el); }, 300);
+        });
+        document.addEventListener('mouseout', function (e) {
+            var rel = e.relatedTarget;
+            if (current && (!rel || !current.contains(rel))) hide();
+        });
+        document.addEventListener('click', hide, { passive: true });
+        window.addEventListener('scroll', hide, { passive: true, capture: true });
+    }
+
     function toast(message, tone, timeout) {
         var host = ensureToastHost();
         var item = document.createElement('div');
@@ -698,7 +756,7 @@ const FRONTEND_PREFS_META = [
 export {
     DEFAULT_PREFS, FRONTEND_PREFS_META,
     loadPrefs, savePrefs, updatePref, applyNavState,
-    initFloatingDock, buildDock, toast, debounce,
+    initFloatingDock, buildDock, toast, debounce, initTooltip,
     fetchJSON, fetchJSONCached, readOfflineJSON, writeOfflineJSON,
     escapeHtml, formatNumber, applyLogPrefs,
     setInteractiveHiddenState,

@@ -108,21 +108,25 @@
                                 </div>
 
                                 <div class="rec-actions">
-                                    <button class="app-btn rec-action-btn rec-btn-main" id="mainScreenBtn" type="button">
+                                    <button class="app-btn rec-action-btn rec-btn-main" id="mainScreenBtn" type="button"
+                                        data-tip="从屏幕捕获实时画面，开始后自动识别游戏小地图中的玩家位置">
                                         <strong>🖥️ 屏幕捕获</strong>
                                         <small id="mainScreenBtnSub">开始追踪</small>
                                     </button>
                                     <div class="rec-btn-row">
-                                        <button class="app-btn-soft rec-action-btn rec-btn-sub" id="pipBtn" type="button">
+                                        <button class="app-btn-soft rec-action-btn rec-btn-sub" id="pipBtn" type="button"
+                                            data-tip="以浮动小窗显示追踪画面，方便同时操作其他窗口">
                                             <strong>🎠 画中画</strong>
                                             <small>悬浮查看</small>
                                         </button>
-                                        <button class="app-btn-ghost rec-action-btn rec-btn-sub" id="broadcastBtn" type="button">
+                                        <button class="app-btn-ghost rec-action-btn rec-btn-sub" id="broadcastBtn" type="button"
+                                            data-tip="将追踪画面推流给频道观众，让其他人实时看到玩家定位">
                                             <strong id="broadcastBtnTitle">📡 展示</strong>
                                             <small id="broadcastBtnSub">推流给观众</small>
                                         </button>
                                     </div>
-                                    <button class="app-btn-danger rec-action-btn rec-btn-reset" id="forceResetBtn" type="button">
+                                    <button class="app-btn-danger rec-action-btn rec-btn-reset" id="forceResetBtn" type="button"
+                                        data-tip="强制清空前后端所有追踪状态。遇到识别卡死或状态异常时使用">
                                         <strong>🔄 强制重置</strong>
                                         <small>清空前后端状态</small>
                                     </button>

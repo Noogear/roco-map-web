@@ -216,6 +216,32 @@ button { border: none; cursor: pointer; }
 .app-toast[data-tone="danger"] { background: rgba(126, 58, 58, 0.96); }
 @keyframes app-toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
+/* ── Custom tooltip ── */
+.app-tooltip {
+    position: fixed;
+    z-index: 9000;
+    max-width: 240px;
+    padding: 7px 12px;
+    border-radius: 10px;
+    background: rgba(44, 28, 14, 0.90);
+    color: rgba(255, 248, 240, 0.95);
+    font-size: 12px;
+    font-weight: 500;
+    line-height: 1.5;
+    letter-spacing: 0.01em;
+    pointer-events: none;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
+    backdrop-filter: blur(8px);
+    white-space: pre-line;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity .13s ease, transform .13s ease;
+}
+.app-tooltip.is-visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
 /* ─── Console layout (shared by recognize + map) ─── */
 .console-layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(300px, 420px); gap: 18px; }
 .console-device { padding: 22px; }
