@@ -530,7 +530,7 @@ class SIFTMapTracker:
             arrow_history=tuple(arrow_dir._history),
             arrow_dir_last_angle=arrow_dir._last_angle,
             arrow_dir_is_stopped=arrow_dir._is_stopped,
-            arrow_dir_stop_streak=arrow_dir._stop_streak,
+            arrow_dir_stop_streak=arrow_dir._low_move_streak,
             lk_prev_gray=(None if self._lk.prev_gray is None else self._lk.prev_gray.copy()),
             lk_prev_pts=(None if self._lk.prev_pts is None else self._lk.prev_pts.copy()),
             lk_map_scale=self._lk.map_scale,
@@ -572,7 +572,7 @@ class SIFTMapTracker:
             arrow_dir._history.extend(snapshot.arrow_history)
             arrow_dir._last_angle = snapshot.arrow_dir_last_angle
             arrow_dir._is_stopped = snapshot.arrow_dir_is_stopped
-            arrow_dir._stop_streak = snapshot.arrow_dir_stop_streak
+            arrow_dir._low_move_streak = snapshot.arrow_dir_stop_streak
             self._lk.prev_gray = (None if snapshot.lk_prev_gray is None
                                   else snapshot.lk_prev_gray.copy())
             self._lk.prev_pts = (None if snapshot.lk_prev_pts is None

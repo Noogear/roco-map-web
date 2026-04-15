@@ -6,15 +6,12 @@ tracker_core.py - 追踪器编排层（无 Web 框架依赖）
   - 坐标平滑/线性过滤/异常值过滤
   - 帧处理流程编排: set_minimap -> process_frame
   - 结果渲染(裁剪地图 + 画箭头 + 编码PNG/JPEG)
-  - 坐标历史持久化
 
 此模块仅依赖 cv2 / numpy / PIL / config / tracker_engines，
 可被 Flask/Tornado/CLI 等任何前端复用。
 """
 
 import os
-import hashlib
-import tempfile
 
 import cv2
 import numpy as np
@@ -100,10 +97,7 @@ class MapTrackerWeb:
         self._circle_cal = CircleCalibrator()
 
         # === 坐标平滑器（卡尔曼 + EMA 防抖 + TP 检测缓冲）===
-        _base_dir = os.path.dirname(os.path.abspath(__file__))
-        session_tag = hashlib.sha1(str(session_id).encode('utf-8')).hexdigest()[:16]
-        self._smooth_file = os.path.join(_base_dir, f'.session_{session_tag}.json')
-        self._smoother = CoordSmoother(smooth_buffer_path=self._smooth_file)
+        self._smoother = CoordSmoother()
         self.pos_history = self._smoother.pos_history  # 公开属性，server.py 等外部代码使用
 
         # === 会话活跃时间戳（用于超时清理）===
@@ -252,29 +246,6 @@ class MapTrackerWeb:
         cal._consecutive_miss = 0
         cal.expected_cx = cal.expected_cy = cal.expected_r = None
         return cleared
-
-    def save_session_state(self) -> None:
-        """保存统一会话状态（smooth_buffer + circle_cal）到磁盘。"""
-        import json, threading
-        path = self._smooth_file
-        if not path:
-            return
-        snapshot = {
-            'smooth_x': list(self._smoother.smooth_buffer_x),
-            'smooth_y': list(self._smoother.smooth_buffer_y),
-            'circle_cal': self._circle_cal.to_dict(),
-        }
-        def _write():
-            try:
-                parent = os.path.dirname(path) or '.'
-                os.makedirs(parent, exist_ok=True)
-                with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=parent, delete=False) as tmp:
-                    json.dump(snapshot, tmp)
-                    tmp_path = tmp.name
-                os.replace(tmp_path, path)
-            except Exception as e:
-                print(f"[session-state] 保存失败: {e}")
-        threading.Thread(target=_write, daemon=True).start()
 
     def touch_active(self) -> None:
         """更新最后活跃时间。"""

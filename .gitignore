@@ -33,3 +33,7 @@ rocom_assets/
 
 test*.py
 _debug*.py
+
+drift_result.txt
+
+*.log

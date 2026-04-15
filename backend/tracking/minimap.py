@@ -185,6 +185,13 @@ def detect_and_extract(
         minRadius=min_r, maxRadius=max_r,
     )
     if circles is None:
+        if calibrator._calibrated and calibrator.expected_cx is not None:
+            det_cx, det_cy, det_r = calibrator.expected_cx, calibrator.expected_cy, calibrator.expected_r
+            x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
+            x2, y2 = min(w, det_cx + det_r), min(h, det_cy + det_r)
+            minimap = square_bgr[y1:y2, x1:x2].copy()
+            if minimap.size >= 100:
+                return minimap
         if not engine_frozen:
             calibrator.record_miss()
         return None
@@ -201,21 +208,30 @@ def detect_and_extract(
             best = c
 
     if best is None or best_score < float(getattr(config, 'MINIMAP_LOCAL_MIN_SCORE', 0.22)):
+        if calibrator._calibrated and calibrator.expected_cx is not None:
+            det_cx, det_cy, det_r = calibrator.expected_cx, calibrator.expected_cy, calibrator.expected_r
+            x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
+            x2, y2 = min(w, det_cx + det_r), min(h, det_cy + det_r)
+            minimap = square_bgr[y1:y2, x1:x2].copy()
+            if minimap.size >= 100:
+                return minimap
         if not engine_frozen:
             calibrator.record_miss()
         return None
 
     det_cx, det_cy, det_r = int(best[0]), int(best[1]), int(best[2])
 
-    if engine_frozen:
-        # 冻结态：
-        # 1) 不使用旧校准严格拒绝（否则分辨率/UI 改变后可能永远 thaw 不回来）
-        # 2) 不把当前结果直接固化成 calibrated，仅重新播种，等待正常帧重新收敛
-        calibrator.reseed(det_cx, det_cy, det_r)
-    else:
-        if not calibrator.is_valid(det_cx, det_cy, det_r):
+    if not calibrator.is_valid(det_cx, det_cy, det_r):
+        if engine_frozen:
+            # 冻结态下旧校准可能已经陈旧：接受当前检测结果并重新播种，
+            # 让 thaw 后的后续帧重新积累历史，而不是继续抱着旧圆心不放。
+            calibrator.reseed(det_cx, det_cy, det_r)
+        elif calibrator._calibrated and calibrator.expected_cx is not None:
+            det_cx, det_cy, det_r = calibrator.expected_cx, calibrator.expected_cy, calibrator.expected_r
+        else:
             calibrator.record_miss()
             return None
+    else:
         calibrator.update(det_cx, det_cy, det_r)
 
     x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
@@ -223,8 +239,6 @@ def detect_and_extract(
     minimap = square_bgr[y1:y2, x1:x2].copy()
 
     if minimap.size < 100:
-        return None
-    if np.var(cv2.cvtColor(minimap, cv2.COLOR_BGR2GRAY)) < 20:
         return None
 
     return minimap

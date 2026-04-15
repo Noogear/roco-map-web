@@ -1,11 +1,10 @@
 """
 tracking/smoother.py - 坐标平滑器
 
-将原来散落在 MapTrackerWeb 中的四套平滑机制合并为一个 CoordSmoother：
+将原来散落在 MapTrackerWeb 中的三套平滑机制合并为一个 CoordSmoother：
   1. pos_history 异常值过滤（欧氏中位数）
   2. Kalman 滤波（4 状态 x/y/vx/vy）
-  3. smooth_buffer 持久化缓冲（启动时恢复 Kalman 热状态）
-  4. 渲染 EMA 防抖（静止死区 + 速度自适应 alpha）
+  3. 渲染 EMA 防抖（静止死区 + 速度自适应 alpha）
 
 外部只需调用：
     update(cx, cy, found, is_inertial, match_quality, arrow_stopped,
@@ -15,10 +14,6 @@ tracking/smoother.py - 坐标平滑器
 from __future__ import annotations
 
 import math
-import json
-import os
-import tempfile
-import threading
 from collections import deque
 
 import cv2
@@ -29,17 +24,13 @@ from backend import config
 
 class CoordSmoother:
     """
-    统一坐标平滑器，合并原来的 4 套机制。
+    统一坐标平滑器，合并原来的 3 套机制。
     """
 
-    SMOOTH_BUFFER_SIZE: int = 60
     POS_HISTORY_SIZE: int = 20
     POS_OUTLIER_THRESHOLD: float = 200.0
 
-    def __init__(
-        self,
-        smooth_buffer_path: str | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         # 1. 异常值过滤历史
         self.pos_history: deque[tuple[int, int]] = deque(maxlen=self.POS_HISTORY_SIZE)
 
@@ -47,15 +38,7 @@ class CoordSmoother:
         self._kalman = self._create_kalman_filter()
         self._kalman_initialized: bool = False
 
-        # 3. 持久化平滑缓冲
-        self.smooth_buffer_x: deque[int] = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
-        self.smooth_buffer_y: deque[int] = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
-        self._smooth_buffer_path = smooth_buffer_path
-        self._last_save_time: float = 0.0   # 节流：避免每帧都 spawn 线程
-        if smooth_buffer_path:
-            self._load_smooth_buffer()
-
-        # 4. 渲染 EMA
+        # 3. 渲染 EMA
         self._display_x: int | None = None
         self._display_y: int | None = None
 
@@ -142,17 +125,7 @@ class CoordSmoother:
                 smooth_x, smooth_y = cx, cy
                 self._inertial_frame_count = 0
 
-        # ③ 持久化（节流：warmup 完成后最多每 5 秒保存一次，避免每帧 spawn 线程）
-        self.smooth_buffer_x.append(smooth_x)
-        self.smooth_buffer_y.append(smooth_y)
-        if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
-            import time as _time
-            _now = _time.monotonic()
-            if _now - self._last_save_time >= 5.0:
-                self._last_save_time = _now
-                self._save_smooth_buffer()
-
-        # ④ 传送检测（来源1: Kalman 跳变 / 来源2: 引擎远距离候选）
+        # ③ 传送检测（来源1: Kalman 跳变 / 来源2: 引擎远距离候选）
         _tp_thresh = getattr(config, 'TP_JUMP_THRESHOLD', 300)
         _tp_confirm = getattr(config, 'TP_CONFIRM_FRAMES', 3)
         _tp_radius = getattr(config, 'TP_CLUSTER_RADIUS', 150)
@@ -194,8 +167,6 @@ class CoordSmoother:
     def reset_to(self, x: int, y: int) -> None:
         """传送确认后立即重置所有过滤器到新位置。"""
         self.pos_history.clear()
-        self.smooth_buffer_x.clear()
-        self.smooth_buffer_y.clear()
         self._kalman_reset(x, y)
         self._display_x = x
         self._display_y = y
@@ -205,8 +176,8 @@ class CoordSmoother:
         self._last_real_match_quality = 1.0
 
     def clear_state(self) -> None:
-        """清空所有平滑状态（历史/缓冲/Kalman/EMA/传送候选），并删除磁盘持久化文件。"""
-        self.clear_runtime_state(clear_persisted=True)
+        """清空所有平滑状态（历史/Kalman/EMA/传送候选）。"""
+        self.clear_runtime_state()
 
     def clear_position_history(self) -> None:
         """仅清空异常值过滤历史，保留其他平滑状态。"""
@@ -219,26 +190,15 @@ class CoordSmoother:
         防止 Kalman / EMA / TP 候选继续把旧坐标往后带。
         """
         self.pos_history.clear()
-        self.smooth_buffer_x.clear()
-        self.smooth_buffer_y.clear()
         self._kalman = self._create_kalman_filter()
         self._kalman_initialized = False
         self._display_x = None
         self._display_y = None
         self._tp_candidate_buffer.clear()
-        self._last_save_time = 0.0
-        # 重置新增的自适应参数
+        # 重置自适应参数
         self._inertial_frame_count = 0
         self._last_real_match_quality = 1.0
-        if clear_persisted:
-            path = self._smooth_buffer_path
-            if path:
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
-                except Exception as e:
-                    print(f"[平滑缓冲] 清除文件失败: {e}")
+
 
     def predict_position(self) -> tuple[int, int] | None:
         """对外暴露 Kalman 预测位置，供场景切换等编排逻辑使用。"""
@@ -341,57 +301,4 @@ class CoordSmoother:
         self._display_y = int(self._display_y + alpha * ddy)
         return self._display_x, self._display_y
 
-    # ------------------------------------------------------------------
-    # 持久化
-    # ------------------------------------------------------------------
 
-    def _load_smooth_buffer(self) -> None:
-        path = self._smooth_buffer_path
-        if not path or not os.path.exists(path):
-            return
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                return
-            xs = data.get('smooth_x', [])
-            ys = data.get('smooth_y', [])
-            if not isinstance(xs, list) or not isinstance(ys, list):
-                return
-            for x, y in zip(xs, ys):
-                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-                    continue
-                ix, iy = int(x), int(y)
-                if ix < 0 or iy < 0:
-                    continue
-                self.smooth_buffer_x.append(ix)
-                self.smooth_buffer_y.append(iy)
-            if self.smooth_buffer_x and self.smooth_buffer_y:
-                lx, ly = self.smooth_buffer_x[-1], self.smooth_buffer_y[-1]
-                self._kalman_update(lx, ly, quality=0.5)
-                self._display_x = lx
-                self._display_y = ly
-                print(f"[平滑缓冲] 已加载 {len(self.smooth_buffer_x)} 个历史坐标，最后位置: ({lx},{ly})")
-        except Exception as e:
-            print(f"[平滑缓冲] 加载失败: {e}")
-
-    def _save_smooth_buffer(self) -> None:
-        path = self._smooth_buffer_path
-        if not path:
-            return
-        # 异步写入：取快照后在后台线程保存，避免阻塞 SIFT 工作线程
-        snapshot = {
-            'smooth_x': list(self.smooth_buffer_x),
-            'smooth_y': list(self.smooth_buffer_y),
-        }
-        def _write():
-            try:
-                parent = os.path.dirname(path) or '.'
-                os.makedirs(parent, exist_ok=True)
-                with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=parent, delete=False) as tmp:
-                    json.dump(snapshot, tmp)
-                    tmp_path = tmp.name
-                os.replace(tmp_path, path)
-            except Exception as e:
-                print(f"[平滑缓冲] 保存失败: {e}")
-        threading.Thread(target=_write, daemon=True).start()

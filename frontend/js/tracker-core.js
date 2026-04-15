@@ -629,15 +629,120 @@ const TrackerCore = (() => {
             // 连接中则复用同一个 Promise，避免并发调用创建多个 socket
             if (S.wsConnecting) return S.wsConnecting;
             S.wsConnecting = new Promise(function(resolve, reject) {
+                var settled = false;
+                var fallbackTried = false;
 
-                try {
-                    var sock = io({
-                        transports: ['polling', 'websocket'],
-                        upgrade: true,
-                        rememberUpgrade: true,
+                var buildSockOptions = function(pollingOnly) {
+                    return {
+                        transports: pollingOnly ? ['polling'] : ['polling', 'websocket'],
+                        upgrade: !pollingOnly,
+                        rememberUpgrade: false,
                         timeout: 5000,
                         forceNew: true,
+                    };
+                };
+
+                // 接收后端二进制响应: [4字节大端JSON长度][JSON][JPEG图片]
+                var _processResultBuf = function(buf, byteLen) {
+                    var view = new DataView(buf);
+                    if (view.byteLength < 4) return;
+                    var jsonLen = view.getUint32(0, false);
+                    if (view.byteLength < 4 + jsonLen) return;
+                    var jsonBytes = new Uint8Array(buf, 4, jsonLen);
+                    var jsonStr = _decodeUtf8(jsonBytes);
+                    var status;
+                    try { status = JSON.parse(jsonStr); } catch(e) { return; }
+
+                    if (status.error) { self.log('\u274c 解码失败'); return; }
+
+                    var jpegStart = 4 + jsonLen;
+                    var jpegBytes = buf.slice(jpegStart);
+                    if (jpegBytes.byteLength > 2) {
+                        var b64 = _arrayBufferToBase64(jpegBytes);
+                        var result = {
+                            success: true,
+                            image: b64,
+                            status: {
+                                mode: status.m,
+                                state: status.s,
+                                position: { x: status.x, y: status.y },
+                                found: !!status.f,
+                                matches: status.c,
+                                match_quality: status.q || 0,
+                                arrow_angle: status.a || 0,
+                                arrow_stopped: !!status.as,
+                                coord_lock: !!status.l,
+                                source: status.src || '',
+                            }
+                        };
+                        self.logUpdate(_fmtResult(result.status, (byteLen / 1024).toFixed(1)));
+                        if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                    }
+                };
+
+                // 接收后端 coords 响应（仅坐标，无 JPEG 图片，适合大地图页面）
+                var _processCoordsResult = function(buf) {
+                    if (!buf || buf.byteLength < 4) return;
+                    var view = new DataView(buf);
+                    var jsonLen = view.getUint32(0, false);
+                    if (buf.byteLength < 4 + jsonLen) return;
+                    var jsonBytes = new Uint8Array(buf, 4, jsonLen);
+                    var jsonStr = _decodeUtf8(jsonBytes);
+                    var status;
+                    try { status = JSON.parse(jsonStr); } catch(e) { return; }
+                    if (status.error) { self.log('\u274c coords 解码失败'); return; }
+                    var result = {
+                        success: true,
+                        image: null,
+                        status: {
+                            mode: status.m,
+                            state: status.s,
+                            position: { x: status.x, y: status.y },
+                            found: !!status.f,
+                            matches: status.c,
+                            match_quality: status.q || 0,
+                            arrow_angle: status.a || 0,
+                            arrow_stopped: !!status.as,
+                            coord_lock: !!status.l,
+                            is_teleport: !!status.tp,
+                            source: status.src || '',
+                        }
+                    };
+                    self.logUpdate(_fmtResult(result.status, (buf.byteLength / 1024).toFixed(1)));
+                    if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                };
+
+                var bindResultHandlers = function(sock) {
+                    sock.on('result', function(data) {
+                        // 标准化为 ArrayBuffer：兼容 ArrayBuffer / TypedArray / Blob
+                        if (data instanceof ArrayBuffer) {
+                            _processResultBuf(data, data.byteLength);
+                        } else if (ArrayBuffer.isView(data)) {
+                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                            _processResultBuf(buf, data.byteLength);
+                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                            // polling 场景 Socket.IO 某些版本可能传 Blob
+                            var blobSize = data.size;
+                            data.arrayBuffer().then(function(ab) { _processResultBuf(ab, blobSize); });
+                        } else {
+                            console.warn('[WS] result: 未知数据类型', typeof data, data);
+                        }
                     });
+
+                    sock.on('coords', function(data) {
+                        if (data instanceof ArrayBuffer) {
+                            _processCoordsResult(data);
+                        } else if (ArrayBuffer.isView(data)) {
+                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                            _processCoordsResult(buf);
+                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                            data.arrayBuffer().then(function(ab) { _processCoordsResult(ab); });
+                        }
+                    });
+                };
+
+                var attemptConnect = function(pollingOnly) {
+                    var sock = io(buildSockOptions(pollingOnly));
                     S.wsSocket = sock;
 
                     sock.on('connect', function() {
@@ -645,11 +750,23 @@ const TrackerCore = (() => {
                         S.wsTransportName = _getSocketTransportName(sock);
                         S.wsConnecting = null;
                         _bindSocketTransportEvents(sock, self);
+
+                        try {
+                            if (S.wsTransportName === 'websocket') {
+                                localStorage.removeItem('tc_ws_polling_only');
+                            } else {
+                                localStorage.setItem('tc_ws_polling_only', '1');
+                            }
+                        } catch (_e) {}
+
                         // 多会话: 报告 token 绑定会话
                         var token = self._ensureSessionToken();
                         sock.emit('session_join', { token: token });
                         self.log('📶 Socket.IO 已连接（' + S.wsTransportName + '）');
-                        resolve(true);
+                        if (!settled) {
+                            settled = true;
+                            resolve(true);
+                        }
                     });
 
                     sock.on('disconnect', function(reason) {
@@ -668,108 +785,31 @@ const TrackerCore = (() => {
                         S.wsTransportName = '';
                         S.wsConnecting = null;
                         console.error('SIO error:', err);
-                        self.log('❌ Socket.IO 连接失败: ' + err.message + '（已尝试 polling / websocket）');
-                        reject(err);
-                    });
 
-                    // 接收后端二进制响应: [4字节大端JSON长度][JSON][JPEG图片]
-                    var _processResultBuf = function(buf, byteLen) {
-                        var view = new DataView(buf);
-                        if (view.byteLength < 4) return;
-                        var jsonLen = view.getUint32(0, false);
-                        if (view.byteLength < 4 + jsonLen) return;
-                        var jsonBytes = new Uint8Array(buf, 4, jsonLen);
-                        var jsonStr = _decodeUtf8(jsonBytes);
-                        var status;
-                        try { status = JSON.parse(jsonStr); } catch(e) { return; }
-
-                        if (status.error) { self.log('\u274c 解码失败'); return; }
-
-                        var jpegStart = 4 + jsonLen;
-                        var jpegBytes = buf.slice(jpegStart);
-                        if (jpegBytes.byteLength > 2) {
-                            var b64 = _arrayBufferToBase64(jpegBytes);
-                            var result = {
-                                success: true,
-                                image: b64,
-                                status: {
-                                    mode: status.m,
-                                    state: status.s,
-                                    position: { x: status.x, y: status.y },
-                                    found: !!status.f,
-                                    matches: status.c,
-                                    match_quality: status.q || 0,
-                                    arrow_angle: status.a || 0,
-                                    arrow_stopped: !!status.as,
-                                    coord_lock: !!status.l,
-                                    source: status.src || '',
-                                }
-                            };
-                            self.logUpdate(_fmtResult(result.status, (byteLen / 1024).toFixed(1)));
-                            if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
-                        }
-                    };
-
-                    sock.on('result', function(data) {
-                        // 标准化为 ArrayBuffer：兼容 ArrayBuffer / TypedArray / Blob
-                        if (data instanceof ArrayBuffer) {
-                            _processResultBuf(data, data.byteLength);
-                        } else if (ArrayBuffer.isView(data)) {
-                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-                            _processResultBuf(buf, data.byteLength);
-                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
-                            // polling 升级过程中 Socket.IO 某些版本可能传 Blob
-                            var blobSize = data.size;
-                            data.arrayBuffer().then(function(ab) { _processResultBuf(ab, blobSize); });
-                        } else {
-                            console.warn('[WS] result: 未知数据类型', typeof data, data);
+                        if (!pollingOnly && !fallbackTried) {
+                            fallbackTried = true;
+                            self.log('⚠️ WebSocket 通道不可用，自动降级为 polling 重连...');
+                            try { sock.disconnect(); } catch (_e) {}
+                            attemptConnect(true);
                             return;
                         }
-                    });
 
-                    // 接收后端 coords 响应（仅坐标，无 JPEG 图片，适合大地图页面）
-                    var _processCoordsResult = function(buf) {
-                        if (!buf || buf.byteLength < 4) return;
-                        var view = new DataView(buf);
-                        var jsonLen = view.getUint32(0, false);
-                        if (buf.byteLength < 4 + jsonLen) return;
-                        var jsonBytes = new Uint8Array(buf, 4, jsonLen);
-                        var jsonStr = _decodeUtf8(jsonBytes);
-                        var status;
-                        try { status = JSON.parse(jsonStr); } catch(e) { return; }
-                        if (status.error) { self.log('\u274c coords 解码失败'); return; }
-                        var result = {
-                            success: true,
-                            image: null,
-                            status: {
-                                mode: status.m,
-                                state: status.s,
-                                position: { x: status.x, y: status.y },
-                                found: !!status.f,
-                                matches: status.c,
-                                match_quality: status.q || 0,
-                                arrow_angle: status.a || 0,
-                                arrow_stopped: !!status.as,
-                                coord_lock: !!status.l,
-                                is_teleport: !!status.tp,
-                                source: status.src || '',
-                            }
-                        };
-                        self.logUpdate(_fmtResult(result.status, (buf.byteLength / 1024).toFixed(1)));
-                        if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
-                    };
-
-                    sock.on('coords', function(data) {
-                        if (data instanceof ArrayBuffer) {
-                            _processCoordsResult(data);
-                        } else if (ArrayBuffer.isView(data)) {
-                            var buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-                            _processCoordsResult(buf);
-                        } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
-                            data.arrayBuffer().then(function(ab) { _processCoordsResult(ab); });
+                        self.log('❌ Socket.IO 连接失败: ' + err.message + '（已回退 polling）');
+                        if (!settled) {
+                            settled = true;
+                            reject(err);
                         }
                     });
 
+                    bindResultHandlers(sock);
+                };
+
+                try {
+                    var preferPollingOnly = false;
+                    try {
+                        preferPollingOnly = localStorage.getItem('tc_ws_polling_only') === '1';
+                    } catch (_e) {}
+                    attemptConnect(preferPollingOnly);
                 } catch(e) {
                     reject(e);
                 }

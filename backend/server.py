@@ -17,6 +17,8 @@ import os
 import time
 import struct
 import threading
+import importlib.util
+from importlib import metadata as importlib_metadata
 from collections import deque
 
 import cv2
@@ -65,6 +67,53 @@ if _cv2_threads > 0:
 
 # Flask + SocketIO
 _SOCKETIO_ASYNC_MODE = os.environ.get('SOCKETIO_ASYNC_MODE', 'threading').lower()
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# 兼容性兜底：threading + werkzeug 场景默认关闭升级，避免 websocket 握手触发 500
+_SOCKETIO_ALLOW_UPGRADES = _env_flag(
+    'SOCKETIO_ALLOW_UPGRADES',
+    _SOCKETIO_ASYNC_MODE in ('gevent', 'eventlet')
+)
+
+
+def _package_version(name: str) -> str:
+    try:
+        return importlib_metadata.version(name)
+    except Exception:
+        return 'not-installed'
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+def _log_socketio_runtime_diagnostics():
+    effective_mode = getattr(socketio, 'async_mode', 'unknown')
+    print('[diag] Socket.IO runtime check:')
+    print(f'  - configured async_mode: {_SOCKETIO_ASYNC_MODE}')
+    print(f'  - effective async_mode : {effective_mode}')
+    print(f'  - allow_upgrades      : {_SOCKETIO_ALLOW_UPGRADES}')
+    print(f"  - flask-socketio      : {_package_version('flask-socketio')}")
+    print(f"  - python-socketio     : {_package_version('python-socketio')}")
+    print(f"  - python-engineio     : {_package_version('python-engineio')}")
+    print(f"  - gevent              : {_package_version('gevent')} (module={_module_available('gevent')})")
+    print(f"  - gevent-websocket    : {_package_version('gevent-websocket')} (module={_module_available('geventwebsocket')})")
+
+    if _SOCKETIO_ASYNC_MODE == 'gevent' and effective_mode != 'gevent':
+        print('  ! WARNING: 已配置 gevent，但运行时并未启用 gevent，请检查依赖或启动方式。')
+    if _SOCKETIO_ALLOW_UPGRADES and effective_mode not in ('gevent', 'eventlet'):
+        print('  ! WARNING: 当前运行模式不建议启用 websocket upgrade，可能导致握手失败。')
+
 app = Flask(__name__)
 # 高性能 JSON provider（orjson）
 app.json = OrjsonProvider(app)
@@ -81,6 +130,7 @@ socketio = SocketIO(
     app,
     cors_allowed_origins='*',
     async_mode=_SOCKETIO_ASYNC_MODE,
+    allow_upgrades=_SOCKETIO_ALLOW_UPGRADES,
     http_compression=True,
     compression_threshold=1024,
     max_http_buffer_size=_WS_FRAME_MAX_BYTES,
@@ -1574,6 +1624,8 @@ def main():
     print("=" * 50)
     print("  \u5730\u56fe\u8ddf\u70b9 - \u7f51\u9875\u7248 [SIFT]")
     print(f"  SocketIO async_mode: {_SOCKETIO_ASYNC_MODE}")
+    print(f"  SocketIO allow_upgrades: {_SOCKETIO_ALLOW_UPGRADES}")
+    _log_socketio_runtime_diagnostics()
     print("  \u6253\u5f00\u6d4f\u89c8\u5668\u8bbf\u95ee: http://0.0.0.0:" + str(config.PORT))
     print("  WebSocket: ws://0.0.0.0:" + str(config.PORT) + "/socket.io/?transport=websocket")
     print("=" * 50)
