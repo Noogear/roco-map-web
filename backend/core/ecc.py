@@ -50,7 +50,7 @@ def ecc_align(
     try:
         cc, warp = cv2.findTransformECC(
             ref, tmpl, warp, cv2.MOTION_TRANSLATION,
-            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 15, 1e-3))
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-3))
     except cv2.error:
         return None
 

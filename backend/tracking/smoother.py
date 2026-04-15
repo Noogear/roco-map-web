@@ -8,8 +8,8 @@ tracking/smoother.py - 坐标平滑器
   4. 渲染 EMA 防抖（静止死区 + 速度自适应 alpha）
 
 外部只需调用：
-  update(cx, cy, found, is_inertial, match_quality, arrow_stopped,
-         tp_far_candidate=None) → (display_x, display_y, tp_confirmed)
+    update(cx, cy, found, is_inertial, match_quality, arrow_stopped,
+                 tp_far_candidate=None) → (display_x, display_y, tp_confirmed, measurement_rejected)
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from __future__ import annotations
 import math
 import json
 import os
+import tempfile
+import threading
 from collections import deque
 
 import cv2
@@ -49,6 +51,7 @@ class CoordSmoother:
         self.smooth_buffer_x: deque[int] = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
         self.smooth_buffer_y: deque[int] = deque(maxlen=self.SMOOTH_BUFFER_SIZE)
         self._smooth_buffer_path = smooth_buffer_path
+        self._last_save_time: float = 0.0   # 节流：避免每帧都 spawn 线程
         if smooth_buffer_path:
             self._load_smooth_buffer()
 
@@ -72,27 +75,30 @@ class CoordSmoother:
         match_quality: float,
         arrow_stopped: bool,
         tp_far_candidate: tuple[int, int, float] | None = None,
-    ) -> tuple[int, int, bool]:
+    ) -> tuple[int, int, bool, bool]:
         """
-        接收一帧坐标，经过完整流水线处理后返回 (display_x, display_y, tp_confirmed)。
+        接收一帧坐标，经过完整流水线处理后返回
+        (display_x, display_y, tp_confirmed, measurement_rejected)。
         tp_confirmed=True 时 display_x/y 即为传送确认后的新位置（供调用方同步引擎）。
-        found=False 时直接返回 (0, 0, False)。
+        measurement_rejected=True 表示本帧真实匹配坐标被异常值过滤拒绝，
+        调用方应避免把该原始坐标继续喂回引擎状态，防止识别逻辑自我强化锁死。
+        found=False 时直接返回 (0, 0, False, False)。
         """
         if not found or cx is None:
-            return 0, 0, False
+            return 0, 0, False, False
 
-        # ① 异常值过滤
+        measurement_rejected = False
+
+        # ① 异常值过滤（以最近接受的坐标为参考，避免分量中位数产生幻影参考点）
         if not is_inertial:
             if len(self.pos_history) >= 3:
-                hist = list(self.pos_history)
-                ref_x = sorted(h[0] for h in hist)[len(hist) // 2]
-                ref_y = sorted(h[1] for h in hist)[len(hist) // 2]
+                ref_x, ref_y = self.pos_history[-1]
                 dist = math.sqrt((cx - ref_x) ** 2 + (cy - ref_y) ** 2)
                 if dist <= self.POS_OUTLIER_THRESHOLD:
                     self.pos_history.append((cx, cy))
                 else:
-                    if self.pos_history:
-                        cx, cy = self.pos_history[-1]
+                    measurement_rejected = True
+                    cx, cy = ref_x, ref_y
             else:
                 self.pos_history.append((cx, cy))
 
@@ -103,15 +109,22 @@ class CoordSmoother:
             predicted = self._kalman_predict()
             if predicted is not None:
                 smooth_x, smooth_y = predicted
-                self._kalman_update(smooth_x, smooth_y, quality=0.3)
+                # 惯性帧只做预测不做矫正，避免预测值喂回自身形成自环。
+                # 逐帧衰减速度估计，使惯性外推自然减速到停。
+                self._kalman.statePost[2, 0] *= 0.92
+                self._kalman.statePost[3, 0] *= 0.92
             else:
                 smooth_x, smooth_y = cx, cy
 
-        # ③ 持久化
+        # ③ 持久化（节流：warmup 完成后最多每 5 秒保存一次，避免每帧 spawn 线程）
         self.smooth_buffer_x.append(smooth_x)
         self.smooth_buffer_y.append(smooth_y)
         if len(self.smooth_buffer_x) >= self.SMOOTH_BUFFER_SIZE:
-            self._save_smooth_buffer()
+            import time as _time
+            _now = _time.monotonic()
+            if _now - self._last_save_time >= 5.0:
+                self._last_save_time = _now
+                self._save_smooth_buffer()
 
         # ④ 传送检测（来源1: Kalman 跳变 / 来源2: 引擎远距离候选）
         _tp_thresh = getattr(config, 'TP_JUMP_THRESHOLD', 300)
@@ -146,11 +159,11 @@ class CoordSmoother:
             if scatter <= _tp_radius:
                 print(f"[传送检测] 聚类确认 scatter={scatter:.0f}px → 立即重置到 ({med_x},{med_y})")
                 self.reset_to(med_x, med_y)
-                return med_x, med_y, True
+                return med_x, med_y, True, False
 
         # ⑤ 渲染 EMA 防抖
         display_x, display_y = self._render_ema(smooth_x, smooth_y, is_inertial, arrow_stopped)
-        return display_x, display_y, False
+        return display_x, display_y, False, measurement_rejected
 
     def reset_to(self, x: int, y: int) -> None:
         """传送确认后立即重置所有过滤器到新位置。"""
@@ -172,6 +185,14 @@ class CoordSmoother:
         self._display_x = None
         self._display_y = None
         self._tp_candidate_buffer.clear()
+
+    def clear_position_history(self) -> None:
+        """仅清空异常值过滤历史，保留其他平滑状态。"""
+        self.pos_history.clear()
+
+    def predict_position(self) -> tuple[int, int] | None:
+        """对外暴露 Kalman 预测位置，供场景切换等编排逻辑使用。"""
+        return self._kalman_predict()
 
     # ------------------------------------------------------------------
     # Kalman 内部方法
@@ -199,12 +220,18 @@ class CoordSmoother:
 
     def _kalman_update(self, cx: int, cy: int, quality: float = 1.0) -> tuple[int, int]:
         measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
-        # 原观测噪声 * (1/quality)，质量低 → 噪声大 → 更信任预测
+        # 观测噪声：质量低 → 噪声大 → 更信任预测
         noise = max(1.0, 50.0 * (1.0 - quality))
         self._kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * noise
+        # 过程噪声速度分量随质量自适应：高质量允许速度快变化（响应），低质量保持平稳（抗噪）
+        vel_noise = 2.0 + 4.0 * quality
+        self._kalman.processNoiseCov[2, 2] = vel_noise
+        self._kalman.processNoiseCov[3, 3] = vel_noise
         if not self._kalman_initialized:
             self._kalman.statePre = np.array(
-                [[np.float32(cx)], [np.float32(cy)], [0.0], [0.0]])
+                [[np.float32(cx)], [np.float32(cy)], [np.float32(0.0)], [np.float32(0.0)]],
+                dtype=np.float32,
+            )
             self._kalman.statePost = self._kalman.statePre.copy()
             self._kalman_initialized = True
         self._kalman.predict()
@@ -275,17 +302,26 @@ class CoordSmoother:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                return
             xs = data.get('smooth_x', [])
             ys = data.get('smooth_y', [])
+            if not isinstance(xs, list) or not isinstance(ys, list):
+                return
             for x, y in zip(xs, ys):
-                self.smooth_buffer_x.append(int(x))
-                self.smooth_buffer_y.append(int(y))
-            if xs and ys:
-                lx, ly = int(xs[-1]), int(ys[-1])
+                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                    continue
+                ix, iy = int(x), int(y)
+                if ix < 0 or iy < 0:
+                    continue
+                self.smooth_buffer_x.append(ix)
+                self.smooth_buffer_y.append(iy)
+            if self.smooth_buffer_x and self.smooth_buffer_y:
+                lx, ly = self.smooth_buffer_x[-1], self.smooth_buffer_y[-1]
                 self._kalman_update(lx, ly, quality=0.5)
                 self._display_x = lx
                 self._display_y = ly
-                print(f"[平滑缓冲] 已加载 {len(xs)} 个历史坐标，最后位置: ({lx},{ly})")
+                print(f"[平滑缓冲] 已加载 {len(self.smooth_buffer_x)} 个历史坐标，最后位置: ({lx},{ly})")
         except Exception as e:
             print(f"[平滑缓冲] 加载失败: {e}")
 
@@ -293,12 +329,19 @@ class CoordSmoother:
         path = self._smooth_buffer_path
         if not path:
             return
-        try:
-            data = {
-                'smooth_x': list(self.smooth_buffer_x),
-                'smooth_y': list(self.smooth_buffer_y),
-            }
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-        except Exception as e:
-            print(f"[平滑缓冲] 保存失败: {e}")
+        # 异步写入：取快照后在后台线程保存，避免阻塞 SIFT 工作线程
+        snapshot = {
+            'smooth_x': list(self.smooth_buffer_x),
+            'smooth_y': list(self.smooth_buffer_y),
+        }
+        def _write():
+            try:
+                parent = os.path.dirname(path) or '.'
+                os.makedirs(parent, exist_ok=True)
+                with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=parent, delete=False) as tmp:
+                    json.dump(snapshot, tmp)
+                    tmp_path = tmp.name
+                os.replace(tmp_path, path)
+            except Exception as e:
+                print(f"[平滑缓冲] 保存失败: {e}")
+        threading.Thread(target=_write, daemon=True).start()

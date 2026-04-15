@@ -19,51 +19,44 @@ def make_clahe_pair():
     return clahe_normal, clahe_low
 
 
-def adaptive_clahe(gray: np.ndarray, clahe_normal, clahe_low, low_thresh: float) -> np.ndarray:
-    """
-    低纹理用 clahe_low，否则 clahe_normal。
-
-    Args:
-        gray:          输入灰度图
-        clahe_normal:  标准纹理 CLAHE
-        clahe_low:     低纹理 CLAHE
-        low_thresh:    std 低于此值视为低纹理
-    """
-    if np.std(gray) < low_thresh:
-        return clahe_low.apply(gray)
-    return clahe_normal.apply(gray)
-
-
 def adaptive_clahe_map(gray: np.ndarray, clahe_normal, clahe_low,
                        low_thresh: float, tile: int = 256) -> np.ndarray:
-    """大地图分块自适应 CLAHE，启动时对逻辑地图整体处理一次。"""
+    """大地图分块自适应 CLAHE + 锐化，与小地图 enhance_minimap 保持一致增强路径。"""
     h, w = gray.shape[:2]
     result = np.empty_like(gray)
     for y in range(0, h, tile):
         for x in range(0, w, tile):
             patch = gray[y:y + tile, x:x + tile]
-            clahe = clahe_low if np.std(patch) < low_thresh else clahe_normal
-            result[y:y + tile, x:x + tile] = clahe.apply(patch)
+            std = float(np.std(patch))
+            result[y:y + tile, x:x + tile] = enhance_minimap(
+                patch, std, clahe_normal, clahe_low, low_thresh)
     return result
 
 
-def enhance_for_texture(gray: np.ndarray, texture_std: float, clahe_low) -> np.ndarray:
+def enhance_minimap(gray_raw: np.ndarray, texture_std: float,
+                    clahe_normal, clahe_low, low_thresh: float) -> np.ndarray:
     """
-    按纹理 std 连续决定增强强度。
+    统一小地图增强：一次 CLAHE + 按纹理强度做锐化（合并原 adaptive_clahe + enhance_for_texture，消除双 CLAHE）。
 
-    texture_std < 15  : 超低纹理（海面），双边保边 + 高CLAHE + 强锐化
-    texture_std < 30  : 低纹理（雪地），温和锐化
-    else              : 标准纹理，原图返回
+    texture_std < 15 : 超低纹理（海面），双边保边 + clahe_low + 强 unsharp mask
+    texture_std < 30 : 低纹理（雪地），clahe_low + 温和锐化
+    texture_std < 55 : 中低纹理（草地），clahe_normal + 极温和 unsharp
+    else             : 标准纹理，clahe_normal
     """
     if texture_std < 15:
-        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        filtered = cv2.bilateralFilter(gray_raw, 9, 75, 75)
         enhanced = clahe_low.apply(filtered)
         blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
         return cv2.addWeighted(enhanced, 2.0, blurred, -1.0, 0)
     if texture_std < 30:
-        blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
-        return cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
-    return gray
+        enhanced = clahe_low.apply(gray_raw)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=3)
+        return cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+    if texture_std < 55:
+        enhanced = clahe_normal.apply(gray_raw)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=2)
+        return cv2.addWeighted(enhanced, 1.3, blurred, -0.3, 0)
+    return clahe_normal.apply(gray_raw)
 
 
 def correct_color_temperature(bgr: np.ndarray) -> np.ndarray:

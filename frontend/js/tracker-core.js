@@ -1,6 +1,6 @@
 /**
- * tracker-core.js - 地图跟点 共用识别核心
- * index.html 和 bigmap.html 共用此模块
+ * tracker-core.js - 地图跟点共用识别核心
+ * 供当前识别页 / 地图页 / 配置页共享。
  *
  * 提供:
  *   TC.log(msg)                    日志
@@ -48,6 +48,7 @@ const TrackerCore = (() => {
         captureCanvas: null,  // 复用截图 canvas，避免每帧创建导致 GPU 内存泄漏
         lastWasUpdate: false, // logUpdate 状态标记
         nullBlobCount: 0,     // 连续 null blob 计数，用于检测视频流问题
+        sessionToken: '',     // 多会话 token
     };
 
     // ==================== 内部工具 ====================
@@ -82,7 +83,6 @@ const TrackerCore = (() => {
         // 附加标志
         var extras = [];
         if (st.coord_lock)  extras.push('🔒');
-        if (st.hybrid_busy) extras.push('AI↑');
         // 拼装
         var line = icon + (tag ? ' [' + tag + ']' : '') + ' ' + pos
                  + ' | ' + st.matches + '匹' + q;
@@ -195,7 +195,9 @@ const TrackerCore = (() => {
         set selCircle(v) { Object.assign(S.selCircle, v); },
         get isScreenActive() { return !!S.screenStream; },
         get wsConnected() { return S.wsConnected; },
+        get wsSocket() { return S.wsSocket; },
         get wsTransportName() { return S.wsTransportName; },
+        get sessionToken() { return S.sessionToken; },
 
         // ========== 日志 ==========
         log(msg) {
@@ -254,7 +256,7 @@ const TrackerCore = (() => {
         // ========== 状态格式化 ==========
         formatStatus(status) {
             var text = '--', cls = 'green', label = '';
-            var found = status.found != null ? status.found : !!status.f;  // 兼容 found / f 两种字段名
+            var found = !!status.found;
             if (status.mode === 'sift') {
                 if (status.state === 'SCENE_CHANGE') {
                     text = '切场'; cls = 'yellow'; label = '场景切换';
@@ -303,7 +305,7 @@ const TrackerCore = (() => {
             if (xe && status.position) xe.textContent = status.position.x;
             if (ye && status.position) ye.textContent = status.position.y;
             if (fe) {
-                var isFound = status.found != null ? status.found : !!status.f;
+                var isFound = !!status.found;
                 fe.textContent = isFound ? '\u2705 \u662f' : '\u274c \u5426';
                 fe.className = 'status-value ' + (isFound ? 'found-yes' : 'found-no');
             }
@@ -315,12 +317,6 @@ const TrackerCore = (() => {
                 var q = status.match_quality || 0;
                 qe.textContent = (q * 100).toFixed(0) + '%';
                 qe.style.color = q >= 0.7 ? '#4caf50' : q >= 0.4 ? '#ffa726' : '#ff5252';
-            }
-
-            // 混合引擎状态
-            var he = document.getElementById(ids.hybrid || 'hybridStatusItem');
-            if (he && status.hybrid !== undefined) {
-                he.style.display = (status.hybrid && status.hybrid_busy) ? '' : 'none';
             }
         },
 
@@ -552,6 +548,27 @@ const TrackerCore = (() => {
         },
 
 
+        // ========== 多会话 Token ==========
+        _ensureSessionToken() {
+            if (S.sessionToken) return S.sessionToken;
+            var stored = null;
+            try { stored = localStorage.getItem('rec_session_token'); } catch(e) {}
+            if (stored && stored.length >= 8) {
+                S.sessionToken = stored;
+            } else {
+                // crypto.randomUUID() 或 fallback
+                if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+                    S.sessionToken = crypto.randomUUID();
+                } else {
+                    S.sessionToken = 'xxxx-xxxx-xxxx'.replace(/x/g, function() {
+                        return Math.floor(Math.random() * 16).toString(16);
+                    });
+                }
+                try { localStorage.setItem('rec_session_token', S.sessionToken); } catch(e) {}
+            }
+            return S.sessionToken;
+        },
+
         // ========== Socket.IO 二进制通道 ==========
         /**
          * 建立 Socket.IO 连接（使用 socket.io client 库）
@@ -584,6 +601,9 @@ const TrackerCore = (() => {
                         S.wsTransportName = _getSocketTransportName(sock);
                         S.wsConnecting = null;
                         _bindSocketTransportEvents(sock, self);
+                        // 多会话: 报告 token 绑定会话
+                        var token = self._ensureSessionToken();
+                        sock.emit('session_join', { token: token });
                         self.log('📶 Socket.IO 已连接（' + S.wsTransportName + '）');
                         resolve(true);
                     });
@@ -638,8 +658,7 @@ const TrackerCore = (() => {
                                     arrow_angle: status.a || 0,
                                     arrow_stopped: !!status.as,
                                     coord_lock: !!status.l,
-                                    hybrid: !!status.hy,
-                                    hybrid_busy: !!status.h,
+                                    source: status.src || '',
                                 }
                             };
                             self.logUpdate(_fmtResult(result.status, (byteLen / 1024).toFixed(1)));
@@ -689,8 +708,7 @@ const TrackerCore = (() => {
                                 arrow_stopped: !!status.as,
                                 coord_lock: !!status.l,
                                 is_teleport: !!status.tp,
-                                hybrid: !!status.hy,
-                                hybrid_busy: !!status.h,
+                                source: status.src || '',
                             }
                         };
                         self.logUpdate(_fmtResult(result.status, (buf.byteLength / 1024).toFixed(1)));
@@ -754,31 +772,13 @@ const TrackerCore = (() => {
             return Promise.resolve();
         },
 
-
-        // ========== 引擎检测 ==========
-        checkEngines() {
-            var self = this;
-            return fetch('/api/mode', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: 'loftr' })
-            }).then(function(tr) { return tr.json(); }).then(function(tResult) {
-                if (!tResult.success) {
-                    self.log('\u26a0\ufe0f SIFT-only 模式：LoFTR 不可用');
-                    return { loftr: false };
-                }
-                // 恢复为 sift
-                return fetch('/api/mode', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mode: 'sift' })
-                }).then(function() { return { loftr: true }; });
-            }).catch(function(e) {
-                console.log('引擎检测跳过:', e.message);
-                return { loftr: false };
-            });
+        requestLatestJpeg() {
+            if (!S.wsSocket || !S.wsConnected) {
+                return false;
+            }
+            S.wsSocket.emit('request_jpeg');
+            return true;
         },
-
 
         // ========== 测试图片 ==========
         loadTestImages(gridContainerId) {
@@ -810,8 +810,7 @@ const TrackerCore = (() => {
     }; // end of return
 })();
 
-// 兼容短别名
-var TC = TrackerCore;
+export default TrackerCore;
 
 /**
  * ArrayBuffer 转 Base64 (用于 Socket.IO 二进制响应的 JPEG 图片)

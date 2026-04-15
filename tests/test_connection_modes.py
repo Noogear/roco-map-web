@@ -4,9 +4,11 @@ import io
 import json
 import struct
 import sys
+import time
 import types
 import unittest
 from collections import deque
+from threading import Lock
 
 from PIL import Image
 
@@ -44,6 +46,16 @@ class FakeTracker:
         self.latest_status = self._make_status()
         self._linear_filter_consecutive = 0
         self.last_minimap = None
+        self.result_callback = None
+        self._push_jpeg = False
+        self._last_active_ts = time.time()
+        self._process_lock = Lock()
+
+    def touch_active(self):
+        self._last_active_ts = time.time()
+
+    def save_session_state(self):
+        pass
 
     def _make_status(self):
         return {
@@ -67,6 +79,8 @@ class FakeTracker:
         self.latest_result_image = TEST_RESULT_B64
         if not self.pos_history:
             self.pos_history.append((128, 256))
+        if self.result_callback is not None:
+            self.result_callback()
 
     def process_frame(self, need_base64=True, need_jpeg=True):
         self.latest_status = self._make_status()
@@ -75,13 +89,6 @@ class FakeTracker:
             self.latest_result_jpeg if need_jpeg else None,
         )
 
-    def set_mode(self, mode):
-        if mode not in ('sift', 'loftr'):
-            return False
-        self.current_mode = mode
-        self.latest_status = self._make_status()
-        return True
-
     def get_latest_result_base64(self):
         return self.latest_result_image
 
@@ -89,21 +96,36 @@ class FakeTracker:
         return self.latest_result_jpeg
 
 
-def _load_main_web_with_fake_tracker():
-    fake_tracker_module = types.ModuleType('tracker_core')
-    fake_tracker_module.AIMapTrackerWeb = FakeTracker
+class _FakeSharedSIFT:
+    map_width = 1024
+    map_height = 1024
 
-    original_tracker_core = sys.modules.get('tracker_core')
-    sys.modules['tracker_core'] = fake_tracker_module
-    sys.modules.pop('main_web', None)
+
+def _load_main_web_with_fake_tracker():
+    fake_tracker_module = types.ModuleType('backend.tracker_core')
+    fake_tracker_module.MapTrackerWeb = FakeTracker
+
+    fake_engines_module = types.ModuleType('backend.tracker_engines')
+    fake_engines_module.get_shared_sift = lambda: _FakeSharedSIFT()
+    fake_engines_module.SharedSIFTResources = _FakeSharedSIFT
+
+    original_tracker_core = sys.modules.get('backend.tracker_core')
+    original_tracker_engines = sys.modules.get('backend.tracker_engines')
+    sys.modules['backend.tracker_core'] = fake_tracker_module
+    sys.modules['backend.tracker_engines'] = fake_engines_module
+    sys.modules.pop('backend.server', None)
 
     try:
-        return importlib.import_module('main_web')
+        return importlib.import_module('backend.server')
     finally:
         if original_tracker_core is not None:
-            sys.modules['tracker_core'] = original_tracker_core
+            sys.modules['backend.tracker_core'] = original_tracker_core
         else:
-            sys.modules.pop('tracker_core', None)
+            sys.modules.pop('backend.tracker_core', None)
+        if original_tracker_engines is not None:
+            sys.modules['backend.tracker_engines'] = original_tracker_engines
+        else:
+            sys.modules.pop('backend.tracker_engines', None)
 
 
 MAIN_WEB = _load_main_web_with_fake_tracker()
@@ -121,11 +143,14 @@ def _unpack_result_packet(packet):
 class WebConnectionModesTest(unittest.TestCase):
     def setUp(self):
         self.http_client = APP.test_client()
-        MAIN_WEB.tracker.sift_engine.coord_lock_enabled = False
-        MAIN_WEB.tracker.pos_history.clear()
-        MAIN_WEB.tracker.latest_result_jpeg = TEST_JPEG
-        MAIN_WEB.tracker.latest_result_image = TEST_RESULT_B64
-        MAIN_WEB.tracker.latest_status = MAIN_WEB.tracker._make_status()
+        fake = FakeTracker()
+        fake.result_callback = lambda: MAIN_WEB._on_result_ready('default')
+        MAIN_WEB._sessions['default'] = fake
+        self.fake_tracker = fake
+
+    def tearDown(self):
+        MAIN_WEB._sessions.pop('default', None)
+        MAIN_WEB._sid_to_token.clear()
 
     def test_upload_minimap_accepts_json_base64(self):
         response = self.http_client.post(
@@ -153,19 +178,24 @@ class WebConnectionModesTest(unittest.TestCase):
         self.assertEqual(payload['status']['state'], 'FOUND')
 
     def test_latest_frame_returns_jpeg_binary(self):
-        MAIN_WEB.tracker.set_minimap('frame-ready')
+        self.fake_tracker.set_minimap('frame-ready')
 
-        response = self.http_client.get('/api/latest_frame')
+        response = self.http_client.get('/api/latest_frame?token=default')
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, 'image/jpeg')
         self.assertEqual(response.data, TEST_JPEG)
 
-    def test_socket_connect_sends_initial_status(self):
+    def test_session_join_sends_initial_status(self):
         client = SOCKETIO.test_client(APP, flask_test_client=self.http_client)
         try:
+            client.get_received()  # clear connect events
+            client.emit('session_join', {'token': 'default'})
             received = client.get_received()
-            status_events = [event for event in received if event['name'] == 'status']
+            ready_events = [e for e in received if e['name'] == 'session_ready']
+            status_events = [e for e in received if e['name'] == 'status']
+            self.assertTrue(ready_events)
+            self.assertTrue(ready_events[0]['args'][0]['ok'])
             self.assertTrue(status_events)
             self.assertEqual(status_events[0]['args'][0]['position'], {'x': 128, 'y': 256})
         finally:
@@ -174,7 +204,9 @@ class WebConnectionModesTest(unittest.TestCase):
     def test_socket_frame_event_returns_binary_result_packet(self):
         client = SOCKETIO.test_client(APP, flask_test_client=self.http_client)
         try:
-            client.get_received()  # 清掉 connect 时的 status 事件
+            client.get_received()
+            client.emit('session_join', {'token': 'default'})
+            client.get_received()  # clear session_ready + status
             client.emit('frame', TEST_JPEG)
             received = client.get_received()
             result_events = [event for event in received if event['name'] == 'result']
@@ -195,6 +227,9 @@ class WebConnectionModesTest(unittest.TestCase):
         try:
             watcher.get_received()
             sender.get_received()
+
+            sender.emit('session_join', {'token': 'default'})
+            sender.get_received()  # clear session_ready + status
 
             sender.emit('frame', TEST_JPEG)
 

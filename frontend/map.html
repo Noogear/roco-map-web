@@ -1,0 +1,260 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>洛克王国世界互动地图</title>
+    <script>
+        try {
+            document.documentElement.setAttribute('data-sidebar-collapsed', localStorage.getItem('sidebar_collapsed') === '1' ? '1' : '0');
+            window.__mapMarkerCountSnapshot = localStorage.getItem('map_marker_count_snapshot') || '📍 加载中…';
+            window.__mapActiveCategorySnapshot = localStorage.getItem('map_active_category_snapshot') || '分类加载中…';
+        } catch (_e) {
+            document.documentElement.setAttribute('data-sidebar-collapsed', '0');
+            window.__mapMarkerCountSnapshot = '📍 加载中…';
+            window.__mapActiveCategorySnapshot = '分类加载中…';
+        }
+    </script>
+    <link rel="stylesheet" href="/css/common.css">
+    <link rel="stylesheet" href="/css/map.css">
+</head>
+<body class="app-body page-preload" data-page="map">
+
+    <main class="app-main app-main--map" style="padding:0;">
+        <section class="terra-shell">
+            <section class="terra-stage">
+                <aside class="terra-sidebar">
+                    <div class="terra-sidebar-head terra-sidebar-head--panel">
+                        <h1>资源点位</h1>
+                        <div class="terra-sidebar-head-controls">
+                            <button class="terra-sidebar-head-btn" id="mapSettingsBtn" type="button" title="打开设置" aria-label="打开设置" aria-haspopup="dialog" aria-expanded="false">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c0 .67.39 1.28 1 1.51.19.07.39.1.6.1H21a2 2 0 0 1 0 4h-.09c-.21 0-.41.03-.6.1-.61.23-1 .84-1 1.51z"/></svg>
+                            </button>
+                            <button class="terra-sidebar-head-btn" id="sidebarPanelClose" type="button" title="关闭资源侧栏" aria-label="关闭资源侧栏">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                            </button>
+                            <div class="map-settings-popover" id="mapSettingsPopover">
+                                <div class="map-settings-popover-head">
+                                    <strong>地图显示设置</strong>
+                                    <small>只调当前地图功能，不跳页。</small>
+                                </div>
+                                <label class="map-settings-row" for="mapPrefMarkerSize">
+                                    <span>资源点大小</span>
+                                    <input id="mapPrefMarkerSize" type="range" min="6" max="28" step="1" value="10">
+                                    <span class="map-settings-val" id="mapPrefMarkerSizeVal">10</span>
+                                </label>
+                                <label class="map-settings-row" for="mapPrefMarkerOpacity">
+                                    <span>资源点透明度</span>
+                                    <input id="mapPrefMarkerOpacity" type="range" min="20" max="100" step="5" value="88">
+                                    <span class="map-settings-val" id="mapPrefMarkerOpacityVal">88%</span>
+                                </label>
+                                <label class="map-settings-row" for="mapPrefSidebarBg">
+                                    <span>侧栏背景</span>
+                                    <input id="mapPrefSidebarBg" type="color" value="#fffdf9">
+                                    <span class="map-settings-val" id="mapPrefSidebarBgVal">#fffdf9</span>
+                                </label>
+                                <label class="map-settings-check" for="mapPrefRememberFilters">
+                                    <input id="mapPrefRememberFilters" type="checkbox">
+                                    <span>记住地图筛选</span>
+                                </label>
+                                <label class="map-settings-check" for="mapPrefAutoCenter">
+                                    <input id="mapPrefAutoCenter" type="checkbox">
+                                    <span>玩家自动保持可见</span>
+                                </label>
+                                <div class="map-settings-actions">
+                                    <button type="button" id="mapPrefResetBtn" class="map-settings-reset-btn">重置默认</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="terra-action-row">
+                        <button type="button" id="showAllBtn">全部显示</button>
+                        <button type="button" id="hideAllBtn">全部隐藏</button>
+                        <button type="button" id="refreshMarkersBtn">刷新数据</button>
+                    </div>
+                    <div class="terra-stats-bar">
+                        <span class="stat-chip" id="markerCountChip">📍 加载中…</span>
+                        <span class="stat-chip" id="activeCategoryChip">分类加载中…</span>
+                    </div>
+                    <script>
+                        (function () {
+                            var markerChip = document.getElementById('markerCountChip');
+                            var categoryChip = document.getElementById('activeCategoryChip');
+                            if (markerChip && window.__mapMarkerCountSnapshot) markerChip.textContent = window.__mapMarkerCountSnapshot;
+                            if (categoryChip && window.__mapActiveCategorySnapshot) categoryChip.textContent = window.__mapActiveCategorySnapshot;
+                        })();
+                    </script>
+                    <div class="resource-sidebar-scroll">
+                        <div id="categoryGroups"></div>
+                    </div>
+                    <div class="terra-search-area">
+                        <div class="terra-search-wrap">
+                            <div class="terra-search-row">
+                                <input id="markerSearchInput" type="search" placeholder="搜索标注点标题及内容…">
+                            </div>
+                            <div id="markerSearchSuggest"></div>
+                        </div>
+                    </div>
+                </aside>
+
+                <div class="terra-map-topbar">
+                    <button class="map-toolbar-btn" type="button" id="zoomInBtn" title="放大">＋</button>
+                    <button class="map-toolbar-btn" type="button" id="zoomOutBtn" title="缩小">－</button>
+                    <span class="map-zoom-label" id="zoomLabel" title="点击修改缩放比例">100%</span>
+                    <input class="map-zoom-input" id="zoomInput" type="number" min="10" max="1000" step="1" aria-label="缩放比例">
+                    <button class="map-toolbar-btn" type="button" id="resetViewBtn" title="重置视图">↺</button>
+                    <button class="map-toolbar-btn" type="button" id="centerPlayerBtn" title="居中定位点">◎</button>
+                </div>
+
+                <button class="map-side-launcher map-side-launcher--left" id="sidebarOpenBtn" type="button" title="打开资源侧栏" aria-label="打开资源侧栏">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 5h18M3 12h18M3 19h18"/></svg>
+                </button>
+
+                <button class="map-side-launcher map-side-launcher--right" id="routeToggleBtn" type="button" title="打开路线面板" aria-label="打开路线面板">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="M13 5l7 7-7 7"/></svg>
+                </button>
+
+                <div id="mc">
+                    <div id="mw">
+                        <img id="mi" alt="大地图" draggable="false">
+                    </div>
+                    <canvas id="markerCanvas" aria-label="Canvas 点位层"></canvas>
+                    <div id="playerDot" style="display:none;"></div>
+                    <svg id="playerArrow" width="44" height="44" viewBox="0 0 44 44" style="opacity:0;">
+                        <polygon id="playerArrowPoly" points="22,3 15,18 29,18"></polygon>
+                        <circle id="playerArrowCircle" cx="22" cy="22" r="8" style="display:none;"></circle>
+                    </svg>
+                </div>
+
+                <!-- 右侧选择器工具栏 -->
+                <div class="map-tool-dock" id="mapToolDock">
+                    <button class="map-tool-btn is-active" id="toolPan" title="抓手 — 拖动地图 / 点击空白处定位" data-tool="pan">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 11V6a2 2 0 0 0-4 0v1M14 10V4a2 2 0 0 0-4 0v6M10 10V6a2 2 0 0 0-4 0v8l-1.46-1.46a2 2 0 0 0-2.83 2.83L7.88 21.5H18a2 2 0 0 0 2-2v-5.5a2 2 0 0 0-4 0v1M22 11v1a2 2 0 0 0-4 0"/></svg>
+                    </button>
+                    <button class="map-tool-btn" id="toolMultiSelect" title="多选点 — 选择已有点或添加自定义点" data-tool="multiselect">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><path d="M9 16l2 2 4-4"/></svg>
+                    </button>
+                    <button class="map-tool-btn" id="toolBoxSelect" title="框选 — 拖动框选区域内的点" data-tool="boxselect">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="4 2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+                    </button>
+                    <div class="map-tool-divider"></div>
+                    <button class="map-tool-btn map-tool-btn--danger" id="toolClearSelect" title="清除选择">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                </div>
+
+                <div class="map-player-hud">
+                    <span class="hud-label">X</span><span class="hud-val" id="coordX">--</span>
+                    <span class="hud-label">Y</span><span class="hud-val" id="coordY">--</span>
+                    <span class="hud-label" id="coordState" style="margin-left:auto;opacity:.7;">点击地图定位</span>
+                </div>
+
+                <!-- 单点详情浮层（原有设计） -->
+                <div class="map-detail-float is-empty" id="markerDetailPanel">
+                    <button class="map-detail-close" id="markerDetailCloseBtn" type="button" title="隐藏信息列表" aria-label="隐藏信息列表">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="4"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
+                    </button>
+                    <h3 id="markerDetailTitle">点位详情</h3>
+                    <div class="resource-meta" id="selectedMarkerChip">未选中</div>
+                    <div id="markerDetailCard" style="margin-top:6px;"></div>
+                </div>
+
+                <!-- 路线面板 -->
+                <aside class="route-panel" id="routePanel">
+                    <div class="route-panel-head">
+                        <h2>路线规划</h2>
+                        <div class="route-panel-controls">
+                            <button class="route-display-btn" id="routeDisplayBtn" type="button" title="显示设置">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                            </button>
+                            <button class="route-panel-close" id="routePanelClose" type="button" title="关闭">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                            </button>
+                        </div>
+                        <div class="route-display-popup" id="routeDisplayPopup">
+                            <div class="rdp-row"><span class="rdp-label">路线颜色</span><input type="color" id="routeLineColor" value="#d4a050"></div>
+                            <div class="rdp-row"><span class="rdp-label">路线粗细</span><input type="range" id="routeLineWidth" min="1" max="8" step="1" value="3"><span class="rdp-val" id="routeLineWidthVal">3px</span></div>
+                            <div class="rdp-row"><span class="rdp-label">路线点颜色</span><input type="color" id="routeDotColor" value="#d4a050"></div>
+                            <div class="rdp-row"><span class="rdp-label">箭头颜色</span><input type="color" id="routeArrowColor" value="#d4a050"></div>
+                            <div class="rdp-row"><span class="rdp-label">透明度</span><input type="range" id="routeLineOpacity" min="20" max="100" step="5" value="80"><span class="rdp-val" id="routeOpacityVal">80%</span></div>
+                            <div class="rdp-row"><span class="rdp-label">传送权重</span><input type="range" id="teleportCostSlider" min="100" max="2000" step="50" value="500"><span class="rdp-val" id="teleportCostVal">500</span></div>
+                            <div class="rdp-row"><label class="rdp-check"><input type="checkbox" id="routeShowRadius"> 显示范围圈</label></div>
+                            <div class="rdp-actions"><button type="button" id="routeDisplayResetBtn">重置默认</button></div>
+                        </div>
+                    </div>
+                    <div class="route-panel-body" id="routePanelBody">
+                        <div class="route-section-wrapper">
+                            <button class="route-section-label" style="margin-top:0" data-collapse="routeServerSection" type="button" aria-controls="routeServerSection" aria-expanded="true">路线存储</button>
+                            <div class="route-section-body" id="routeServerSection">
+                                <div class="route-server-picker">
+                                    <select id="routeServerSelect" aria-label="选择存储路线">
+                                        <option value="">选择 routes 目录存储路线…</option>
+                                    </select>
+                                    <button type="button" id="routeServerLoad">载入</button>
+                                    <button type="button" id="routeServerRefresh" title="刷新存储路线">↻</button>
+                                </div>
+                                <div class="route-actions">
+                                    <button type="button" id="routeImport">📥 导入本地</button>
+                                    <button type="button" id="routeExport">📤 导出路线</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="route-section-wrapper">
+                            <button class="route-section-label" data-collapse="calcSection" type="button" aria-controls="calcSection" aria-expanded="true">路线计算</button>
+                            <div class="route-section-body" id="calcSection">
+                                <div class="route-wp-toolbar route-wp-toolbar--calc">
+                                    <button type="button" class="route-add-selection-btn" id="routeAddSelection" title="将当前所有选择点加入路径">➕ 将选择点加入路径</button>
+                                </div>
+                                <label class="route-lock-toggle route-lock-toggle--calc" id="routeLockToggle"><input type="checkbox" id="routeLockCheck"> 锁定列表（禁止增删）</label>
+                                <div class="route-mode-toggle">
+                                    <button type="button" class="route-mode-btn is-active" id="routeAlgoRange">🔮 范围优化</button>
+                                    <button type="button" class="route-mode-btn" id="routeAlgoNode">⚡ 节点优化</button>
+                                    <button type="button" class="route-mode-btn" id="routeAlgoManual">✏️ 手动排序</button>
+                                </div>
+                                <div class="route-mode-hint" id="routeModeHint">范围优化：重叠采集圈合并为单一站点，传送点不参与合并</div>
+                                <div class="route-calc-btn-wrap">
+                                    <button type="button" id="routeCalc" class="route-calc-btn">🔄 计算路线布局</button>
+                                    <button type="button" class="route-result-toggle-btn" id="routeResultToggle" title="查看计算结果" aria-label="查看计算结果">◎</button>
+                                    <div class="route-result-popover" id="routeResultArea"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="route-section-wrapper route-section-wrapper--waypoints">
+                            <div class="route-section-label route-section-label--static" aria-controls="wpSection" aria-expanded="true">
+                                <span>路径点 (<span id="routeWpCount">0</span>)</span>
+                                <button type="button" id="routeWpClearAll" class="route-wp-clear-btn" title="清空路径点（再次点击确认）">清空路径点</button>
+                            </div>
+                            <div class="route-section-body" id="wpSection">
+                                <div id="routeNavHud"></div>
+                                <ul class="route-wp-list" id="routeWpList"></ul>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="route-nav-sticky">
+                        <button type="button" class="route-nav-start-btn" id="routeNavStart">🧭 开始导航</button>
+                        <div class="route-nav-opts"><label><input type="checkbox" id="routeAutoVisit" checked> 自动标记经过</label></div>
+                    </div>
+                </aside>
+            </section>
+        </section>
+    </main>
+
+    <script type="module" src="/js/map.js"></script>
+<!-- Route type assignment dialog – placed at body level so position:fixed is not clipped by route-panel's transform stacking context -->
+<div class="route-type-dialog" id="routeTypeDialog">
+    <div class="route-type-dialog-card" role="dialog" aria-modal="true" aria-label="路径点类型选择">
+        <div class="route-type-dialog-head">
+            <strong>按类型指定路径点</strong>
+            <small>同类型点统一设置为传送点或资源点</small>
+        </div>
+        <div class="route-type-dialog-list" id="routeTypeList"></div>
+        <div class="route-type-dialog-actions">
+            <button type="button" id="routeTypeAllResource">全设资源</button>
+            <button type="button" id="routeTypeAllTeleport">全设传送</button>
+            <button type="button" id="routeTypeCancel">取消</button>
+            <button type="button" id="routeTypeApply">确认加入</button>
+        </div>
+    </div>
+</div>
+</body>
+</html>

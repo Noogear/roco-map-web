@@ -13,6 +13,8 @@ tracker_core.py - 追踪器编排层（无 Web 框架依赖）
 """
 
 import os
+import hashlib
+import tempfile
 
 import cv2
 import numpy as np
@@ -20,9 +22,30 @@ import base64
 from threading import Lock, Thread, Event
 
 from backend import config
-from backend.tracker_engines import SIFTMapTracker
+from backend.tracker_engines import SIFTMapTracker, SharedSIFTResources, get_shared_sift
+from backend.core.data_standards import DataScope, bind_scope
 from backend.tracking.minimap import CircleCalibrator, detect_and_extract
 from backend.tracking.smoother import CoordSmoother
+
+
+# ==================== 共享显示地图（全局单例）====================
+_display_map_bgr: np.ndarray | None = None
+_display_map_lock = Lock()
+
+
+def _ensure_shared_display_map() -> np.ndarray:
+    """双检锁懒加载共享显示地图（只读）。"""
+    global _display_map_bgr
+    if _display_map_bgr is not None:
+        return _display_map_bgr
+    with _display_map_lock:
+        if _display_map_bgr is not None:
+            return _display_map_bgr
+        img = cv2.imread(config.DISPLAY_MAP_PATH)
+        if img is None:
+            raise FileNotFoundError(f"找不到显示地图: {config.DISPLAY_MAP_PATH}！")
+        _display_map_bgr = img
+        return _display_map_bgr
 
 
 class MapTrackerWeb:
@@ -31,17 +54,21 @@ class MapTrackerWeb:
     不包含任何 Web/Flask/SocketIO 代码。
     """
 
-    def __init__(self):
-        # --- 加载引擎 ---
-        print("=" * 50)
-        self.sift_engine = SIFTMapTracker()
-        self.current_mode = 'sift'
-        print("=" * 50)
+    def __init__(self, session_id: str = 'default', shared: SharedSIFTResources | None = None):
+        bind_scope(self, DataScope.SESSION_SCOPED)
+        # --- 会话标识 ---
+        self.session_id = session_id
 
-        # 显示地图（两种模式共用）
-        self.display_map_bgr = cv2.imread(config.DISPLAY_MAP_PATH)
-        self.map_height = self.sift_engine.map_height
-        self.map_width = self.sift_engine.map_width
+        # --- 加载引擎（共享只读资源）---
+        if shared is None:
+            shared = get_shared_sift()
+        self._shared = shared
+        self.sift_engine = SIFTMapTracker(shared)
+        self.current_mode = 'sift'
+
+        # 显示地图改为模块级共享单例
+        self.map_height = shared.map_height
+        self.map_width = shared.map_width
 
         # 线程安全锁
         self.lock = Lock()          # 保护 current_frame_bgr 的读写
@@ -49,9 +76,11 @@ class MapTrackerWeb:
 
         # 当前帧数据
         self.current_frame_bgr = None
+        self.current_frame_token = ''
         self.latest_result_image = None
         self.latest_result_jpeg = None
         self.latest_result_frame = None
+        self.latest_result_token = ''
         self._render_revision = 0
         self._latest_result_image_revision = -1
         self._latest_result_jpeg_revision = -1
@@ -72,9 +101,14 @@ class MapTrackerWeb:
 
         # === 坐标平滑器（卡尔曼 + EMA 防抖 + TP 检测缓冲）===
         _base_dir = os.path.dirname(os.path.abspath(__file__))
-        self._smooth_file = os.path.join(_base_dir, '.smooth_coords.json')
+        session_tag = hashlib.sha1(str(session_id).encode('utf-8')).hexdigest()[:16]
+        self._smooth_file = os.path.join(_base_dir, f'.session_{session_tag}.json')
         self._smoother = CoordSmoother(smooth_buffer_path=self._smooth_file)
         self.pos_history = self._smoother.pos_history  # 公开属性，server.py 等外部代码使用
+
+        # === 会话活跃时间戳（用于超时清理）===
+        import time as _time
+        self._last_active_ts: float = _time.time()
 
         self.latest_status = {
             'mode': 'sift',
@@ -110,9 +144,10 @@ class MapTrackerWeb:
 
     # ========== 公开 API ==========
 
-    def set_minimap(self, minimap_bgr):
+    def set_minimap(self, minimap_bgr, token: str = ''):
         with self.lock:
             self.current_frame_bgr = minimap_bgr.copy()
+            self.current_frame_token = str(token or '')
         self._new_frame_event.set()  # 唤醒后台 SIFT 工作线程
 
     def _background_processor(self):
@@ -136,19 +171,140 @@ class MapTrackerWeb:
                 except Exception as cb_e:
                     print(f"[sift-worker] result_callback 异常: {cb_e}")
 
-    def set_mode(self, mode):
-        """模式切换（仅支持 sift）"""
-        return mode == 'sift'
-
     def reset_history(self):
-        """清空平滑/历史状态并关闭坐标锁定，返回 (cleared_count, was_locked)。"""
-        engine = self.sift_engine
+        """清空平滑/历史状态，返回 cleared_count。"""
         cleared = len(self.pos_history)
-        was_locked = engine.coord_lock_enabled
-
         self._smoother.clear_state()
-        engine.set_coord_lock(False)
-        return cleared, was_locked
+        return cleared
+
+    def full_reset(self):
+        """彻底重置：清空所有追踪状态（引擎 + 平滑器 + 圆校准器），
+        使得下一帧等效于系统刚启动的首帧全局扫描。"""
+        # 先清除 event 防止后台线程在 reset 完成后立即处理旧的 pending frame
+        self._new_frame_event.clear()
+        with self._process_lock:
+            return self._full_reset_locked()
+
+    def _full_reset_locked(self):
+        """full_reset 的实际实现，调用前必须持有 _process_lock。"""
+        cleared = self.reset_history()
+        # 重置 SIFT 引擎内部状态
+        eng = self.sift_engine
+        eng.last_x = None
+        eng.last_y = None
+        eng.lost_frames = 0
+        eng._switch_to_global()
+        eng._lk.reset()
+        eng._frozen = False
+        eng._frozen_last_x = None
+        eng._frozen_last_y = None
+        eng._frozen_local_kp = None
+        eng._frozen_local_flann = None
+        eng._pending_freeze_resume_hint = None
+        eng._nearby_flann_cache.clear()
+        eng._relocalize_cd = 0
+        eng._watchdog_accum_dx = 0.0
+        eng._watchdog_accum_dy = 0.0
+        eng._watchdog_suspect_streak = 0
+        eng._watchdog_last_sift_x = None
+        eng._watchdog_last_sift_y = None
+        eng._watchdog_consecutive_ok = 0
+        eng._watchdog_static_streak = 0
+        eng._watchdog_triggered = False
+        eng._last_arrow_angle = 0.0
+        eng._last_arrow_stopped = True
+        eng._arrow_dir._history.clear()
+        eng._arrow_dir._last_angle = 0.0
+        eng._arrow_dir._is_stopped = True
+        eng._arrow_dir._stop_streak = 0
+        eng._local_success_streak = 0
+        eng._force_global_revalidate = False
+        # 重置编排器状态
+        self._scene_change_streak = 0
+        self._tp_just_confirmed = False
+        self.current_frame_bgr = None
+        self.current_frame_token = ''
+        self.latest_result_image = None
+        self.latest_result_jpeg = None
+        self.latest_result_frame = None
+        self.latest_result_token = ''
+        self._render_revision = 0
+        self._last_match_quality = 0
+        self._last_arrow_angle_out = 0
+        self._last_arrow_stopped_out = True
+        self._last_source = ''
+        # 重置 latest_status
+        self.latest_status = {
+            'mode': 'sift',
+            'state': '--',
+            'position': {'x': 0, 'y': 0},
+            'found': False,
+            'matches': 0,
+        }
+        # 重置圆校准器
+        cal = self._circle_cal
+        cal._history.clear()
+        cal._calibrated = False
+        cal._consecutive_miss = 0
+        cal.expected_cx = cal.expected_cy = cal.expected_r = None
+        return cleared
+
+    def save_session_state(self) -> None:
+        """保存统一会话状态（smooth_buffer + circle_cal）到磁盘。"""
+        import json, threading
+        path = self._smooth_file
+        if not path:
+            return
+        snapshot = {
+            'smooth_x': list(self._smoother.smooth_buffer_x),
+            'smooth_y': list(self._smoother.smooth_buffer_y),
+            'circle_cal': self._circle_cal.to_dict(),
+        }
+        def _write():
+            try:
+                parent = os.path.dirname(path) or '.'
+                os.makedirs(parent, exist_ok=True)
+                with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=parent, delete=False) as tmp:
+                    json.dump(snapshot, tmp)
+                    tmp_path = tmp.name
+                os.replace(tmp_path, path)
+            except Exception as e:
+                print(f"[session-state] 保存失败: {e}")
+        threading.Thread(target=_write, daemon=True).start()
+
+    def touch_active(self) -> None:
+        """更新最后活跃时间。"""
+        import time as _time
+        self._last_active_ts = _time.time()
+
+    def _render_hold_position(self, x, y, state, half_view):
+        """在保持旧坐标的场景下复用同一套渲染逻辑。"""
+        display_crop, _ = self._render_sift_crop(
+            x, y, x, y, True, True, half_view)
+        return True, display_crop, state, 0, x, y
+
+    def _handle_missing_minimap(self, half_view):
+        """处理无有效小地图时的冻结 / 保持 / 预测路径。"""
+        self._scene_change_streak += 1
+        if self._scene_change_streak < self._scene_change_debounce:
+            last_pos = self.sift_engine.last_position
+            if last_pos is not None:
+                return self._render_hold_position(last_pos[0], last_pos[1], 'INERTIAL', half_view)
+
+        self.sift_engine.freeze_for_scene_change()
+
+        frozen_pos = self.sift_engine.frozen_position
+        if frozen_pos is not None:
+            return self._render_hold_position(frozen_pos[0], frozen_pos[1], 'SCENE_CHANGE', half_view)
+
+        predicted = self._smoother.predict_position()
+        if predicted is not None:
+            return self._render_hold_position(predicted[0], predicted[1], 'SCENE_CHANGE', half_view)
+
+        display_crop = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
+        cv2.putText(display_crop, "Scene Change...", (100, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        return False, display_crop, 'SCENE_CHANGE', 0, 0, 0
 
     def process_frame(self, need_base64=True, need_jpeg=True):
         """
@@ -170,6 +326,7 @@ class MapTrackerWeb:
             if self.current_frame_bgr is None:
                 return None
             minimap_bgr = self.current_frame_bgr.copy()
+            frame_token = self.current_frame_token
 
         half_view = config.VIEW_SIZE // 2
 
@@ -180,7 +337,7 @@ class MapTrackerWeb:
         # ====== 坐标异常值过滤（欧氏距离，避免对角线方向失衡） ======
         # CoordSmoother.update() 已在内部完成异常值过滤并维护 pos_history，此处无需重复
 
-        final_bgr = self._compose_output_frame(display_crop, half_view)
+        final_bgr = self._compose_output_frame(display_crop)
 
         img_base64 = None
         jpeg_bytes = None
@@ -202,9 +359,10 @@ class MapTrackerWeb:
             'match_quality': getattr(self, '_last_match_quality', 0),
             'arrow_angle': getattr(self, '_last_arrow_angle_out', 0),
             'arrow_stopped': getattr(self, '_last_arrow_stopped_out', True),
-            'coord_lock': self.sift_engine.coord_lock_enabled,
             'is_teleport': _is_tp,
+            'source': getattr(self, '_last_source', ''),
         }
+        self.latest_result_token = frame_token
 
         self.latest_result_frame = final_bgr
         self._render_revision += 1
@@ -233,73 +391,19 @@ class MapTrackerWeb:
         # === 圆形小地图检测：从方形截取中定位并提取 ===
         extracted = self._detect_and_extract_minimap(minimap_bgr)
         if extracted is None:
-            # 无有效小地图(战斗/暂停/UI/地图展开)
+            return self._handle_missing_minimap(half_view)
 
-            # SCENE_CHANGE debounce：需连续 N 帧失败才真正进入冻结状态
-            # 防止挂机时单帧 HoughCircles 抖动或低纹理方差误判引起"重定位中"闪烁
-            self._scene_change_streak += 1
-            _debounce = self._scene_change_debounce
-            if self._scene_change_streak < _debounce and self.sift_engine.last_x is not None:
-                # 未达 debounce 阈值 + 引擎有上一有效坐标：用惯性代替 SCENE_CHANGE
-                sx, sy = self.sift_engine.last_x, self.sift_engine.last_y
-                display_crop, _ = self._render_sift_crop(
-                    sx, sy, sx, sy, True, True,
-                    self.sift_engine._last_arrow_angle,
-                    self.sift_engine._last_arrow_stopped,
-                    {'_locked_state': ''}, half_view)
-                return True, display_crop, 'INERTIAL', 0, sx, sy
-
-            # 冻结 SIFT 引擎状态（仅首次进入 BLOCK 时触发）
-            self.sift_engine._freeze_state()
-
-            # 冻结期间：优先返回冻结坐标（避免 Kalman 发散）
-            frozen_pos = self.sift_engine.frozen_position
-            if frozen_pos is not None:
-                sx, sy = frozen_pos
-                display_crop, status_state = self._render_sift_crop(
-                    sx, sy, sx, sy, True, True, self.sift_engine._last_arrow_angle,
-                    self.sift_engine._last_arrow_stopped,
-                    {'_locked_state': ''}, half_view)
-                return True, display_crop, 'SCENE_CHANGE', 0, sx, sy
-
-            # 无冻结坐标 → 尝试 Kalman 预测
-            predicted = self._smoother._kalman_predict()
-            if predicted is not None:
-                sx, sy = predicted
-                display_crop, status_state = self._render_sift_crop(
-                    sx, sy, sx, sy, True, True, self.sift_engine._last_arrow_angle,
-                    self.sift_engine._last_arrow_stopped,
-                    {'_locked_state': ''}, half_view)
-                return True, display_crop, 'SCENE_CHANGE', 0, sx, sy
-            display_crop = np.zeros((config.VIEW_SIZE, config.VIEW_SIZE, 3), dtype=np.uint8)
-            cv2.putText(display_crop, "Scene Change...", (100, 200),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            return False, display_crop, 'SCENE_CHANGE', 0, 0, 0
-
-        # 小地图重现：解冻引擎状态（恢复局部索引+坐标）
-        self.sift_engine._thaw_state()
+        # 小地图重现：解冻引擎状态（生成一次性恢复提示，首帧先走轻量恢复匹配）
+        self.sift_engine.resume_after_scene_change()
         self._scene_change_streak = 0   # 重置连续失帧计数
         minimap_bgr = extracted  # 提取的圆内区域，与之前引擎输入格式一致
+        engine_snapshot = self.sift_engine.snapshot_tracking_state()
 
-        # === 坐标锁定模式检测 ===
-        if self.sift_engine.coord_lock_enabled:
-            anchor = SIFTMapTracker._compute_lock_anchor(
-                self.pos_history, self.sift_engine._lock_history_size)
-            if anchor is not None:
-                result = self.sift_engine._match_locked(minimap_bgr, anchor[0], anchor[1])
-                locked_state = result.get('_locked_state', '')
-                if result['found'] and not result.get('is_inertial'):
-                    self.sift_engine.last_x = result['center_x']
-                    self.sift_engine.last_y = result['center_y']
-                elif not result['found'] and self.sift_engine.last_x is not None:
-                    result['center_x'] = self.sift_engine.last_x
-                    result['center_y'] = self.sift_engine.last_y
-                    result['found'] = True
-                    result['is_inertial'] = True
-            else:
-                result = self.sift_engine.match(minimap_bgr)
-        else:
-            result = self.sift_engine.match(minimap_bgr)
+        result = self.sift_engine.match(minimap_bgr)
+
+        # 看门狗触发：清空 pos_history，阻断异常值过滤回滚循环
+        if result.get('_watchdog_triggered'):
+            self._smoother.clear_position_history()
 
         found = result['found']
         cx, cy = result['center_x'], result['center_y']
@@ -310,25 +414,40 @@ class MapTrackerWeb:
         is_inertial = result.get('is_inertial', False)
         match_quality = result.get('match_quality', 1.0 if found and not is_inertial else 0.0)
         self._last_match_quality = match_quality
+        self._last_source = result.get('source', '')
 
         # === 坐标平滑 + 传送检测（统一由 CoordSmoother 处理）===
-        smooth_x, smooth_y, tp_confirmed = self._smoother.update(
+        smooth_x, smooth_y, tp_confirmed, measurement_rejected = self._smoother.update(
             cx, cy, found, is_inertial, match_quality, arrow_stopped,
             tp_far_candidate=result.get('_tp_far_candidate'),
         )
+        if measurement_rejected and found and not is_inertial and not tp_confirmed and not result.get('_watchdog_triggered'):
+            self.sift_engine.restore_tracking_state(engine_snapshot)
+            prev = self.sift_engine.last_position
+            prev_x, prev_y = prev if prev is not None else (None, None)
+            arrow_angle, arrow_stopped = self.sift_engine.last_arrow_state
+            self._last_arrow_angle_out = arrow_angle
+            self._last_arrow_stopped_out = arrow_stopped
+            self._last_match_quality = 0.0
+            match_quality = 0.0
+
+            if prev_x is not None and prev_y is not None:
+                found = True
+                is_inertial = True
+                cx, cy = prev_x, prev_y
+                smooth_x, smooth_y = prev_x, prev_y
+            else:
+                found = False
+                cx = cy = None
+                smooth_x = smooth_y = 0
+
         if tp_confirmed:
             self._tp_just_confirmed = True
-            # 同步 SIFT 引擎位置，让后续帧立即在新位置局部搜索
-            with self.sift_engine._lock:
-                self.sift_engine.last_x = smooth_x
-                self.sift_engine.last_y = smooth_y
-                self.sift_engine.lost_frames = 0
-                self.sift_engine._switch_to_local(smooth_x, smooth_y)
+            self.sift_engine.sync_external_position(smooth_x, smooth_y)
 
         # 渲染裁剪区域 + 画点
         display_crop, status_state = self._render_sift_crop(
-            smooth_x, smooth_y, cx, cy, found, is_inertial, arrow_angle, arrow_stopped,
-            result, half_view)
+            smooth_x, smooth_y, cx, cy, found, is_inertial, half_view)
 
         match_count = 0
         last_x = smooth_x
@@ -340,10 +459,14 @@ class MapTrackerWeb:
 
         return found, display_crop, status_state, match_count, last_x, last_y
 
-    def _render_sift_crop(self, smooth_x, smooth_y, cx, cy, found, is_inertial, arrow_angle, arrow_stopped, result, half_view):
+    def _ensure_display_map(self):
+        return _ensure_shared_display_map()
+
+    def _render_sift_crop(self, smooth_x, smooth_y, cx, cy, found, is_inertial, half_view):
         """SIFT 模式的地图裁剪，返回 (display_crop, status_state)。
         扩边 JPEG_PAD 像素供前端亚帧微平移；箭头/圆点由前端 60fps 叠加，此处不绘制。
         """
+        display_map = self._ensure_display_map()
         pad = getattr(config, 'JPEG_PAD', 0)
         if found and cx is not None:
             ox = getattr(config, 'RENDER_OFFSET_X', 0)
@@ -353,44 +476,33 @@ class MapTrackerWeb:
             y2 = min(self.map_height, smooth_y + oy + half_view + pad)
             x1 = max(0, smooth_x + ox - half_view - pad)
             x2 = min(self.map_width, smooth_x + ox + half_view + pad)
-            display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
+            display_crop = display_map[y1:y2, x1:x2].copy()
             # 箭头与位置标记由前端在 canvas 上叠加，后端不再绘制
         else:
-            if self.sift_engine.last_x is not None and self.sift_engine.last_y is not None:
-                y1 = max(0, self.sift_engine.last_y - half_view - pad)
-                y2 = min(self.map_height, self.sift_engine.last_y + half_view + pad)
-                x1 = max(0, self.sift_engine.last_x - half_view - pad)
-                x2 = min(self.map_width, self.sift_engine.last_x + half_view + pad)
+            last_pos = self.sift_engine.last_position
+            if last_pos is not None:
+                last_x, last_y = last_pos
+                y1 = max(0, last_y - half_view - pad)
+                y2 = min(self.map_height, last_y + half_view + pad)
+                x1 = max(0, last_x - half_view - pad)
+                x2 = min(self.map_width, last_x + half_view + pad)
             else:
                 x1 = x2 = y1 = y2 = 0
 
-            if (self.sift_engine.last_x is not None and self.sift_engine.last_y is not None and
-                    x2 > x1 and y2 > y1):
-                display_crop = self.display_map_bgr[y1:y2, x1:x2].copy()
+            if last_pos is not None and x2 > x1 and y2 > y1:
+                display_crop = display_map[y1:y2, x1:x2].copy()
             else:
                 full_size = config.VIEW_SIZE + 2 * pad
                 display_crop = np.zeros((full_size, full_size, 3), dtype=np.uint8)
-                lock_label = "🔒 " if self.sift_engine.coord_lock_enabled else ""
-                cv2.putText(display_crop, f"{lock_label}Lost...", (130 + pad, 200 + pad),
+                cv2.putText(display_crop, "Lost...", (130 + pad, 200 + pad),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
         # 状态显示
-        if self.sift_engine.coord_lock_enabled:
-            locked_state = result.get('_locked_state', '')
-            if locked_state == 'LOCKED':
-                status_state = '🔒锁定'
-            elif locked_state in ('LOCK_FAIL', 'NO_FEATURES', 'FEW_KPTS'):
-                status_state = '🔒重试中'
-            elif is_inertial:
-                status_state = '🔒惯性'
-            else:
-                status_state = 'INERTIAL' if is_inertial else ('FOUND' if found else 'SEARCHING')
-        else:
-            status_state = 'INERTIAL' if is_inertial else ('FOUND' if found else 'SEARCHING')
+        status_state = 'INERTIAL' if is_inertial else ('FOUND' if found else 'SEARCHING')
 
         return display_crop, status_state
 
-    def _compose_output_frame(self, display_crop, half_view):
+    def _compose_output_frame(self, display_crop):
         """将裁剪地图居中贴到画布上，返回最终 BGR 帧。
         画布尺寸 = VIEW_SIZE + 2*JPEG_PAD，供前端亚帧微平移使用。
         """

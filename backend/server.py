@@ -14,9 +14,10 @@ server.py - Web 控制层（Flask + SocketIO 路由）
 
 import sys
 import os
-import json
 import time
 import struct
+import threading
+from collections import deque
 
 import cv2
 import numpy as np
@@ -24,10 +25,21 @@ import base64
 from io import BytesIO
 
 from backend import config
-from flask import Flask, jsonify, request, send_file, send_from_directory
-from flask_socketio import SocketIO, emit
+from flask import Flask, jsonify, redirect, request, send_file, send_from_directory
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_compress import Compress
 from backend.tracker_core import MapTrackerWeb
-from backend.store import get_route_files, load_route_data, load_circle_state, save_circle_state
+from backend.tracker_engines import get_shared_sift
+from backend.core.context import SessionRegistry
+from backend.core.data_standards import DataScope, audit_tracker_scope
+from backend.core.fastjson import OrjsonProvider, dumps_bytes
+from backend.map_data import (
+    get_marker_chunks,
+    get_marker_details,
+    get_marker_manifest,
+    get_marker_search_index,
+)
+from backend.store import get_route_files, load_route_data
 
 # 项目目录路径（backend/ 的上一级）
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,32 +66,134 @@ if _cv2_threads > 0:
 # Flask + SocketIO
 _SOCKETIO_ASYNC_MODE = os.environ.get('SOCKETIO_ASYNC_MODE', 'threading').lower()
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_SOCKETIO_ASYNC_MODE)
+# 高性能 JSON provider（orjson）
+app.json = OrjsonProvider(app)
 
-# 全局追踪器实例
-tracker = MapTrackerWeb()
+# 网络吞吐优化：HTTP 压缩 + 长连接传输参数
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # HTTP 上传最大 8MB
+app.config['COMPRESS_ALGORITHM'] = ['br', 'gzip']
+app.config['COMPRESS_LEVEL'] = int(os.environ.get('COMPRESS_LEVEL', '5'))
+app.config['COMPRESS_MIN_SIZE'] = int(os.environ.get('COMPRESS_MIN_SIZE', '700'))
+Compress(app)
 
-# Plan B: 记录当前有哪些客户端在使用 'frame' 事件（需要 JPEG）
-# 无此类客户端时 _push_jpeg=False，后台线程跳过 cv2.imencode 节省 10-15ms/帧。
-_frame_clients: set = set()
+_WS_FRAME_MAX_BYTES = 4 * 1024 * 1024               # WS 帧最大 4MB
+socketio = SocketIO(
+    app,
+    cors_allowed_origins='*',
+    async_mode=_SOCKETIO_ASYNC_MODE,
+    http_compression=True,
+    compression_threshold=1024,
+    max_http_buffer_size=_WS_FRAME_MAX_BYTES,
+)
 
-# JPEG 节流：记录上次发送 JPEG 时的地图坐标。
-# 当新坐标偏移 < JPEG_PAD - JPEG_THROTTLE_MARGIN 时只发 coords，节省 80-200KB/次。
-import math as _math
-_last_jpeg_x: float = 0.0
-_last_jpeg_y: float = 0.0
-_JPEG_THROTTLE_MARGIN = 8   # 保留 8px 缓冲，pan 超出前 8px 就发新图
-
-# Plan A (push model): 最新 'frame' 客户端的 SID，供 _on_result_ready 定向推送。
-# 叠加式：push 失败时 pull 兜底（ws_receive_frame 仍发 coords）。
-_push_frame_sid: str = ''
+# 会话隔离：token -> tracker
+_DEFAULT_SESSION_TOKEN = 'default'
 
 
-def _make_status_json() -> bytes:
+def _create_tracker_for_token(token: str) -> MapTrackerWeb:
+    tracker_obj = MapTrackerWeb(session_id=token)
+    audit_tracker_scope(tracker_obj)
+    return tracker_obj
+
+
+_session_registry: SessionRegistry[MapTrackerWeb] = SessionRegistry(_create_tracker_for_token)
+_TRACKER_SCOPE = DataScope.SESSION_SCOPED
+
+# JPEG 推送管理器（per-client 节流锚点 + Plan A/B 状态）
+# 全图模式客户端只接收 coords 广播，不注册进管理器。
+from backend.push.manager import JpegPushManager
+_jpeg_mgr = JpegPushManager()
+
+# 会话隔离：sid <-> token 绑定，并按 token 房间定向推送 coords/result
+_SESSION_ROOM_PREFIX = 'session:'
+_sid_token: dict[str, str] = {}
+_sid_token_lock = threading.Lock()
+_hash_query_lock = threading.Lock()
+
+
+def _normalize_session_token(token) -> str:
+    token = str(token or '').strip()
+    if len(token) < 8:
+        return ''
+    # 限制长度并移除空白，避免异常 token 影响房间命名
+    token = ''.join(token.split())
+    return token[:128]
+
+
+def _coerce_session_token(token) -> str:
+    normalized = _normalize_session_token(token)
+    return normalized or _DEFAULT_SESSION_TOKEN
+
+
+def _extract_http_session_token() -> str:
+    token = request.args.get('token') or request.headers.get('X-Session-Token')
+    if not token and request.is_json:
+        data = request.get_json(silent=True) or {}
+        token = data.get('token')
+    if not token:
+        token = request.form.get('token') if hasattr(request, 'form') else ''
+    return _coerce_session_token(token)
+
+
+def _get_tracker_for_token(token: str) -> MapTrackerWeb:
+    ctx, created = _session_registry.get_or_create(_coerce_session_token(token))
+    tracker_obj = ctx.tracker
+    if created or tracker_obj.result_callback is None:
+        tracker_obj.result_callback = (
+            lambda _token=ctx.token, _tracker=tracker_obj: _on_result_ready(_token, _tracker)
+        )
+    tracker_obj.touch_active()
+    return tracker_obj
+
+
+def _get_tracker_for_http_request() -> MapTrackerWeb:
+    return _get_tracker_for_token(_extract_http_session_token())
+
+
+def _get_tracker_for_sid(sid: str) -> MapTrackerWeb:
+    return _get_tracker_for_token(_get_sid_token(sid) or _DEFAULT_SESSION_TOKEN)
+
+
+def _session_room(token: str) -> str:
+    return _SESSION_ROOM_PREFIX + token
+
+
+def _bind_sid_token(sid: str, token: str) -> str:
+    """绑定 sid -> token，返回旧 token（不存在则空字符串）。"""
+    with _sid_token_lock:
+        old = _sid_token.get(sid, '')
+        _sid_token[sid] = token
+    return old
+
+
+def _unbind_sid_token(sid: str) -> str:
+    with _sid_token_lock:
+        return _sid_token.pop(sid, '')
+
+
+def _get_sid_token(sid: str) -> str:
+    with _sid_token_lock:
+        return _sid_token.get(sid, '')
+
+# ── 展示室（Broadcast Room）──────────────────────────────────────
+# 每位展示者有独立房间，观众订阅特定展示者。
+# 节流：每位展示者服务器端以 ~10fps 广播，避免观众数量放大流量。
+#   _bcast_rooms[name] = {
+#       'sid': str,               # 展示者 socket.sid
+#       'viewers': set[str],      # 正在订阅的观众 sids
+#       'last_ts': float,         # 上次广播时间戳
+#       'last_frame': bytes|None, # 最新帧
+#   }
+_bcast_rooms: dict[str, dict] = {}
+_bcast_lock = threading.Lock()
+_BCAST_MIN_INTERVAL = 0.10          # 10 fps 硬上限（10fps 已足够观看）
+
+
+def _make_status_json(tracker_obj: MapTrackerWeb) -> bytes:
     """构建 WS 推送用的紧凑 JSON bytes（避免 ws_receive_frame 与 _on_result_ready 重复编码）。"""
-    status = tracker.latest_status
-    return json.dumps({
-        'm': tracker.current_mode,
+    status = tracker_obj.latest_status
+    return dumps_bytes({
+        'm': tracker_obj.current_mode,
         's': status['state'],
         'x': status['position']['x'],
         'y': status['position']['y'],
@@ -88,81 +202,503 @@ def _make_status_json() -> bytes:
         'q': round(status.get('match_quality', 0), 2),
         'a': round(status.get('arrow_angle', 0), 1),
         'as': int(status.get('arrow_stopped', True)),
-        'l': int(tracker.sift_engine.coord_lock_enabled),
         'tp': int(status.get('is_teleport', False)),
-    }, separators=(',', ':')).encode('utf-8')
+    })
 
 
-def _on_result_ready():
+def _on_result_ready(token: str, tracker_obj: MapTrackerWeb):
     """
     Plan A 推送回调：sift-worker 处理完帧后立即调用，主动推送新结果。
     比 pull 模式（等下一帧 ws_receive_frame）延迟低 ~80ms。
-    JPEG 节流逻辑在此执行（dist < budget → 只推 coords，节省带宽）。
+
+    JPEG 模式：由 _jpeg_mgr.push_result() 负责节流决策，定向推送 result/coords。
+    全图模式：客户端未注册进 _jpeg_mgr，依赖下方广播的 coords 更新位置点。
     每个 emit 独立 try/except，单条失败不影响其他。
     """
-    global _last_jpeg_x, _last_jpeg_y
-
-    if tracker.latest_status.get('state') == '--':
+    if tracker_obj.latest_status.get('state') == '--':
         return  # 首帧尚未完成，不推送
 
-    status_json = _make_status_json()
+    status_json = _make_status_json(tracker_obj)
     header = struct.pack('>I', len(status_json))
+    cx = tracker_obj.latest_status['position']['x']
+    cy = tracker_obj.latest_status['position']['y']
 
-    # JPEG 节流：超出 pan 余量才发新 JPEG
-    pad = getattr(config, 'JPEG_PAD', 40)
-    budget = pad - _JPEG_THROTTLE_MARGIN
-    cx = tracker.latest_status['position']['x']
-    cy = tracker.latest_status['position']['y']
-    dist = _math.sqrt((cx - _last_jpeg_x) ** 2 + (cy - _last_jpeg_y) ** 2)
+    token = _coerce_session_token(_normalize_session_token(getattr(tracker_obj, 'latest_result_token', '')) or token)
 
-    sid = _push_frame_sid
-    if sid:
-        jpeg = tracker.latest_result_jpeg
-        if jpeg and dist >= budget:
-            # 位移超出余量：推 result（含 JPEG），更新锚点
-            _last_jpeg_x, _last_jpeg_y = cx, cy
-            try:
-                socketio.emit('result', header + status_json + jpeg,
-                              to=sid, binary=True, namespace='/')
-            except Exception as e:
-                print(f"[push] result → {sid} 失败: {e}")
-        else:
-            # 位移在余量内：只推轻量 coords，前端 pan 消化
-            try:
-                socketio.emit('coords', header + status_json,
-                              to=sid, binary=True, namespace='/')
-            except Exception as e:
-                print(f"[push] coords → {sid} 失败: {e}")
+    # JPEG 模式：按 token 定向推送（含节流）
+    _jpeg_mgr.push_result(socketio, tracker_obj.latest_result_jpeg, cx, cy, header, status_json, token=token)
 
-    # 向所有客户端广播坐标（bigmap.html 等；frame 客户端收到重复 coords 无害）
-    try:
-        socketio.emit('coords', header + status_json,
-                      broadcast=True, binary=True, namespace='/')
-    except Exception as e:
-        print(f"[push] coords broadcast 失败: {e}")
+    # 全图模式 / 地图页：仅向同会话房间推送，避免跨会话串流
+    if token:
+        try:
+            socketio.emit('coords', header + status_json, to=_session_room(token), namespace='/')
+        except Exception as e:
+            print(f"[push] coords room push 失败: {e}")
 
 
-tracker.result_callback = _on_result_ready
+_get_tracker_for_token(_DEFAULT_SESSION_TOKEN)
 
 # (路径常量 _BASE_DIR / FRONTEND_DIR / ASSETS_DIR 已在文件顶部定义)
 
 
+# ==================== 配置元数据 / 运行时热更新 ====================
 
-# ==================== 圆形选区持久化 ====================
+_CONFIG_RUNTIME_RULES = {
+    'JPEG_PAD': {
+        'type': 'int', 'min': 0, 'max': 160,
+        'group': '界面与渲染', 'label': 'JPEG 扩边像素',
+        'description': '控制 JPEG 模式额外扩边，便于前端平滑位移。',
+        'editable': True,
+    },
+    'SEARCH_RADIUS': {
+        'type': 'int', 'min': 120, 'max': 2000,
+        'group': '识别引擎', 'label': '局部搜索半径',
+        'description': '影响局部匹配范围，越大越稳但也更慢。',
+        'editable': True,
+    },
+    'NEARBY_SEARCH_RADIUS': {
+        'type': 'int', 'min': 120, 'max': 2400,
+        'group': '识别引擎', 'label': '附近搜索半径',
+        'description': '局部失败时的附近补救搜索半径。',
+        'editable': True,
+    },
+    'LOCAL_FAIL_LIMIT': {
+        'type': 'int', 'min': 1, 'max': 20,
+        'group': '识别引擎', 'label': '局部失败阈值',
+        'description': '局部匹配连续失败多少次后退回全局搜索。',
+        'editable': True,
+    },
+    'SIFT_JUMP_THRESHOLD': {
+        'type': 'int', 'min': 80, 'max': 2000,
+        'group': '识别引擎', 'label': '跳变阈值',
+        'description': '识别结果与上一帧距离过大时，用于判定异常跳点。',
+        'editable': True,
+    },
+    'LOCAL_REVALIDATE_INTERVAL': {
+        'type': 'int', 'min': 1, 'max': 30,
+        'group': '识别引擎', 'label': '局部复核周期',
+        'description': '局部命中多少次后强制做一次全局复核。',
+        'editable': True,
+    },
+    'LOCAL_REVALIDATE_MIN_QUALITY': {
+        'type': 'float', 'min': 0.0, 'max': 1.0,
+        'group': '识别引擎', 'label': '局部复核质量阈值',
+        'description': '局部质量低于该值时提前触发全局复核。',
+        'editable': True,
+    },
+    'LOCAL_REVALIDATE_MARGIN': {
+        'type': 'float', 'min': 0.0, 'max': 0.5,
+        'group': '识别引擎', 'label': '复核覆盖边际',
+        'description': '全局质量至少高出该阈值才覆盖局部结果。',
+        'editable': True,
+    },
+    'LOCAL_REVALIDATE_DIFF': {
+        'type': 'int', 'min': 50, 'max': 1000,
+        'group': '识别引擎', 'label': '复核冲突距离',
+        'description': '局部与全局结果差异超过该值时视为冲突。',
+        'editable': True,
+    },
+    'MAX_LOST_FRAMES': {
+        'type': 'int', 'min': 0, 'max': 300,
+        'group': '识别引擎', 'label': '最大惯性帧数',
+        'description': '完全丢失前允许惯性维持的最大帧数。',
+        'editable': True,
+    },
+    'LK_ENABLED': {
+        'type': 'bool', 'group': '识别引擎', 'label': '启用 LK 光流',
+        'description': '开启后可降低部分帧的 SIFT 压力。',
+        'editable': True,
+    },
+    'LK_SIFT_INTERVAL': {
+        'type': 'int', 'min': 1, 'max': 30,
+        'group': '识别引擎', 'label': 'LK 强制 SIFT 周期',
+        'description': '每隔多少帧强制做一次 SIFT 纠偏。',
+        'editable': True,
+    },
+    'LK_MIN_CONFIDENCE': {
+        'type': 'float', 'min': 0.0, 'max': 1.0,
+        'group': '识别引擎', 'label': 'LK 最低置信度',
+        'description': '低于该值时放弃光流结果。',
+        'editable': True,
+    },
+    'ECC_ENABLED': {
+        'type': 'bool', 'group': '识别引擎', 'label': '启用 ECC 兜底',
+        'description': '低纹理附近搜索失败时允许 ECC 对齐兜底。',
+        'editable': True,
+    },
+    'ECC_MIN_CORRELATION': {
+        'type': 'float', 'min': 0.0, 'max': 1.0,
+        'group': '识别引擎', 'label': 'ECC 最低相关度',
+        'description': 'ECC 结果低于该值将被忽略。',
+        'editable': True,
+    },
+    'ARROW_ANGLE_SMOOTH_ALPHA': {
+        'type': 'float', 'min': 0.0, 'max': 1.0,
+        'group': '箭头', 'label': '箭头平滑系数',
+        'description': '数值越高，箭头越灵敏。',
+        'editable': True,
+    },
+    'ARROW_MOVE_MIN_DISPLACEMENT': {
+        'type': 'float', 'min': 0.1, 'max': 20.0,
+        'group': '箭头', 'label': '最小移动判定',
+        'description': '小于该位移时认为角色接近静止。',
+        'editable': True,
+    },
+    'ARROW_POS_HISTORY_LEN': {
+        'type': 'int', 'min': 2, 'max': 20,
+        'group': '箭头', 'label': '箭头历史长度',
+        'description': '箭头方向计算所保留的坐标历史数。',
+        'editable': True,
+    },
+    'ARROW_STOPPED_DEBOUNCE': {
+        'type': 'int', 'min': 1, 'max': 60,
+        'group': '箭头', 'label': '静止防抖帧数',
+        'description': '连续多少帧接近静止后才视为停下。',
+        'editable': True,
+    },
+    'ARROW_SNAP_THRESHOLD': {
+        'type': 'float', 'min': 5.0, 'max': 180.0,
+        'group': '箭头', 'label': '箭头吸附阈值',
+        'description': '方向突变超过该角度时直接吸附到新方向。',
+        'editable': True,
+    },
+    'LINEAR_FILTER_ENABLED': {
+        'type': 'bool', 'group': '渲染平滑', 'label': '启用线性过滤',
+        'description': '对连续异常跳点做线性过滤。',
+        'editable': True,
+    },
+    'LINEAR_FILTER_WINDOW': {
+        'type': 'int', 'min': 1, 'max': 40,
+        'group': '渲染平滑', 'label': '线性过滤窗口',
+        'description': '异常值过滤时参考的历史窗口大小。',
+        'editable': True,
+    },
+    'LINEAR_FILTER_MAX_DEVIATION': {
+        'type': 'int', 'min': 20, 'max': 500,
+        'group': '渲染平滑', 'label': '最大偏差',
+        'description': '超出该偏差的点更容易被判为异常。',
+        'editable': True,
+    },
+    'LINEAR_FILTER_MAX_CONSECUTIVE': {
+        'type': 'int', 'min': 1, 'max': 30,
+        'group': '渲染平滑', 'label': '最大连续过滤数',
+        'description': '避免长时间连续过滤导致无法恢复。',
+        'editable': True,
+    },
+    'RENDER_STILL_THRESHOLD': {
+        'type': 'int', 'min': 0, 'max': 50,
+        'group': '渲染平滑', 'label': '静止死区',
+        'description': '平滑显示时的小位移忽略阈值。',
+        'editable': True,
+    },
+    'RENDER_EMA_ALPHA': {
+        'type': 'float', 'min': 0.0, 'max': 1.0,
+        'group': '渲染平滑', 'label': '最低 EMA Alpha',
+        'description': '慢速移动时的最低平滑系数。',
+        'editable': True,
+    },
+    'RENDER_EMA_ALPHA_MAX': {
+        'type': 'float', 'min': 0.0, 'max': 1.0,
+        'group': '渲染平滑', 'label': '最高 EMA Alpha',
+        'description': '快速移动时的最高平滑系数。',
+        'editable': True,
+    },
+    'RENDER_EMA_SLOW_DIST': {
+        'type': 'int', 'min': 1, 'max': 200,
+        'group': '渲染平滑', 'label': '慢速距离阈值',
+        'description': '低于该距离时使用最低 EMA alpha。',
+        'editable': True,
+    },
+    'RENDER_EMA_FAST_DIST': {
+        'type': 'int', 'min': 1, 'max': 500,
+        'group': '渲染平滑', 'label': '快速距离阈值',
+        'description': '高于该距离时使用最高 EMA alpha。',
+        'editable': True,
+    },
+    'RENDER_OFFSET_X': {
+        'type': 'int', 'min': -200, 'max': 200,
+        'group': '渲染平滑', 'label': '渲染偏移 X',
+        'description': '用于显示侧的微调偏移。',
+        'editable': True,
+    },
+    'RENDER_OFFSET_Y': {
+        'type': 'int', 'min': -200, 'max': 200,
+        'group': '渲染平滑', 'label': '渲染偏移 Y',
+        'description': '用于显示侧的微调偏移。',
+        'editable': True,
+    },
+    'TP_JUMP_THRESHOLD': {
+        'type': 'int', 'min': 50, 'max': 2000,
+        'group': '渲染平滑', 'label': '传送跳变阈值',
+        'description': '超过该阈值时会进入传送候选确认。',
+        'editable': True,
+    },
+    'TP_CONFIRM_FRAMES': {
+        'type': 'int', 'min': 1, 'max': 10,
+        'group': '渲染平滑', 'label': '传送确认帧数',
+        'description': '连续多少帧聚类命中后确认传送。',
+        'editable': True,
+    },
+    'TP_CLUSTER_RADIUS': {
+        'type': 'int', 'min': 20, 'max': 500,
+        'group': '渲染平滑', 'label': '传送聚类半径',
+        'description': '传送候选聚类时允许的最大散布半径。',
+        'editable': True,
+    },
+}
 
-_CIRCLE_STATE_FILE = os.path.join(_BASE_DIR, '.circle_state.json')
+_CONFIG_RESTART_REQUIRED = {
+    'PORT', 'WINDOW_GEOMETRY', 'VIEW_SIZE', 'LOGIC_MAP_PATH', 'DISPLAY_MAP_PATH',
+    'SIFT_CONTRAST_THRESHOLD', 'MINIMAP', 'MINIMAP_CAPTURE_MARGIN',
+    'MINIMAP_CIRCLE_CALIBRATION_FRAMES', 'MINIMAP_CIRCLE_R_TOLERANCE',
+    'MINIMAP_CIRCLE_CENTER_TOLERANCE', 'MINIMAP_CIRCLE_RECALIBRATE_MISS',
+}
 
-# 启动时加载已有状态
-_saved_circle = load_circle_state(_CIRCLE_STATE_FILE)
-if _saved_circle:
-    print(f"📍 已恢复圆形选区: cx={_saved_circle.get('cx')}, cy={_saved_circle.get('cy')}, r={_saved_circle.get('r')}")
+
+def _iter_config_keys() -> list[str]:
+    return sorted(
+        key for key, value in vars(config).items()
+        if key.isupper() and not key.startswith('_') and not callable(value)
+    )
+
+
+def _infer_config_group(key: str) -> str:
+    if key in ('PORT', 'MINIMAP', 'WINDOW_GEOMETRY', 'VIEW_SIZE', 'JPEG_PAD'):
+        return '基础服务'
+    if key.endswith('_PATH'):
+        return '地图文件'
+    if key.startswith('AUTO_DETECT') or key.startswith('MINIMAP_'):
+        return '自动圆检测'
+    if key.startswith('ARROW_'):
+        return '箭头'
+    if key.startswith('RENDER_') or key.startswith('LINEAR_FILTER_') or key.startswith('TP_'):
+        return '渲染平滑'
+    return '识别引擎'
+
+
+def _infer_config_type(value) -> str:
+    if isinstance(value, bool):
+        return 'bool'
+    if isinstance(value, int) and not isinstance(value, bool):
+        return 'int'
+    if isinstance(value, float):
+        return 'float'
+    if isinstance(value, dict):
+        return 'json'
+    return 'string'
+
+
+def _serialize_config_value(value):
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return str(value)
+
+
+def _build_config_meta(key: str, value):
+    rule = _CONFIG_RUNTIME_RULES.get(key, {})
+    editable = bool(rule.get('editable', False))
+    restart_required = key in _CONFIG_RESTART_REQUIRED or (not editable and key not in _CONFIG_RUNTIME_RULES)
+    return {
+        'key': key,
+        'label': rule.get('label', key.replace('_', ' ')),
+        'group': rule.get('group', _infer_config_group(key)),
+        'type': rule.get('type', _infer_config_type(value)),
+        'editable': editable,
+        'restartRequired': restart_required,
+        'min': rule.get('min'),
+        'max': rule.get('max'),
+        'step': rule.get('step'),
+        'description': rule.get('description', ''),
+        'reason': rule.get('reason') or (
+            '该配置需要重启相关引擎或服务后才能安全生效。' if restart_required else '当前版本仅开放只读查看。'
+        ),
+    }
+
+
+def _build_config_payload():
+    values = {}
+    meta = {}
+    groups = set()
+    for key in _iter_config_keys():
+        value = getattr(config, key)
+        values[key] = _serialize_config_value(value)
+        meta[key] = _build_config_meta(key, value)
+        groups.add(meta[key]['group'])
+    return {
+        'success': True,
+        'values': values,
+        'meta': meta,
+        'groups': sorted(groups),
+        'editableKeys': sorted(key for key, item in meta.items() if item['editable']),
+        'readonlyKeys': sorted(key for key, item in meta.items() if not item['editable']),
+    }
+
+
+def _coerce_runtime_value(meta: dict, raw_value):
+    value_type = meta['type']
+    if value_type == 'bool':
+        if isinstance(raw_value, bool):
+            value = raw_value
+        elif isinstance(raw_value, str):
+            lowered = raw_value.strip().lower()
+            if lowered in ('1', 'true', 'yes', 'on'):
+                value = True
+            elif lowered in ('0', 'false', 'no', 'off'):
+                value = False
+            else:
+                raise ValueError('必须为 true / false')
+        else:
+            raise ValueError('必须为布尔值')
+        return value
+
+    if value_type == 'int':
+        if isinstance(raw_value, bool):
+            raise ValueError('不能为布尔值')
+        if isinstance(raw_value, str):
+            raw_value = raw_value.strip()
+            if raw_value == '':
+                raise ValueError('不能为空')
+        try:
+            value = int(float(raw_value))
+        except (TypeError, ValueError):
+            raise ValueError('必须为整数')
+        if float(value) != float(raw_value):
+            raise ValueError('必须为整数')
+        return value
+
+    if value_type == 'float':
+        if isinstance(raw_value, bool):
+            raise ValueError('不能为布尔值')
+        try:
+            return float(raw_value)
+        except (TypeError, ValueError):
+            raise ValueError('必须为数字')
+
+    if value_type == 'string':
+        if raw_value is None:
+            raise ValueError('不能为空')
+        return str(raw_value)
+
+    raise ValueError('当前类型暂不支持在线修改')
+
+
+def _validate_runtime_config_updates(updates: dict):
+    approved = {}
+    rejected = {}
+
+    for key, raw_value in updates.items():
+        current_value = getattr(config, key, None)
+        meta = _build_config_meta(key, current_value)
+        if current_value is None or key not in _iter_config_keys():
+            rejected[key] = '配置项不存在'
+            continue
+        if not meta['editable']:
+            rejected[key] = meta['reason']
+            continue
+        try:
+            value = _coerce_runtime_value(meta, raw_value)
+        except ValueError as exc:
+            rejected[key] = str(exc)
+            continue
+
+        min_value = meta.get('min')
+        max_value = meta.get('max')
+        if min_value is not None and value < min_value:
+            rejected[key] = f'不能小于 {min_value}'
+            continue
+        if max_value is not None and value > max_value:
+            rejected[key] = f'不能大于 {max_value}'
+            continue
+        approved[key] = value
+
+    return approved, rejected
+
+
+def _apply_runtime_config_updates(updates: dict):
+    for key, value in updates.items():
+        setattr(config, key, value)
+
+    def _apply_to_tracker(tracker_obj: MapTrackerWeb):
+        engine = tracker_obj.sift_engine
+        process_lock = getattr(tracker_obj, '_process_lock', None)
+        if process_lock is not None:
+            process_lock.acquire()
+        try:
+            with engine._lock:
+                if 'SEARCH_RADIUS' in updates:
+                    engine.SEARCH_RADIUS = config.SEARCH_RADIUS
+                if 'NEARBY_SEARCH_RADIUS' in updates:
+                    engine.NEARBY_SEARCH_RADIUS = config.NEARBY_SEARCH_RADIUS
+                if 'LOCAL_FAIL_LIMIT' in updates:
+                    engine.LOCAL_FAIL_LIMIT = config.LOCAL_FAIL_LIMIT
+                if 'SIFT_JUMP_THRESHOLD' in updates:
+                    engine.JUMP_THRESHOLD = config.SIFT_JUMP_THRESHOLD
+                if 'LOCAL_REVALIDATE_INTERVAL' in updates:
+                    engine._local_revalidate_interval = config.LOCAL_REVALIDATE_INTERVAL
+                if 'LOCAL_REVALIDATE_MIN_QUALITY' in updates:
+                    engine._local_revalidate_min_quality = config.LOCAL_REVALIDATE_MIN_QUALITY
+                if 'LOCAL_REVALIDATE_MARGIN' in updates:
+                    engine._local_revalidate_margin = config.LOCAL_REVALIDATE_MARGIN
+                if 'LOCAL_REVALIDATE_DIFF' in updates:
+                    engine._local_revalidate_diff = config.LOCAL_REVALIDATE_DIFF
+
+                if hasattr(engine, '_lk'):
+                    if 'LK_ENABLED' in updates:
+                        engine._lk.enabled = config.LK_ENABLED
+                    if 'LK_SIFT_INTERVAL' in updates:
+                        engine._lk.sift_every = config.LK_SIFT_INTERVAL
+                    if 'LK_MIN_CONFIDENCE' in updates:
+                        engine._lk.min_conf = config.LK_MIN_CONFIDENCE
+
+                if 'ECC_ENABLED' in updates:
+                    engine._ecc_enabled = config.ECC_ENABLED
+                if 'ECC_MIN_CORRELATION' in updates:
+                    engine._ecc_min_cc = config.ECC_MIN_CORRELATION
+
+                arrow_dir = getattr(engine, '_arrow_dir', None)
+                if arrow_dir is not None:
+                    if 'ARROW_ANGLE_SMOOTH_ALPHA' in updates:
+                        arrow_dir._ema_alpha = config.ARROW_ANGLE_SMOOTH_ALPHA
+                    if 'ARROW_MOVE_MIN_DISPLACEMENT' in updates:
+                        arrow_dir._stop_speed_px = config.ARROW_MOVE_MIN_DISPLACEMENT
+                    if 'ARROW_STOPPED_DEBOUNCE' in updates:
+                        arrow_dir._stop_debounce = config.ARROW_STOPPED_DEBOUNCE
+                    if 'ARROW_SNAP_THRESHOLD' in updates:
+                        arrow_dir._snap_threshold = config.ARROW_SNAP_THRESHOLD
+                    if 'ARROW_POS_HISTORY_LEN' in updates:
+                        history = list(arrow_dir._history)
+                        arrow_dir._history = deque(history[-config.ARROW_POS_HISTORY_LEN:], maxlen=config.ARROW_POS_HISTORY_LEN)
+        finally:
+            if process_lock is not None:
+                process_lock.release()
+
+    for ctx in _session_registry.snapshot_contexts():
+        _apply_to_tracker(ctx.tracker)
 
 
 # ==================== HTTP 路由 ====================
 
 @app.route('/')
+def root():
+    return redirect('/recognize')
+
+@app.route('/recognize')
 def index():
-    return send_file(os.path.join(FRONTEND_DIR, 'index.html'))
+    return send_file(os.path.join(FRONTEND_DIR, 'recognize.html'))
+
+
+@app.route('/map')
+def serve_map():
+    return send_file(os.path.join(FRONTEND_DIR, 'map.html'))
+
+
+@app.route('/settings')
+def serve_settings():
+    return send_file(os.path.join(FRONTEND_DIR, 'settings.html'))
 
 
 @app.route('/<path:filename>')
@@ -186,6 +722,20 @@ def list_test_images():
     return jsonify(images)
 
 
+def _decode_base64_image(b64_data: str):
+    """解码单张 base64 图片，失败返回 None。"""
+    if not b64_data:
+        return None
+    if ',' in b64_data:
+        b64_data = b64_data.split(',', 1)[1]
+    try:
+        img_bytes = base64.b64decode(b64_data)
+    except Exception:
+        return None
+    nparr = np.frombuffer(img_bytes, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+
 def _decode_image_from_request():
     """从当前请求中解析图片（支持 FormData 与 JSON base64），失败返回 None。"""
     # 方式1: FormData 文件上传
@@ -197,289 +747,418 @@ def _decode_image_from_request():
     # 方式2: JSON base64 上传
     if request.is_json:
         data = request.get_json(silent=True) or {}
-        b64_data = data.get('image', '')
-        if not b64_data:
-            return None
-        if ',' in b64_data:
-            b64_data = b64_data.split(',', 1)[1]
-        try:
-            img_bytes = base64.b64decode(b64_data)
-        except Exception:
-            return None
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        return _decode_base64_image(data.get('image', ''))
 
     return None
 
 
-def _auto_detect_minimap_circle(img_bgr: np.ndarray):
-    """
-    在整帧截图中自动定位小地图圆。
+def _decode_images_from_request(max_count: int = 8) -> list[np.ndarray]:
+    """从请求中解析多张图片（JSON images 数组优先），失败返回空列表。"""
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        images = data.get('images')
+        if isinstance(images, list) and images:
+            decoded = []
+            for item in images[:max(1, max_count)]:
+                img = _decode_base64_image(item)
+                if img is not None:
+                    decoded.append(img)
+            if decoded:
+                return decoded
 
-    策略：
-      1) 优先扫描右上 ROI（主流游戏小地图布局）
-      2) 失败时回退全图扫描
-      3) 对候选按“右上角贴近度 + 半径合理性”打分
-
-    Returns:
-      dict: {
-        cx, cy, r,          # 归一化坐标（前端 selCircle）
-        px, py, pr,         # 原图像素坐标
-        confidence          # 0..1 置信度
-      }
-      或 None
-    """
-    if img_bgr is None or img_bgr.size == 0:
-        return None
-
-    h0, w0 = img_bgr.shape[:2]
-    if h0 < 32 or w0 < 32:
-        return None
-
-    # 大图先缩放，降低 Hough 开销
-    max_side = max(h0, w0)
-    scale = 1.0
-    work = img_bgr
-    if max_side > 1280:
-        scale = 1280.0 / max_side
-        nw = max(1, int(round(w0 * scale)))
-        nh = max(1, int(round(h0 * scale)))
-        work = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
-
-    h, w = work.shape[:2]
-
-    def _find_in_region(x1, y1, x2, y2, mode: str):
-        roi = work[y1:y2, x1:x2]
-        if roi.size == 0:
-            return []
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (9, 9), 2)
-
-        base = min(h, w)
-        min_r = max(14, int(base * 0.035))
-        max_r = max(min_r + 8, int(base * 0.16))
-
-        # ROI 更严格，全图更宽松
-        param2 = 24 if mode == 'roi' else 20
-        circles = cv2.HoughCircles(
-            gray,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=max(20, min(roi.shape[:2]) // 4),
-            param1=90,
-            param2=param2,
-            minRadius=min_r,
-            maxRadius=max_r,
-        )
-        if circles is None:
-            return []
-
-        out = []
-        for c in np.round(circles[0, :]).astype(int):
-            cx, cy, r = int(c[0]) + x1, int(c[1]) + y1, int(c[2])
-            if r <= 0:
-                continue
-            out.append((cx, cy, r))
-        return out
-
-    # 1) 右上 ROI 优先
-    roi_candidates = _find_in_region(int(w * 0.52), 0, w, int(h * 0.50), mode='roi')
-    # 2) 回退全图
-    full_candidates = _find_in_region(0, 0, w, h, mode='full') if not roi_candidates else []
-    candidates = roi_candidates + full_candidates
-    if not candidates:
-        return None
-
-    # 按位置和半径评分：越靠右上越优，半径太小惩罚
-    best = None
-    best_score = -1.0
-    base = float(min(h, w))
-    for cx, cy, r in candidates:
-        # 右上贴近度
-        right_closeness = 1.0 - min(1.0, (w - cx) / max(w, 1))
-        top_closeness = 1.0 - min(1.0, cy / max(h, 1))
-        pos_score = 0.6 * right_closeness + 0.4 * top_closeness
-
-        # 半径合理性（常见范围 ~ 4% - 14% 的短边）
-        r_ratio = r / max(base, 1.0)
-        size_score = 1.0 - min(1.0, abs(r_ratio - 0.08) / 0.08)
-        score = 0.7 * pos_score + 0.3 * size_score
-
-        if score > best_score:
-            best_score = score
-            best = (cx, cy, r)
-
-    if best is None:
-        return None
-
-    cx_s, cy_s, r_s = best
-    # 回映射到原始分辨率
-    px = int(round(cx_s / scale))
-    py = int(round(cy_s / scale))
-    pr = int(round(r_s / scale))
-
-    # 归一化为前端 selCircle 使用的比例
-    cx = float(px / max(w0, 1))
-    cy = float(py / max(h0, 1))
-    rr = float(pr / max(min(w0, h0), 1))
-
-    # 边界钳制
-    cx = max(0.0, min(1.0, cx))
-    cy = max(0.0, min(1.0, cy))
-    rr = max(0.02, min(0.49, rr))
-
-    return {
-        'cx': cx,
-        'cy': cy,
-        'r': rr,
-        'px': px,
-        'py': py,
-        'pr': pr,
-        'confidence': round(max(0.0, min(1.0, best_score)), 3),
-    }
-
-
-@app.route('/api/autodetect_circle', methods=['POST'])
-def api_autodetect_circle():
-    """Web 智能校准：从整帧截图自动定位小地图圆心与半径。"""
-    img = _decode_image_from_request()
-    if img is None:
-        return jsonify({'error': 'Invalid image'}), 400
-
-    det = _auto_detect_minimap_circle(img)
-    if det is None:
-        return jsonify({'error': 'Circle not found'}), 404
-
-    saved = save_circle_state(_CIRCLE_STATE_FILE, det['cx'], det['cy'], det['r'])
-    return jsonify({
-        'success': True,
-        'cx': det['cx'],
-        'cy': det['cy'],
-        'r': det['r'],
-        'pixel': {'x': det['px'], 'y': det['py'], 'r': det['pr']},
-        'confidence': det['confidence'],
-        'saved': bool(saved),
-    })
+    single = _decode_image_from_request()
+    return [single] if single is not None else []
 
 
 @app.route('/api/upload_minimap', methods=['POST'])
 def upload_minimap():
-    """接收前端上传的小地图图片（支持 FormData 和 JSON base64 两种格式）"""
+    """接收前端上传的小地图图片（支持 FormData 和 JSON base64 两种格式）。
+    同步处理并返回结果，不唤醒后台 SIFT 工作线程。"""
+    tracker_obj = _get_tracker_for_http_request()
     img = _decode_image_from_request()
 
     if img is not None:
-        tracker.set_minimap(img)
-        result = tracker.process_frame(need_base64=True, need_jpeg=False)
+        # 直接设置当前帧（不调用 set_minimap 以避免唤醒后台线程导致双重处理）
+        with tracker_obj.lock:
+            tracker_obj.current_frame_bgr = img.copy()
+        result = tracker_obj.process_frame(need_base64=True, need_jpeg=False)
         if result and result[0]:
             return jsonify({
                 'success': True,
                 'image': result[0],
-                'status': tracker.latest_status,
+                'status': tracker_obj.latest_status,
             })
     return jsonify({'error': 'Invalid image'}), 400
+
+
+@app.route('/api/recognize_single', methods=['POST'])
+def recognize_single():
+    """无状态单次识别：直接做全局 SIFT 匹配，不操作/不依赖共享 tracker 状态。
+    适用于上传截图测试场景。"""
+    from backend.core.features import extract_minimap_features, sift_match_region, CircularMaskCache
+    from backend.core.enhance import enhance_minimap, make_clahe_pair, correct_color_temperature
+    from backend.core.ecc import ecc_align
+    from backend.tracking.minimap import detect_and_extract
+
+    img = _decode_image_from_request()
+    if img is None:
+        return jsonify({'error': 'No image data'}), 400
+
+    shared = get_shared_sift()
+    input_h, input_w = img.shape[:2]
+    source_tag = 'RAW'
+
+    # 1. 圆形小地图检测 + 提取（使用临时校准器，不影响共享状态）
+    from backend.tracking.minimap import CircleCalibrator
+    temp_cal = CircleCalibrator()
+    extracted = detect_and_extract(img, temp_cal, engine_frozen=False)
+    if extracted is not None:
+        img = extracted
+        source_tag = 'LOCAL_CIRCLE'
+    else:
+        # 1.1 当输入是整张截图时，尝试自动定位小地图圆后再裁剪
+        # 说明：上传测试常见失败原因是前端固定裁剪参数与截图布局不一致。
+        if min(input_h, input_w) >= 320:
+            from backend.tracking.autodetect import detect_minimap_circle
+
+            det = detect_minimap_circle(img)
+            if det is not None:
+                h, w = img.shape[:2]
+                bs = min(w, h)
+                cx = float(det['cx']) * w
+                cy = float(det['cy']) * h
+                r = float(det['r']) * bs
+                margin = max(1.0, float(getattr(config, 'MINIMAP_CAPTURE_MARGIN', 1.4)))
+
+                sz = max(10, int(round(r * 2 * margin)))
+                rx = max(0, min(int(round(cx - sz / 2)), w - sz))
+                ry = max(0, min(int(round(cy - sz / 2)), h - sz))
+                crop = img[ry:ry + sz, rx:rx + sz].copy()
+
+                # 再跑一次局部圆提取，确保进入与常规路径一致的小地图域
+                extracted2 = detect_and_extract(crop, CircleCalibrator(), engine_frozen=False)
+                img = extracted2 if extracted2 is not None else crop
+                source_tag = f"AUTO_DETECT_{det.get('layout', 'full').upper()}"
+
+    # 2. 预处理：色温补偿 + CLAHE 增强
+    img = correct_color_temperature(img)
+    gray_raw = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    texture_std = float(np.std(gray_raw))
+    clahe_normal, clahe_low = make_clahe_pair()
+    low_thresh = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
+    gray = enhance_minimap(gray_raw, texture_std, clahe_normal, clahe_low, low_thresh)
+
+    # 3. 提取小地图特征点
+    mask_cache = CircularMaskCache()
+    kp_mini, des_mini = extract_minimap_features(gray, shared.sift, mask_cache, texture_std=texture_std)
+    if des_mini is None or len(kp_mini) < 3:
+        return jsonify({
+            'success': False,
+            'status': {
+                'state': 'NO_FEATURES', 'found': False,
+                'position': {'x': 0, 'y': 0}, 'matches': 0,
+                'match_quality': 0, 'mode': 'sift',
+            }
+        })
+
+    hash_index = getattr(shared, '_hash_index', None)
+
+    def _locate_hash_candidates_adaptive(max_results: int = 3):
+        """无状态场景下自适应放宽 hash 阈值，提升低纹理召回率。"""
+        if hash_index is None:
+            return []
+
+        # 先严格后宽松，避免常规场景误召回。
+        thresholds = [None, 16, 20]
+        with _hash_query_lock:
+            original = int(getattr(hash_index, '_hamming_thresh', 12))
+            try:
+                for th in thresholds:
+                    if th is not None:
+                        hash_index._hamming_thresh = int(th)
+                    candidates = hash_index.locate(gray_raw, last_x=None, last_y=None, radius=0, max_results=max_results)
+                    if candidates:
+                        return candidates
+                return []
+            finally:
+                hash_index._hamming_thresh = original
+
+    def _hash_ecc_or_hash_fallback(source_suffix: str):
+        """无状态兜底：先 hash 粗定位，再用 ECC 在候选附近细化。"""
+        if hash_index is None:
+            return None
+
+        candidates = _locate_hash_candidates_adaptive(max_results=3)
+        if not candidates:
+            return None
+
+        # ECC 两侧保持在增强域，降低亮度差带来的失败率
+        logic_map_for_ecc = getattr(shared, '_logic_map_gray_clahe', shared._logic_map_gray)
+        ecc_min_cc = float(getattr(config, 'SINGLE_ECC_MIN_CORRELATION', 0.30))
+        ecc_jump = int(getattr(config, 'SINGLE_ECC_JUMP_THRESHOLD', 360))
+        ecc_scale_hint = float(getattr(config, 'HASH_INDEX_PATCH_SCALE', 4.0))
+
+        for hx, hy, hdist in candidates:
+            refined = ecc_align(
+                gray, logic_map_for_ecc,
+                int(hx), int(hy),
+                ecc_scale_hint,
+                shared.map_width, shared.map_height,
+                ecc_jump,
+                min_cc=ecc_min_cc,
+            )
+            if refined is not None:
+                ex, ey = refined
+                consistent = True
+                try:
+                    consistent = bool(hash_index.check_consistency(gray_raw, int(ex), int(ey)))
+                except Exception:
+                    consistent = True
+                # 兜底质量分：保证前端有可读性，同时不虚高
+                base_q = max(0.18, 0.42 - float(hdist) * 0.015)
+                if consistent:
+                    base_q = max(base_q, 0.35)
+                return jsonify({
+                    'success': True,
+                    'status': {
+                        'state': 'FOUND', 'found': True, 'source': f'HASH_ECC_{source_suffix}',
+                        'position': {'x': int(ex), 'y': int(ey)}, 'matches': 0,
+                        'match_quality': float(min(base_q, 0.65)), 'mode': 'sift',
+                    }
+                })
+
+        # ECC 未细化成功，退回 hash 粗定位（至少给可用近似坐标）
+        hx, hy, hdist = candidates[0]
+        return jsonify({
+            'success': True,
+            'status': {
+                'state': 'HASH_FOUND', 'found': True, 'source': f'HASH_INDEX_{source_suffix}',
+                'position': {'x': int(hx), 'y': int(hy)}, 'matches': 0,
+                'match_quality': max(0.15, 0.35 - float(hdist) * 0.02), 'mode': 'sift',
+            }
+        })
+
+    # 4. 全局 SIFT 匹配（使用共享只读 FLANN 索引，线程安全）
+    match_ratio = getattr(config, 'SIFT_MATCH_RATIO', 0.82)
+    min_match = getattr(config, 'SIFT_MIN_MATCH_COUNT', 5)
+    result = sift_match_region(
+        kp_mini, des_mini, gray.shape,
+        shared.kp_big_all, shared.flann_global,
+        match_ratio, min_match,
+        shared.map_width, shared.map_height)
+
+    if result is None:
+        # 尝试宽松参数
+        result = sift_match_region(
+            kp_mini, des_mini, gray.shape,
+            shared.kp_big_all, shared.flann_global,
+            0.88, 3,
+            shared.map_width, shared.map_height)
+
+    if result is None:
+        # SIFT 失败：走 hash+ECC 兜底链，提高低纹理召回率
+        fallback_resp = _hash_ecc_or_hash_fallback(source_tag)
+        if fallback_resp is not None:
+            return fallback_resp
+        return jsonify({
+            'success': False,
+            'status': {
+                'state': 'NOT_FOUND', 'found': False,
+                'position': {'x': 0, 'y': 0}, 'matches': 0,
+                'match_quality': 0, 'mode': 'sift',
+            }
+        })
+
+    tx, ty, inlier_count, quality, avg_scale = result
+    # 5. 无状态识别安全闸门：低置信或视觉不一致时不直接返回 FOUND
+    # 目的：避免出现“识别到了，但坐标错”的误报。
+    min_inliers = int(getattr(config, 'SIFT_MIN_MATCH_COUNT', 5))
+    min_quality = float(getattr(config, 'SINGLE_RECOGNIZE_MIN_QUALITY', 0.12))
+    sift_confident = (int(inlier_count) >= max(3, min_inliers)) and (float(quality) >= min_quality)
+    # 哈希索引是粗校验，不宜压过“非常强”的 SIFT 命中（避免误拒真阳性）。
+    sift_very_strong = (int(inlier_count) >= 8) and (float(quality) >= 0.55)
+
+    hash_consistent = True
+    if hash_index is not None:
+        try:
+            hash_consistent = bool(hash_index.check_consistency(gray_raw, int(tx), int(ty)))
+        except Exception:
+            hash_consistent = True
+
+    if (not sift_confident) or ((not hash_consistent) and (not sift_very_strong)):
+        fallback_resp = _hash_ecc_or_hash_fallback(source_tag)
+        if fallback_resp is not None:
+            return fallback_resp
+
+        return jsonify({
+            'success': False,
+            'status': {
+                'state': 'LOW_CONFIDENCE', 'found': False,
+                'position': {'x': 0, 'y': 0}, 'matches': int(inlier_count),
+                'match_quality': float(quality), 'mode': 'sift',
+                'source': f'SIFT_GLOBAL_{source_tag}',
+            }
+        })
+
+    # 5. 渲染结果图片（使用灰度大地图）
+    gray_map = shared._logic_map_gray
+    half_view = config.VIEW_SIZE // 2
+    pad = getattr(config, 'JPEG_PAD', 0)
+    y1 = max(0, ty - half_view - pad)
+    y2 = min(shared.map_height, ty + half_view + pad)
+    x1 = max(0, tx - half_view - pad)
+    x2 = min(shared.map_width, tx + half_view + pad)
+    crop = gray_map[y1:y2, x1:x2]
+    full_size = config.VIEW_SIZE + 2 * pad
+    canvas = np.full((full_size, full_size), 43, dtype=np.uint8)
+    h, w = crop.shape[:2]
+    yo = max(0, (full_size - h) // 2)
+    xo = max(0, (full_size - w) // 2)
+    ph = min(h, full_size - yo)
+    pw = min(w, full_size - xo)
+    canvas[yo:yo+ph, xo:xo+pw] = crop[:ph, :pw]
+    _, jpeg_buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    img_b64 = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_buf.tobytes()).decode('utf-8')
+
+    return jsonify({
+        'success': True,
+        'image': img_b64,
+        'status': {
+            'state': 'FOUND', 'found': True, 'source': f'SIFT_GLOBAL_{source_tag}',
+            'position': {'x': int(tx), 'y': int(ty)}, 'matches': int(inlier_count),
+            'match_quality': float(quality), 'mode': 'sift',
+        }
+    })
 
 
 @app.route('/api/status')
 def get_status():
     """获取当前追踪状态"""
-    return jsonify(tracker.latest_status)
+    tracker_obj = _get_tracker_for_http_request()
+    return jsonify(tracker_obj.latest_status)
+
+
+@app.route('/api/reset', methods=['POST'])
+def force_reset():
+    """强制重置追踪器状态，清空引擎/平滑器/圆校准器所有状态，防止死锁和停滞。"""
+    tracker_obj = _get_tracker_for_http_request()
+    cleared = tracker_obj.full_reset()
+    return jsonify({'ok': True, 'cleared': cleared})
 
 
 @app.route('/api/map_info')
 def get_map_info():
-    """大地图模式：返回地图尺寸和图片路径"""
+    """返回大地图尺寸。"""
+    tracker_obj = _get_tracker_for_http_request()
     return jsonify({
-        'map_width': tracker.map_width,
-        'map_height': tracker.map_height,
-        'display_map_url': '/big_map-1.png',
+        'map_width': tracker_obj.map_width,
+        'map_height': tracker_obj.map_height,
     })
 
 
-@app.route('/bigmap')
-def bigmap_page():
-    """大地图独立页面"""
-    return send_file(os.path.join(FRONTEND_DIR, 'bigmap.html'))
+# ==================== 地图资源数据 API ====================
+
+_MAP_BUILDER_DIR = os.path.join(_BASE_DIR, 'map_builder')
 
 
-@app.route('/api/coord_lock', methods=['POST'])
-def api_coord_lock():
-    """坐标锁定模式: 开/关/查询"""
-    data = request.get_json(silent=True) or {}
-    action = data.get('action', 'toggle').lower()
-    engine = tracker.sift_engine
-
-    if action == 'query':
-        return jsonify({
-            'enabled': engine.coord_lock_enabled,
-            'history_count': len(tracker.pos_history),
-            'can_activate': len(tracker.pos_history) >= engine._lock_min_to_activate,
-        })
-
-    if action == 'on':
-        if len(tracker.pos_history) < engine._lock_min_to_activate:
-            return jsonify({'error': f'历史坐标不足 (需要{engine._lock_min_to_activate}个，当前{len(tracker.pos_history)}个)'}), 400
-        ok = engine.set_coord_lock(True)
-        return jsonify({'success': ok, 'enabled': True})
-
-    elif action == 'off':
-        ok = engine.set_coord_lock(False)
-        return jsonify({'success': ok, 'enabled': False})
-
-    else:  # toggle
-        if engine.coord_lock_enabled:
-            ok = engine.set_coord_lock(False)
-            return jsonify({'success': ok, 'enabled': False})
-        else:
-            if len(tracker.pos_history) < engine._lock_min_to_activate:
-                return jsonify({'error': f'历史坐标不足 (需要{engine._lock_min_to_activate}个，当前{len(tracker.pos_history)}个)'}), 400
-            ok = engine.set_coord_lock(True)
-            return jsonify({'success': ok, 'enabled': True})
+def _json_with_cache(payload: dict, *, max_age: int = 0, immutable: bool = False):
+    response = jsonify(payload)
+    if max_age > 0:
+        cache_control = f'public, max-age={max_age}'
+        if immutable:
+            cache_control += ', immutable'
+        response.headers['Cache-Control'] = cache_control
+    else:
+        response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
-@app.route('/api/reset_history', methods=['POST'])
-def api_reset_history():
-    """清空坐标历史 + 关闭锁定"""
-    cleared, was_locked = tracker.reset_history()
-
-    print(f"🗑 历史已重置: 清除{cleared}条记录, 锁定{'已关闭' if was_locked else '未开启'}")
-    return jsonify({
-        'success': True,
-        'cleared_count': cleared,
-        'was_locked': was_locked,
-    })
+def _has_version_query() -> bool:
+    return bool((request.args.get('v') or '').strip())
 
 
-@app.route('/api/circle_state', methods=['GET', 'POST'])
-def api_circle_state():
-    """获取/保存 圆形选区状态 (cx, cy, r) 到服务器本地"""
+@app.route('/api/markers/manifest')
+def api_markers_manifest():
+    """返回分块加载所需的标记点清单。"""
+    force_reload = (request.args.get('refresh') or '').strip() == '1'
+    return _json_with_cache(get_marker_manifest(force_reload=force_reload), max_age=30)
+
+
+@app.route('/api/markers/chunks')
+def api_marker_chunks():
+    """按 chunk key 返回指定区块的轻量点位数据。"""
+    raw_keys = (request.args.get('keys') or '').split(',')
+    payload = get_marker_chunks(raw_keys)
+    if not payload['requestedKeys']:
+        return _json_with_cache({'success': False, 'error': 'keys 不能为空'}, max_age=0), 400
+    return _json_with_cache(payload, max_age=(31536000 if _has_version_query() else 0), immutable=_has_version_query())
+
+
+@app.route('/api/markers/details')
+def api_marker_details():
+    """按 id 批量返回标记点详情。"""
+    raw_ids = (request.args.get('ids') or '').split(',')
+    payload = get_marker_details(raw_ids)
+    if not payload['requestedIds']:
+        return _json_with_cache({'success': False, 'error': 'ids 不能为空'}, max_age=0), 400
+    return _json_with_cache(payload, max_age=(31536000 if _has_version_query() else 0), immutable=_has_version_query())
+
+
+@app.route('/api/markers/search_index')
+def api_marker_search_index():
+    """返回延迟加载的搜索索引（标题/描述/坐标）。"""
+    return _json_with_cache(get_marker_search_index(), max_age=(31536000 if _has_version_query() else 0), immutable=_has_version_query())
+
+@app.route('/api/markers')
+def api_markers():
+    """返回精简版标记点数据 (id, markType, x, y)"""
+    return send_from_directory(_MAP_BUILDER_DIR, 'rocom_markers_lite.json')
+
+@app.route('/api/markers/detail')
+def api_markers_detail():
+    """返回标记点详情 (title, description)，按 id 索引"""
+    return send_from_directory(_MAP_BUILDER_DIR, 'rocom_markers_detail.json')
+
+@app.route('/api/categories')
+def api_categories():
+    """返回分类字典 (id -> {name, group})"""
+    return send_from_directory(_MAP_BUILDER_DIR, 'categories.json')
+
+
+@app.route('/api/config', methods=['GET', 'POST'])
+def api_config_runtime():
+    """读取/更新后端配置。只开放热更新安全子集，其他配置只读展示。"""
     if request.method == 'GET':
-        state = load_circle_state(_CIRCLE_STATE_FILE)
-        if state:
-            return jsonify({'success': True, **state})
-        return jsonify({'success': False, 'error': 'No saved state'})
+        return jsonify(_build_config_payload())
 
-    # POST: 保存状态
     data = request.get_json(silent=True) or {}
-    try:
-        cx = float(data.get('cx', 0))
-        cy = float(data.get('cy', 0))
-        r = float(data.get('r', 0))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'Invalid parameters'}), 400
+    updates = data.get('updates') if isinstance(data, dict) else None
+    if not isinstance(updates, dict) or not updates:
+        return jsonify({'success': False, 'error': 'updates 必须是非空对象'}), 400
 
-    if save_circle_state(_CIRCLE_STATE_FILE, cx, cy, r):
-        return jsonify({'success': True, 'cx': cx, 'cy': cy, 'r': r})
-    return jsonify({'error': 'Save failed'}), 500
+    approved, rejected = _validate_runtime_config_updates(updates)
+    if approved:
+        _apply_runtime_config_updates(approved)
+
+    payload = _build_config_payload()
+    payload.update({
+        'success': not rejected,
+        'partial': bool(approved and rejected),
+        'applied': {key: _serialize_config_value(value) for key, value in approved.items()},
+        'rejected': rejected,
+    })
+    return jsonify(payload), (200 if not rejected else 400)
 
 
 @app.route('/api/result')
 def get_result():
     """获取最新的结果图片"""
-    image = tracker.get_latest_result_base64()
+    tracker_obj = _get_tracker_for_http_request()
+    image = tracker_obj.get_latest_result_base64()
     if image:
         return jsonify({
             'image': image,
-            'status': tracker.latest_status,
+            'status': tracker_obj.latest_status,
         })
     return jsonify({'error': 'No result yet'}), 404
 
@@ -487,7 +1166,8 @@ def get_result():
 @app.route('/api/latest_frame')
 def get_latest_frame():
     """获取最新渲染的地图帧（JPEG 二进制）- 供外部悬浮窗使用"""
-    jpeg_bytes = tracker.get_latest_result_jpeg()
+    tracker_obj = _get_tracker_for_http_request()
+    jpeg_bytes = tracker_obj.get_latest_result_jpeg()
     if jpeg_bytes:
         return send_file(
             BytesIO(jpeg_bytes),
@@ -499,11 +1179,12 @@ def get_latest_frame():
 @app.route('/api/process')
 def process():
     """手动触发一次处理（用于文件模式）"""
-    result = tracker.process_frame(need_base64=True, need_jpeg=False)
+    tracker_obj = _get_tracker_for_http_request()
+    result = tracker_obj.process_frame(need_base64=True, need_jpeg=False)
     if result and result[0]:
         return jsonify({
             'image': result[0],
-            'status': tracker.latest_status,
+            'status': tracker_obj.latest_status,
         })
     return jsonify({'error': 'No minimap set'}), 400
 
@@ -521,7 +1202,6 @@ def api_list_routes():
             routes.append({
                 'filename': f,
                 'name': data.get('name', f),
-                'loop': data.get('loop', False),
                 'point_count': len(data.get('points', [])),
             })
     return jsonify(routes)
@@ -547,110 +1227,94 @@ def api_get_route(filename):
 def ws_connect():
     """客户端建立 WS 连接"""
     print(f"WebSocket 客户端已连接: {request.sid}")
-    emit('status', tracker.latest_status)
+    tracker_obj = _get_tracker_for_token(_DEFAULT_SESSION_TOKEN)
+    emit('status', tracker_obj.latest_status)
+
+
+@socketio.on('session_join')
+def ws_session_join(data):
+    """绑定识别会话 token，并将连接加入对应房间。"""
+    token = _normalize_session_token((data or {}).get('token') if isinstance(data, dict) else '')
+    if not token:
+        return
+
+    old = _bind_sid_token(request.sid, token)
+    if old and old != token:
+        try:
+            leave_room(_session_room(old))
+        except Exception:
+            pass
+    join_room(_session_room(token))
+    tracker_obj = _get_tracker_for_token(token)
+    emit('status', tracker_obj.latest_status)
+
+    # 若客户端先发了 frame 再 session_join，补绑 push 目标
+    _jpeg_mgr.register_frame_client(request.sid, token)
 
 
 @socketio.on('disconnect')
 def ws_disconnect():
-    global _push_frame_sid
-    # Plan B: 客户端断开时从 frame_clients 移除，若没有 JPEG 消费者则关闭编码
-    _frame_clients.discard(request.sid)
-    tracker._push_jpeg = bool(_frame_clients)
-    # Plan A: 若断开的是 push 目标，清除 SID 避免无效推送
-    if request.sid == _push_frame_sid:
-        _push_frame_sid = ''
+    old_token = _coerce_session_token(_unbind_sid_token(request.sid))
+
+    # JPEG 模式：从管理器清理 SID（Plan A/B 状态），若无消费者则关闭后台编码
+    _jpeg_mgr.unregister_client(request.sid)
+    tracker_obj = _get_tracker_for_token(old_token)
+    tracker_obj._push_jpeg = _jpeg_mgr.has_jpeg_clients(old_token)
+
+    # 展示室清理：展示者断线 → 删除房间并通知观众；观众断线 → 从订阅集合移除
+    with _bcast_lock:
+        # 展示者断线
+        dead_rooms = [n for n, i in _bcast_rooms.items() if i['sid'] == request.sid]
+        for name in dead_rooms:
+            room = _bcast_rooms.pop(name)
+            for vsid in list(room['viewers']):
+                try:
+                    socketio.emit('broadcast_ended', {'name': name}, to=vsid)
+                except Exception:
+                    pass
+        # 观众断线
+        for info in _bcast_rooms.values():
+            info['viewers'].discard(request.sid)
+
+    if dead_rooms:
+        with _bcast_lock:
+            rooms = [{'name': n, 'viewers': len(i['viewers'])} for n, i in _bcast_rooms.items()]
+        socketio.emit('broadcast_list', {'rooms': rooms})
+
     print(f"WebSocket 客户端断开: {request.sid}")
-
-
-@socketio.on('coord_lock')
-def ws_coord_lock(data):
-    """通过 WS 切换坐标锁定模式"""
-    action = (data.get('action', 'toggle') if isinstance(data, dict) else 'toggle').lower()
-    engine = tracker.sift_engine
-
-    if action == 'query':
-        emit('lock_result', {
-            'enabled': engine.coord_lock_enabled,
-            'history_count': len(tracker.pos_history),
-            'can_activate': len(tracker.pos_history) >= engine._lock_min_to_activate,
-        })
-        return
-
-    if action == 'on' or (action == 'toggle' and not engine.coord_lock_enabled):
-        need = engine._lock_min_to_activate
-        have = len(tracker.pos_history)
-        if have < need:
-            emit('lock_result', {'success': False, 'error': f'历史不足({have}/{need})'})
-            return
-        ok = engine.set_coord_lock(True)
-        emit('lock_result', {'success': ok, 'enabled': True})
-    elif action == 'off' or (action == 'toggle' and engine.coord_lock_enabled):
-        ok = engine.set_coord_lock(False)
-        emit('lock_result', {'success': ok, 'enabled': False})
-
-
-@socketio.on('reset_history')
-def ws_reset_history():
-    """通过 WS 重置坐标历史"""
-    cleared, was_locked = tracker.reset_history()
-
-    print(f"🗑 [WS] 历史已重置: 清除{cleared}条, 锁定{'已关闭' if was_locked else '未开启'}")
-    emit('reset_result', {
-        'success': True,
-        'cleared_count': cleared,
-        'was_locked': was_locked,
-    })
 
 
 @socketio.on('request_jpeg')
 def ws_request_jpeg():
-    """前端请求强制推送一张新 JPEG（如切换到 JPEG 渲染模式时触发）。
-    重置节流锚点到不可能的坐标，确保下次 _on_result_ready 必定发送 result+JPEG。
-    """
-    global _last_jpeg_x, _last_jpeg_y
-    _last_jpeg_x = -99999.0
-    _last_jpeg_y = -99999.0
+    """前端切换到 JPEG 渲染模式时触发，强制下次 _on_result_ready 必须推送 result+JPEG。"""
+    _jpeg_mgr.force_next_jpeg(_coerce_session_token(_get_sid_token(request.sid)))
 
 
 @socketio.on('frame')
 def ws_receive_frame(raw_bytes):
     """
-    接收二进制 JPEG 帧，存帧并立即返回上一帧缓存坐标（非阻塞，pull 兜底）。
-    SIFT 匹配运行在后台线程，处理完成后由 _on_result_ready 主动推送新结果（Plan A）。
+    JPEG 模式专用：接收二进制 JPEG 帧，存帧并立即返回缓存坐标（pull 兜底）。
+    SIFT 运行在后台线程，完成后由 _on_result_ready 主动推送新结果（Plan A）。
     协议: 客户端发送原始 JPEG bytes → 服务端返回 [JSON头(4字节长度) + JSON]
-    Plan B: 注册该客户端为 JPEG 消费者，确保后台线程生成 JPEG。
-    Plan A: 记录该 SID 为 push 目标，SIFT 完成后立即推送（含 JPEG 节流）。
     """
-    global _push_frame_sid
+    if len(raw_bytes) > _WS_FRAME_MAX_BYTES:
+        return  # 拒绝超大帧，防止内存耗尽
 
-    # Plan B: 记录该 sid 需要 JPEG，后台线程保持编码开启
-    if request.sid not in _frame_clients:
-        _frame_clients.add(request.sid)
-        tracker._push_jpeg = True
-    # Plan A: 记录最新 JPEG 客户端 SID，供 _on_result_ready 定向推送
-    _push_frame_sid = request.sid
+    token = _coerce_session_token(_get_sid_token(request.sid))
+    tracker_obj = _get_tracker_for_token(token)
+
+    # Plan B + Plan A：注册客户端，开启后台 JPEG 编码，并设为 push 目标
+    _jpeg_mgr.register_frame_client(request.sid, token)
+    tracker_obj._push_jpeg = True
 
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
-        tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程，立即返回
-
-        # Pull 兜底：立即返回上一帧缓存坐标，等待 push 推送新 JPEG（~20ms 后）
-        status = tracker.latest_status
-        if status.get('state') == '--':
-            return  # 启动后尚无任何结果
-
-        status_json = _make_status_json()
-        header = struct.pack('>I', len(status_json))
-        emit('coords', header + status_json, binary=True)
-
-        # 向其他监听客户端（如 bigmap.html）广播仅坐标的轻量更新
-        emit('coords', header + status_json,
-             broadcast=True, include_self=False, binary=True)
+        tracker_obj.set_minimap(img, token=token)  # 存帧并唤醒后台 SIFT 线程，结果由 _on_result_ready 定向推送
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True)
+        emit('error', struct.pack('>I', len(err)) + err)
 
 
 @socketio.on('frame_coords')
@@ -659,41 +1323,197 @@ def ws_frame_coords(raw_bytes):
     接收帧并存帧（后台处理），立即返回上一帧缓存坐标。大幅减少带宽。
     Plan B: 无 'frame' 客户端时设 _push_jpeg=False，后台线程跳过 JPEG 编码。
     """
+    if len(raw_bytes) > _WS_FRAME_MAX_BYTES:
+        return  # 拒绝超大帧，防止内存耗尽
+
+    token = _coerce_session_token(_get_sid_token(request.sid))
+    tracker_obj = _get_tracker_for_token(token)
+
     nparr = np.frombuffer(raw_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
         # Plan B: 当前无 JPEG 消费者时关闭编码，节省 10-15ms/帧
-        if not _frame_clients:
-            tracker._push_jpeg = False
+        if not _jpeg_mgr.has_jpeg_clients(token):
+            tracker_obj._push_jpeg = False
 
-        tracker.set_minimap(img)  # 存帧并唤醒后台 SIFT 线程
-
-        if tracker.latest_status.get('state') == '--':
-            return  # 尚无任何处理结果（首帧），静默等待
-
-        status = tracker.latest_status
-        status_json = json.dumps({
-            'm': tracker.current_mode,
-            's': status['state'],
-            'x': status['position']['x'],
-            'y': status['position']['y'],
-            'f': int(status['found']),
-            'c': status['matches'],
-            'q': round(status.get('match_quality', 0), 2),
-            'a': round(status.get('arrow_angle', 0), 1),
-            'as': int(status.get('arrow_stopped', True)),
-            'l': int(tracker.sift_engine.coord_lock_enabled),
-            'h': int(status.get('hybrid_busy', False)),
-            'hy': int(status.get('hybrid', False)),
-        }, separators=(',', ':')).encode('utf-8')
-
-        emit('coords',
-             struct.pack('>I', len(status_json)) + status_json,
-             binary=True)
+        tracker_obj.set_minimap(img, token=token)  # 存帧并唤醒后台 SIFT 线程，结果由 _on_result_ready 定向推送
     else:
         err = b'{"error":"decode_fail"}'
-        emit('error', struct.pack('>I', len(err)) + err, binary=True)
+        emit('error', struct.pack('>I', len(err)) + err)
+
+
+@socketio.on('broadcast_list')
+def ws_bcast_list():
+    """返回当前活跃展示者列表给调用者（观众模式用）。"""
+    with _bcast_lock:
+        rooms = [
+            {'name': name, 'viewers': len(info['viewers'])}
+            for name, info in _bcast_rooms.items()
+        ]
+    emit('broadcast_list', {'rooms': rooms})
+
+
+@socketio.on('broadcast_join')
+def ws_bcast_join(data):
+    """
+    展示者加入展示室（data = {name: str}）。
+    同名已存在且原展示者 sid 不同时拒绝（防止抢占）。
+    """
+    name = (data.get('name') or '').strip()[:32] if isinstance(data, dict) else ''
+    if not name:
+        emit('broadcast_joined', {'ok': False, 'error': '昵称不能为空'})
+        return
+    with _bcast_lock:
+        existing = _bcast_rooms.get(name)
+        if existing and existing['sid'] != request.sid:
+            emit('broadcast_joined', {'ok': False, 'error': '该昵称已被他人使用'})
+            return
+        _bcast_rooms[name] = {
+            'sid': request.sid,
+            'viewers': existing['viewers'] if existing else set(),
+            'last_ts': 0.0,
+            'last_frame': None,
+        }
+    # 通知所有人列表更新
+    with _bcast_lock:
+        rooms = [{'name': n, 'viewers': len(i['viewers'])} for n, i in _bcast_rooms.items()]
+    socketio.emit('broadcast_list', {'rooms': rooms})
+    emit('broadcast_joined', {'ok': True, 'name': name})
+    print(f"[bcast] {name}({request.sid}) 已加入展示室")
+
+
+@socketio.on('broadcast_leave')
+def ws_bcast_leave(data):
+    """展示者离开展示室（或踢出）。"""
+    name = (data.get('name') or '').strip() if isinstance(data, dict) else ''
+    with _bcast_lock:
+        room = _bcast_rooms.get(name)
+        if room and room['sid'] == request.sid:
+            # 通知所有观众展示者已离线
+            for vsid in list(room['viewers']):
+                try:
+                    socketio.emit('broadcast_ended', {'name': name}, to=vsid)
+                except Exception:
+                    pass
+            del _bcast_rooms[name]
+    with _bcast_lock:
+        rooms = [{'name': n, 'viewers': len(i['viewers'])} for n, i in _bcast_rooms.items()]
+    socketio.emit('broadcast_list', {'rooms': rooms})
+
+
+@socketio.on('broadcast_watch')
+def ws_bcast_watch(data):
+    """观众订阅展示者（data = {name: str}）。"""
+    name = (data.get('name') or '').strip() if isinstance(data, dict) else ''
+    with _bcast_lock:
+        room = _bcast_rooms.get(name)
+        if not room:
+            emit('broadcast_watch_ack', {'ok': False, 'error': '展示者不存在或已离线'})
+            return
+        room['viewers'].add(request.sid)
+        rooms = [{'name': n, 'viewers': len(i['viewers'])} for n, i in _bcast_rooms.items()]
+    socketio.emit('broadcast_list', {'rooms': rooms})
+    emit('broadcast_watch_ack', {'ok': True, 'name': name})
+    print(f"[bcast] 观众 {request.sid} 订阅 {name}")
+
+
+@socketio.on('broadcast_unwatch')
+def ws_bcast_unwatch(data):
+    """观众取消订阅。"""
+    name = (data.get('name') or '').strip() if isinstance(data, dict) else ''
+    changed = False
+    with _bcast_lock:
+        room = _bcast_rooms.get(name)
+        if room:
+            room['viewers'].discard(request.sid)
+            changed = True
+            rooms = [{'name': n, 'viewers': len(i['viewers'])} for n, i in _bcast_rooms.items()]
+    if changed:
+        socketio.emit('broadcast_list', {'rooms': rooms})
+
+
+@socketio.on('broadcast_frame')
+def ws_bcast_frame(raw_bytes):
+    """
+    展示者推送 JPEG 帧。服务端节流（10fps），把帧广播给所有订阅观众。
+    协议：原始 JPEG bytes，无需包头（展示画面，非 SIFT 分析结果）。
+
+    节流逻辑：通道内每 100ms 最多发一帧。节流期间收到的帧暂存为 last_frame，
+    并调度一次"冲刷任务"，在间隔结束后把 last_frame 补发出去，
+    保证展示者最后一帧一定能到达观众（防止永久丢帧）。
+    """
+    if not raw_bytes:
+        return
+    # 找出该 sid 对应的房间
+    with _bcast_lock:
+        room_name = None
+        room = None
+        for name, info in _bcast_rooms.items():
+            if info['sid'] == request.sid:
+                room_name = name
+                room = info
+                break
+        if room is None:
+            return  # 未注册为展示者，忽略
+
+        now = time.monotonic()
+        if now - room['last_ts'] < _BCAST_MIN_INTERVAL:
+            room['last_frame'] = bytes(raw_bytes)  # 暂存最新帧
+            # 若尚无冲刷任务在路上，调度一个在间隔结束后补发
+            if not room.get('flush_scheduled'):
+                room['flush_scheduled'] = True
+                delay = _BCAST_MIN_INTERVAL - (now - room['last_ts'])
+
+                def _flush(rname=room_name):
+                    with _bcast_lock:
+                        r = _bcast_rooms.get(rname)
+                        if not r:
+                            return
+                        r['flush_scheduled'] = False
+                        frame = r.get('last_frame')
+                        if not frame or not r['viewers']:
+                            return
+                        r['last_ts'] = time.monotonic()
+                        viewers_snap = list(r['viewers'])
+                    dead = set()
+                    for vsid in viewers_snap:
+                        try:
+                            socketio.emit('broadcast_frame', frame, to=vsid)
+                        except Exception:
+                            dead.add(vsid)
+                    if dead:
+                        with _bcast_lock:
+                            rv = _bcast_rooms.get(rname)
+                            if rv:
+                                rv['viewers'] -= dead
+
+                socketio.start_background_task(lambda d=delay, f=_flush: (
+                    __import__('time').sleep(d), f()
+                ))
+            return
+
+        room['last_ts'] = now
+        room['last_frame'] = bytes(raw_bytes)
+        room['flush_scheduled'] = False
+        viewers = list(room['viewers'])
+
+    if not viewers:
+        return
+
+    # 向每个存活的观众 emit（失败则清理）
+    dead = set()
+    for vsid in viewers:
+        try:
+            socketio.emit('broadcast_frame', raw_bytes, to=vsid)
+        except Exception:
+            dead.add(vsid)
+
+    if dead:
+        with _bcast_lock:
+            r = _bcast_rooms.get(room_name)
+            if r:
+                r['viewers'] -= dead
 
 
 # ==================== 启动入口 ====================

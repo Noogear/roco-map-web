@@ -1,0 +1,42 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>配置中心</title>
+    <style>
+        body.page-preload .app-main,
+        body.page-preload .app-dock,
+        body.page-preload .app-toast-stack {
+            visibility: hidden;
+            opacity: 0;
+        }
+    </style>
+    <link rel="stylesheet" href="/css/common.css">
+    <link rel="stylesheet" href="/css/settings.css">
+</head>
+<body class="app-body page-preload" data-page="settings" data-delay-ready="1">
+
+    <main class="app-main">
+        <div class="app-page-shell settings-shell settings-side-layout">
+            <div class="settings-scroll">
+                <header class="settings-header">
+                    <div>
+                        <h1>个人设置</h1>
+                        <p class="app-note">管理你的前端偏好、界面主题与数据，所有设置保存在当前浏览器本地。</p>
+                    </div>
+                    <div class="settings-header-actions">
+                        <button class="app-btn-soft" type="button" id="exportBtn">📤 导出</button>
+                        <button class="app-btn-soft" type="button" id="importBtn">📥 导入</button>
+                        <input type="file" id="importFile" accept=".json" class="hidden">
+                    </div>
+                </header>
+                <div id="settingsBody" class="settings-sections"></div>
+            </div>
+        </div>
+    </main>
+
+    <script src="/js/socket.io.min.js"></script>
+    <script type="module" src="/js/settings.js"></script>
+</body>
+</html>

@@ -2,9 +2,11 @@ opencv-python
 numpy
 mss
 Pillow
-torch        # LoFTR AI 引擎依赖；CNB GPU 环境需提前安装 CUDA 版，见 README
-kornia       # LoFTR AI 引擎依赖
 requests
 flask      # main_ai_web.py 网页版需要
 flask-socketio>=5.3    # WebSocket 支持
-python-socketio[client]>=5.11  # 前端 WS 可选
+python-socketio>=5.11
+orjson>=3.10           # 高性能 JSON 编解码
+flask-compress>=1.15   # gzip/br 压缩，降低带宽占用
+gevent>=25.0           # 高并发 SocketIO worker
+gevent-websocket>=0.10 # gevent WebSocket worker 支持

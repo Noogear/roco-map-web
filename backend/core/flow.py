@@ -58,6 +58,28 @@ class LKTracker:
         return self.frame_num % self.sift_every == 0
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _as_xy_points(pts: np.ndarray | None) -> np.ndarray:
+        """将点集统一为 (N,2)；无法解析时返回空数组。"""
+        if pts is None:
+            return np.empty((0, 2), dtype=np.float32)
+        arr = np.asarray(pts)
+        if arr.size == 0:
+            return np.empty((0, 2), dtype=np.float32)
+
+        # OpenCV 常见输出形状：(N,1,2) 或 (N,2)
+        if arr.ndim == 3 and arr.shape[-2:] == (1, 2):
+            arr = arr.reshape(-1, 2)
+        elif arr.ndim == 2 and arr.shape[1] == 2:
+            pass
+        elif arr.ndim == 1 and arr.size % 2 == 0:
+            arr = arr.reshape(-1, 2)
+        else:
+            return np.empty((0, 2), dtype=np.float32)
+
+        return arr.astype(np.float32, copy=False)
+
+    # ------------------------------------------------------------------
     def track(
         self,
         minimap_gray: np.ndarray,
@@ -83,9 +105,11 @@ class LKTracker:
             if curr_pts is None or status is None:
                 return None
             ok = status.ravel() == 1
-            good_curr = curr_pts[ok]
-            good_prev = self.prev_pts[ok]
+            good_curr = self._as_xy_points(curr_pts[ok])
+            good_prev = self._as_xy_points(self.prev_pts[ok])
             if len(good_curr) < 4:
+                return None
+            if good_curr.shape != good_prev.shape or good_curr.shape[1] != 2:
                 return None
             disp = good_curr - good_prev
             dx_mm = float(np.median(disp[:, 0]))
@@ -98,17 +122,11 @@ class LKTracker:
             return None
 
     # ------------------------------------------------------------------
-    def update_frame(self, minimap_gray: np.ndarray) -> None:
-        """更新 prev_gray（每帧末调用，无论跟踪是否成功）。"""
-        self.prev_gray = minimap_gray.copy()
-        self.frame_num += 1
-
-    # ------------------------------------------------------------------
     def refresh_tracking_points(self, minimap_gray: np.ndarray) -> None:
-        """SIFT/ORB 找到位置后，重新提取当前帧跟踪点给下一帧用。"""
+        """绝对定位成功后，重新提取当前帧跟踪点供下一帧 LK 使用。"""
         h, w = minimap_gray.shape[:2]
         mask = self._mask_cache.get(h, w)
         pts = cv2.goodFeaturesToTrack(
             minimap_gray, maxCorners=60, qualityLevel=0.01,
             minDistance=7, mask=mask)
-        self.prev_pts = pts
+        self.prev_pts = pts if pts is not None and len(pts) >= 4 else None

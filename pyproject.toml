@@ -11,7 +11,11 @@ dependencies = [
     "requests",
     "flask>=2.0",
     "flask-socketio>=5.3",
-    "python-socketio[asyncio_client]>=5.11",
+    "python-socketio>=5.11",
+    "orjson>=3.10",
+    "flask-compress>=1.15",
+    "gevent>=25.0",
+    "gevent-websocket>=0.10",
 ]
 
 [project.optional-dependencies]
@@ -31,3 +35,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["backend*"]
+
+[tool.pytest.ini_options]
+norecursedirs = [
+    ".git",
+    ".venv",
+    "_debug",
+    "node_modules",
+]

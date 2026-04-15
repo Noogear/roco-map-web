@@ -10,11 +10,19 @@ from __future__ import annotations
 import json
 import os
 import time
+import threading
 
 
 # ---------------------------------------------------------------------------
 # 路线文件
 # ---------------------------------------------------------------------------
+
+_ROUTE_CACHE_LOCK = threading.Lock()
+_ROUTE_CACHE: dict[str, tuple[int, float, dict | None]] = {}
+
+
+def _route_cache_key(routes_dir: str, filename: str) -> str:
+    return os.path.abspath(os.path.join(routes_dir, filename))
 
 def get_route_files(routes_dir: str) -> list[str]:
     """扫描 routes 目录，返回 .json 文件名列表（已排序）。"""
@@ -27,37 +35,32 @@ def load_route_data(routes_dir: str, filename: str) -> dict | None:
     """加载单个路线 JSON 文件。filename 已经过安全校验（basename only）。"""
     filepath = os.path.join(routes_dir, filename)
     if not os.path.isfile(filepath):
+        with _ROUTE_CACHE_LOCK:
+            _ROUTE_CACHE.pop(_route_cache_key(routes_dir, filename), None)
         return None
+
+    cache_key = _route_cache_key(routes_dir, filename)
+    try:
+        stat = os.stat(filepath)
+        mtime_ns = int(stat.st_mtime_ns)
+    except OSError:
+        return None
+
+    with _ROUTE_CACHE_LOCK:
+        cached = _ROUTE_CACHE.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            # 返回浅拷贝，避免调用方误改缓存对象
+            data = cached[2]
+            return dict(data) if isinstance(data, dict) else None
+
     try:
         with open(filepath, 'r', encoding='utf-8') as fh:
-            return json.load(fh)
+            data = json.load(fh)
+        payload = data if isinstance(data, dict) else None
+        with _ROUTE_CACHE_LOCK:
+            _ROUTE_CACHE[cache_key] = (mtime_ns, time.time(), payload)
+        return dict(payload) if isinstance(payload, dict) else None
     except Exception:
         return None
 
 
-# ---------------------------------------------------------------------------
-# 圆形选区状态
-# ---------------------------------------------------------------------------
-
-def load_circle_state(state_file: str) -> dict | None:
-    """从本地 JSON 文件恢复圆形选区状态，失败返回 None。"""
-    if not os.path.isfile(state_file):
-        return None
-    try:
-        with open(state_file, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def save_circle_state(state_file: str, cx: float, cy: float, r: float) -> bool:
-    """将圆形选区状态写入本地 JSON 文件，返回是否成功。"""
-    try:
-        data = {'cx': cx, 'cy': cy, 'r': r, 'ts': time.time()}
-        with open(state_file, 'w') as f:
-            json.dump(data, f)
-        print(f"💾 圆形选区已保存: cx={cx:.4f}, cy={cy:.4f}, r={r:.4f}")
-        return True
-    except Exception as e:
-        print(f"[警告] 保存圆形选区失败: {e}")
-        return False

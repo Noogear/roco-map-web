@@ -8,7 +8,7 @@ $:
       services:
         - name: vscode
           options:
-            launch: uv run run_web.py
+            launch: SOCKETIO_ASYNC_MODE=gevent uv run run_web.py
             keepAliveTimeout: 3600000
             daemon: true
             backup: true
@@ -26,7 +26,7 @@ $:
         - name: vscode
           options:
             onlyPreview: true
-            launch: uv run run_web.py
+            launch: SOCKETIO_ASYNC_MODE=gevent uv run run_web.py
             keepAliveTimeout: 3600000
             daemon: true
             backup: true

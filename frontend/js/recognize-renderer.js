@@ -1,0 +1,164 @@
+/* recognize-renderer.js — 共享工具、RAF 循环、PiP、模式切换调度
+ *
+ * 渲染策略由独立模块导入：
+ *   recognize-renderer-fullmap.js  →  RenderModeFullmap
+ *   recognize-renderer-jpeg.js     →  RenderModeJpeg
+ *
+ * R.modeStrategy 指向当前活跃策略，所有渲染/图像处理均委托给它：
+ *   .render(ctx, R, ext, drawArrow)    绘制一帧
+ *   .onPositionUpdate(R)               新位置坐标到达
+ *   .onImageResult(src, R)             收到后端图像数据
+ *   .onEnter(R)                        进入该模式
+ *   .onLeave(R)                        离开该模式
+ */
+import * as AppCommon from './common.js';
+import TC from './tracker-core.js';
+import RenderModeFullmap from './recognize-renderer-fullmap.js';
+import RenderModeJpeg from './recognize-renderer-jpeg.js';
+
+export const RecognizeRenderer = {
+    setup: function (R) {
+        'use strict';
+
+        /* ── Catmull-Rom 插值 ── */
+        function catmullRom(p0, p1, p2, p3, t) {
+            var t2 = t * t, t3 = t2 * t;
+            return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+        }
+
+        function getExtrapolatedPos() {
+            if (!R.mapState) return null;
+            if (!R.mapState.found) return R.mapState;
+            var h = R.mapHistory;
+            if (h.length < 2) return R.mapState;
+            var prev = h[h.length - 2], curr = h[h.length - 1];
+            var interval = curr.ts - prev.ts;
+            if (interval < 10) return curr;
+            var jdx = curr.x - prev.x, jdy = curr.y - prev.y;
+            if (jdx * jdx + jdy * jdy > 400 * 400) return curr;
+            var t = Math.min(Math.max((performance.now() - interval - prev.ts) / interval, 0), 1);
+            var rx, ry;
+            if (h.length >= 4) {
+                var p0 = h[h.length - 4], p1 = h[h.length - 3];
+                rx = catmullRom(p0.x, p1.x, prev.x, curr.x, t);
+                ry = catmullRom(p0.y, p1.y, prev.y, curr.y, t);
+            } else if (h.length >= 3) {
+                var p0b = h[h.length - 3];
+                rx = catmullRom(p0b.x, p0b.x, prev.x, curr.x, t);
+                ry = catmullRom(p0b.y, p0b.y, prev.y, curr.y, t);
+            } else {
+                rx = prev.x + t * jdx; ry = prev.y + t * jdy;
+            }
+            return { x: rx, y: ry, angle: curr.angle, stopped: curr.stopped, found: curr.found, isInertial: curr.isInertial, isSceneChange: curr.isSceneChange };
+        }
+
+        function drawArrow(ctx, cx, cy, angle, stopped) {
+            var size = 12;
+            ctx.save(); ctx.translate(cx, cy); ctx.rotate((angle || 0) * Math.PI / 180);
+            ctx.fillStyle = 'rgba(48,182,254,0.86)';
+            if (stopped) {
+                ctx.beginPath(); ctx.arc(0, 0, Math.round(size * 0.6), 0, Math.PI * 2); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+            } else {
+                ctx.beginPath(); ctx.moveTo(0, -size); ctx.lineTo(-size * 0.6, size * 0.7); ctx.lineTo(size * 0.6, size * 0.7); ctx.closePath(); ctx.fill();
+                ctx.strokeStyle = '#fff'; ctx.lineWidth = 1; ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        /* ── 安装 displayMap 生命周期（全图模式专用，供策略对象使用） ── */
+        RenderModeFullmap.setupOnR(R);
+
+        /* ── 初始化活跃策略 ── */
+        R.modeStrategy = R.renderMode === 'jpeg' ? RenderModeJpeg : RenderModeFullmap;
+
+        /* ── 主渲染：委托给当前策略 ── */
+        R.renderMapCanvas = function () {
+            var ctx = R.resultCanvas.getContext('2d');
+            var ext = getExtrapolatedPos();
+            R.modeStrategy.render(ctx, R, ext, drawArrow);
+        };
+
+        /* ── RAF 循环 ── */
+        R.startMapRAF = function () {
+            if (R.mapRAFActive) return;
+            R.mapRAFActive = true;
+            (function loop() {
+                if (!R.mapRAFActive) return;
+                /* Skip rendering when tab is hidden to avoid GPU work piling up */
+                if (document.hidden) { requestAnimationFrame(loop); return; }
+                try { R.renderMapCanvas(); } catch (e) { console.error(e); }
+                if (R.pipRAFActive) { try { R.updatePiPCanvas(); } catch (_) {} }
+                requestAnimationFrame(loop);
+            })();
+        };
+
+        /* ── PiP ── */
+        R.updatePiPCanvas = function () {
+            var ctx = document.getElementById('pipCanvas').getContext('2d');
+            ctx.drawImage(R.resultCanvas, 0, 0, 400, 400);
+        };
+
+        function stopPiPRefresh() { R.pipRAFActive = false; }
+
+        function isNativePiPActive() {
+            var v = document.getElementById('pipVideo');
+            return document.pictureInPictureElement === v || v.webkitPresentationMode === 'picture-in-picture';
+        }
+
+        R.resetPiPButtonState = function () {
+            R.pipBtn.classList.remove('is-active');
+            stopPiPRefresh();
+        };
+
+        R.toggleNativePiP = async function () {
+            try {
+                if (isNativePiPActive()) {
+                    if (document.pictureInPictureElement) await document.exitPictureInPicture();
+                    else document.getElementById('pipVideo').webkitSetPresentationMode('inline');
+                    R.resetPiPButtonState(); return;
+                }
+                var pipCanvas = document.getElementById('pipCanvas');
+                var pipVideo = document.getElementById('pipVideo');
+                R.updatePiPCanvas();
+                pipVideo.srcObject = pipCanvas.captureStream(30);
+                if (!R.pipEventsBound) {
+                    R.pipEventsBound = true;
+                    pipVideo.addEventListener('leavepictureinpicture', function () { R.resetPiPButtonState(); TC.log('✅ 原生画中画已关闭'); });
+                    pipVideo.addEventListener('webkitpresentationmodechanged', function () { if (pipVideo.webkitPresentationMode !== 'picture-in-picture') R.resetPiPButtonState(); });
+                }
+                await pipVideo.play();
+                var support = R.getPiPSupport();
+                if (support.standard) await pipVideo.requestPictureInPicture();
+                else pipVideo.webkitSetPresentationMode('picture-in-picture');
+                R.pipBtn.classList.add('is-active');
+                R.pipRAFActive = true;
+                (function pipLoop() { if (!R.pipRAFActive) return; if (!R.mapRAFActive) R.updatePiPCanvas(); requestAnimationFrame(pipLoop); })();
+                TC.log('✅ 原生浏览器画中画已开启');
+            } catch (err) {
+                R.resetPiPButtonState();
+                AppCommon.toast('画中画启动失败：' + err.message, 'danger');
+            }
+        };
+
+        /* ── 模式切换按钮 ── */
+        R.updateRenderModeBtn = function () {
+            var btn = document.getElementById('renderModeBtn');
+            var isFullmap = R.modeStrategy.id === 'fullmap';
+            btn.textContent = isFullmap ? '🗺️ 全图' : '📸 JPEG';
+            btn.title = isFullmap
+                ? '当前：全图模式（60fps平滑，无边界）\n点击切换到 JPEG 模式（轻量低流量）'
+                : '当前：JPEG 模式（轻量低流量）\n点击切换到全图模式（60fps平滑，无边界）';
+        };
+
+        R.toggleRenderMode = function () {
+            var next = R.modeStrategy.id === 'fullmap' ? RenderModeJpeg : RenderModeFullmap;
+            R.modeStrategy.onLeave(R);
+            R.modeStrategy = next;
+            R.renderMode = next.id;   /* 保留 renderMode 字段兼容旧引用 */
+            AppCommon.updatePref('preferJpegMode', next.id === 'jpeg');
+            R.updateRenderModeBtn();
+            next.onEnter(R);
+        };
+    }
+};

@@ -15,6 +15,7 @@ _debug/
 
 # 临时环境/实验目录
 .tmp_prebuilt_env/
+tests/
 
 # 忽略 IDE 配置文件
 .idea/
@@ -26,3 +27,9 @@ _debug/
 
 # 临时截图样本（保留 picture/ 目录本身，忽略临时 QQ 截图）
 picture/
+output/
+rocom_assets/
+
+
+test*.py
+_debug*.py

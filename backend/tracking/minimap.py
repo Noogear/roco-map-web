@@ -33,6 +33,21 @@ class CircleCalibrator:
         self.expected_r: int | None = None
         self._consecutive_miss: int = 0
 
+    def restore(self, cx: int, cy: int, r: int) -> None:
+        """
+        从持久化状态恢复校准，跳过 N 帧校准期。
+        直接进入 calibrated 状态并填充历史以稳定后续校验。
+        """
+        n_cal = getattr(config, 'MINIMAP_CIRCLE_CALIBRATION_FRAMES', 8)
+        self._history.clear()
+        for _ in range(n_cal):
+            self._history.append((cx, cy, r))
+        self.expected_cx = cx
+        self.expected_cy = cy
+        self.expected_r = r
+        self._calibrated = True
+        self._consecutive_miss = 0
+
     def update(self, cx: int, cy: int, r: int) -> None:
         self._history.append((cx, cy, r))
         self._consecutive_miss = 0
@@ -66,6 +81,74 @@ class CircleCalibrator:
             self._consecutive_miss = 0
             print("[圆校准] 连续未检测到小地图圆，重置校准（可能分辨率/UI 变化）")
 
+    def reseed(self, cx: int, cy: int, r: int) -> None:
+        """
+        冻结态恢复时用新检测到的圆重新播种。
+
+        注意：这里故意不直接进入 calibrated 状态，避免加载场景/切分辨率后
+        把单帧噪声固化成严格阈值；后续正常帧会重新积累历史并收敛。
+        """
+        self._history.clear()
+        self._history.append((cx, cy, r))
+        self._calibrated = False
+        self.expected_cx = None
+        self.expected_cy = None
+        self.expected_r = None
+        self._consecutive_miss = 0
+
+    def to_dict(self) -> dict | None:
+        """序列化校准状态，未校准时返回 None。"""
+        if not self._calibrated:
+            return None
+        return {'cx': self.expected_cx, 'cy': self.expected_cy, 'r': self.expected_r}
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> 'CircleCalibrator':
+        """从持久化数据恢复。"""
+        cal = cls()
+        if data and all(k in data for k in ('cx', 'cy', 'r')):
+            cal.restore(data['cx'], data['cy'], data['r'])
+        return cal
+
+
+def _score_local_circle(gray: np.ndarray, edges: np.ndarray, cx: int, cy: int, r: int) -> float:
+    """对局部方形截取中的候选圆打分（中心贴近度 + 边缘环强度 + 半径合理性）。"""
+    h, w = gray.shape[:2]
+    base = float(min(h, w))
+    if base <= 0:
+        return 0.0
+
+    # 1) 越靠近方形中心越好
+    center_dist = math.sqrt((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2)
+    center_score = max(0.0, 1.0 - center_dist / max(base * 0.30, 1.0))
+
+    # 2) 半径应与截取 margin 匹配：r / base ≈ 1 / (2 * capture_margin)
+    capture_margin = max(1.0, float(getattr(config, 'MINIMAP_CAPTURE_MARGIN', 1.4)))
+    expected_ratio = 1.0 / (2.0 * capture_margin)
+    r_ratio = r / base
+    size_score = max(0.0, 1.0 - abs(r_ratio - expected_ratio) / max(expected_ratio * 0.65, 1e-6))
+
+    # 3) 圆环边缘强度：候选半径附近应有明显边缘响应
+    pad = max(2, int(r * 1.25))
+    x1 = max(0, cx - pad)
+    y1 = max(0, cy - pad)
+    x2 = min(w, cx + pad)
+    y2 = min(h, cy + pad)
+    roi = edges[y1:y2, x1:x2]
+    if roi.size == 0:
+        return 0.0
+
+    yy, xx = np.ogrid[y1:y2, x1:x2]
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    band = max(2.0, r * 0.12)
+    ring_mask = (dist >= (r - band)) & (dist <= (r + band))
+    if not np.any(ring_mask):
+        edge_score = 0.0
+    else:
+        edge_score = float(np.mean(roi[ring_mask]) / 255.0)
+
+    return 0.45 * center_score + 0.35 * edge_score + 0.20 * size_score
+
 
 def detect_and_extract(
     square_bgr: np.ndarray,
@@ -86,8 +169,11 @@ def detect_and_extract(
     gray = cv2.cvtColor(square_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
 
-    min_r = getattr(config, 'MINIMAP_MIN_RADIUS', 60)
-    max_r = getattr(config, 'MINIMAP_MAX_RADIUS', 160)
+    base = min(h, w)
+    min_ratio = float(getattr(config, 'MINIMAP_LOCAL_MIN_RADIUS_RATIO', 0.22))
+    max_ratio = float(getattr(config, 'MINIMAP_LOCAL_MAX_RADIUS_RATIO', 0.48))
+    min_r = max(10, int(base * min_ratio))
+    max_r = min(int(base * 0.49), max(min_r + 6, int(base * max_ratio)))
     param1 = getattr(config, 'HOUGH_PARAM1', 50)
     param2 = getattr(config, 'HOUGH_PARAM2', 30)
 
@@ -104,24 +190,33 @@ def detect_and_extract(
         return None
 
     circles = np.round(circles[0, :]).astype(int)
+    edges = cv2.Canny(blurred, 60, 160)
 
-    # 取最靠近图像中心的圆
-    cx_img, cy_img = w / 2, h / 2
-    best, best_dist = None, float('inf')
+    # 综合评分选最优圆：平时更稳，冻结态也能在跳过旧校准时尽量避免误判
+    best, best_score = None, -1.0
     for c in circles:
-        d = math.sqrt((c[0] - cx_img) ** 2 + (c[1] - cy_img) ** 2)
-        if d < best_dist:
-            best_dist = d
+        score = _score_local_circle(gray, edges, int(c[0]), int(c[1]), int(c[2]))
+        if score > best_score:
+            best_score = score
             best = c
 
-    det_cx, det_cy, det_r = int(best[0]), int(best[1]), int(best[2])
-
-    if not calibrator.is_valid(det_cx, det_cy, det_r):
+    if best is None or best_score < float(getattr(config, 'MINIMAP_LOCAL_MIN_SCORE', 0.22)):
         if not engine_frozen:
             calibrator.record_miss()
         return None
 
-    calibrator.update(det_cx, det_cy, det_r)
+    det_cx, det_cy, det_r = int(best[0]), int(best[1]), int(best[2])
+
+    if engine_frozen:
+        # 冻结态：
+        # 1) 不使用旧校准严格拒绝（否则分辨率/UI 改变后可能永远 thaw 不回来）
+        # 2) 不把当前结果直接固化成 calibrated，仅重新播种，等待正常帧重新收敛
+        calibrator.reseed(det_cx, det_cy, det_r)
+    else:
+        if not calibrator.is_valid(det_cx, det_cy, det_r):
+            calibrator.record_miss()
+            return None
+        calibrator.update(det_cx, det_cy, det_r)
 
     x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
     x2, y2 = min(w, det_cx + det_r), min(h, det_cy + det_r)
