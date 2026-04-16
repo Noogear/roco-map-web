@@ -103,11 +103,43 @@ def create_orb_beblid_feature2d() -> ORBBeblidFeature2D:
 # 圆形掩码（带 LRU 缓存）
 # ---------------------------------------------------------------------------
 
-def make_circular_mask(h: int, w: int, inner_ratio: float = 0.0) -> np.ndarray:
+def _resolve_circular_mask_geometry(
+    h: int,
+    w: int,
+    *,
+    center: tuple[float, float] | None = None,
+    radius: float | None = None,
+) -> tuple[int, int, int]:
+    if center is None:
+        cx = w / 2.0
+        cy = h / 2.0
+    else:
+        cx = float(center[0])
+        cy = float(center[1])
+
+    if radius is None:
+        base_radius = min(cx, cy, max(0.0, w - cx), max(0.0, h - cy))
+    else:
+        base_radius = float(radius)
+
+    margin_ratio = float(getattr(config, 'MINIMAP_MASK_EDGE_MARGIN_RATIO', 0.08))
+    min_margin = int(getattr(config, 'MINIMAP_MASK_EDGE_MARGIN_MIN_PIXELS', 6))
+    margin = max(2, min_margin, int(round(base_radius * margin_ratio)))
+    outer_radius = max(1, int(round(base_radius - margin)))
+    return int(round(cx)), int(round(cy)), outer_radius
+
+
+def make_circular_mask(
+    h: int,
+    w: int,
+    inner_ratio: float = 0.0,
+    *,
+    center: tuple[float, float] | None = None,
+    radius: float | None = None,
+) -> np.ndarray:
     """生成大小为 (h, w) 的圆形掩码；可选中心挖空（用于排除玩家箭头）。"""
     mask = np.zeros((h, w), dtype=np.uint8)
-    cx, cy = w // 2, h // 2
-    r_outer = min(cx, cy) - 2
+    cx, cy, r_outer = _resolve_circular_mask_geometry(h, w, center=center, radius=radius)
     cv2.circle(mask, (cx, cy), r_outer, 255, -1)
     if inner_ratio > 0:
         r_inner = max(1, int(round(r_outer * float(inner_ratio))))
@@ -122,12 +154,22 @@ class CircularMaskCache:
     def __init__(self) -> None:
         self._cache: dict[tuple[int, int, int], np.ndarray] = {}
 
-    def get(self, h: int, w: int, inner_ratio: float = 0.0) -> np.ndarray:
-        cx, cy = w // 2, h // 2
-        r_outer = max(1, min(cx, cy) - 2)
+    def get(
+        self,
+        h: int,
+        w: int,
+        inner_ratio: float = 0.0,
+        *,
+        center: tuple[float, float] | None = None,
+        radius: float | None = None,
+    ) -> np.ndarray:
+        if center is not None or radius is not None:
+            return make_circular_mask(h, w, inner_ratio, center=center, radius=radius)
+
+        _, _, r_outer = _resolve_circular_mask_geometry(h, w)
         ratio = max(0.0, min(0.95, float(inner_ratio)))
         inner_px = int(round(r_outer * ratio)) if ratio > 0 else 0
-        key = (h, w, inner_px)
+        key = (h, w, inner_px, r_outer)
         if key not in self._cache:
             self._cache[key] = make_circular_mask(h, w, inner_px / float(r_outer))
         return self._cache[key]
@@ -169,6 +211,8 @@ def extract_minimap_features(
     *,
     texture_std: float | None = None,
     inner_ratio: float | None = None,
+    mask_center: tuple[float, float] | None = None,
+    mask_radius: float | None = None,
 ) -> tuple[list | None, np.ndarray | None]:
     """提取小地图特征（带圆形掩码）。返回 (kp, des) 或 (None, None)。
 
@@ -190,7 +234,12 @@ def extract_minimap_features(
         else:
             inner_ratio = r_urban
 
-    mask = mask_cache.get(h, w, inner_ratio=inner_ratio)
+    mask = mask_cache.get(
+        h, w,
+        inner_ratio=inner_ratio,
+        center=mask_center,
+        radius=mask_radius,
+    )
 
     kp, des = sift.detectAndCompute(minimap_gray, mask)
     if des is None or len(kp) < 2:
@@ -285,6 +334,7 @@ def match_region(
     map_width: int,
     map_height: int,
     *,
+    minimap_center: tuple[float, float] | None = None,
     use_gms: bool = False,
     gms_train_shape: tuple[int, int] | None = None,
     gms_min_matches: int = 20,
@@ -363,7 +413,11 @@ def match_region(
         return None
 
     h, w = mm_shape[:2]
-    center_src = np.array([w / 2.0, h / 2.0, 1.0], dtype=np.float64)
+    if minimap_center is None:
+        center_x, center_y = w / 2.0, h / 2.0
+    else:
+        center_x, center_y = float(minimap_center[0]), float(minimap_center[1])
+    center_src = np.array([center_x, center_y, 1.0], dtype=np.float64)
     dst_center = M @ center_src
     tx, ty = int(dst_center[0]), int(dst_center[1])
 

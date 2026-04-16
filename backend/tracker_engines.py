@@ -510,14 +510,16 @@ class FeatureMapTracker:
         return nearby_kp, nearby_des, nearby_flann
 
     def _try_nearby_match_stack(self, kp_mini, des_mini, minimap_gray, hint_x, hint_y,
-                                radius, allow_ecc=True, source_prefix=''):
+                                radius, allow_ecc=True, source_prefix='',
+                                minimap_center: tuple[float, float] | None = None):
         """复用的附近搜索链：SIFT nearby → 可选 ECC → Template Matching兜底。"""
         nearby_kp, nearby_des, nearby_flann = self._get_or_build_nearby_flann(hint_x, hint_y, radius)
         if nearby_flann is not None:
             result = match_region(
                 kp_mini, des_mini, minimap_gray.shape,
                 nearby_kp, nearby_flann, 0.90, 3,
-                self.map_width, self.map_height)
+                self.map_width, self.map_height,
+                minimap_center=minimap_center)
             if result is not None:
                 tx, ty, inlier_count, quality, avg_scale = result
                 if abs(tx - hint_x) + abs(ty - hint_y) < self.JUMP_THRESHOLD * 1.5:
@@ -537,7 +539,8 @@ class FeatureMapTracker:
         return None
 
     def _consume_freeze_resume_match(self, kp_mini, des_mini, minimap_gray,
-                                     match_ratio, min_match):
+                                     match_ratio, min_match,
+                                     minimap_center: tuple[float, float] | None = None):
         """消费一次冻结恢复提示：local → nearby → hash 粗定位。"""
         hint = self._pending_freeze_resume_hint
         self._pending_freeze_resume_hint = None
@@ -555,7 +558,8 @@ class FeatureMapTracker:
             result = match_region(
                 kp_mini, des_mini, minimap_gray.shape,
                 kp_local, flann_local, match_ratio, min_match,
-                self.map_width, self.map_height)
+                self.map_width, self.map_height,
+                minimap_center=minimap_center)
             if result is not None:
                 tx, ty, inlier_count, quality, avg_scale = result
                 if abs(tx - hint_x) + abs(ty - hint_y) < self.JUMP_THRESHOLD * 1.5:
@@ -567,7 +571,8 @@ class FeatureMapTracker:
             kp_mini, des_mini, minimap_gray,
             hint_x, hint_y, radius,
             allow_ecc=False,
-            source_prefix='FREEZE_RESUME')
+            source_prefix='FREEZE_RESUME',
+            minimap_center=minimap_center)
         if nearby is not None:
             return nearby
 
@@ -865,7 +870,8 @@ class FeatureMapTracker:
     def _maybe_revalidate_local_match(self, kp_mini, des_mini, mm_shape,
                                       ratio, min_match, local_match, tp_far_candidate,
                                       frame_cfg: dict | None = None,
-                                      low_texture_like: bool = False):
+                                      low_texture_like: bool = False,
+                                      minimap_center: tuple[float, float] | None = None):
         tx, ty, inlier_count, quality, avg_scale, source = local_match
         self._local_success_streak += 1
         need_validate = (
@@ -906,6 +912,7 @@ class FeatureMapTracker:
             kp_mini, des_mini, mm_shape,
             self.kp_big_all, (self.flann_global_lsh if _use_lsh else self.flann_global), ratio, min_match,
             self.map_width, self.map_height,
+            minimap_center=minimap_center,
             use_gms=_use_gms,
             gms_train_shape=(self.map_height, self.map_width),
             gms_min_matches=int(_frame_cfg.get('matcher_gms_min_matches', 20)),
@@ -1194,11 +1201,19 @@ class FeatureMapTracker:
         }
 
     # ---- 核心匹配 ----
-    def match(self, minimap_bgr):
+    def match(self, minimap_bgr, *,
+              minimap_center: tuple[float, float] | None = None,
+              minimap_radius: float | None = None):
         with self._lock:
-            return self._match_impl(minimap_bgr)
+            return self._match_impl(
+                minimap_bgr,
+                minimap_center=minimap_center,
+                minimap_radius=minimap_radius,
+            )
 
-    def _match_impl(self, minimap_bgr):
+    def _match_impl(self, minimap_bgr, *,
+                    minimap_center: tuple[float, float] | None = None,
+                    minimap_radius: float | None = None):
         frame_cfg = self._build_frame_runtime_config()
         found = False
         center_x, center_y = None, None
@@ -1302,7 +1317,9 @@ class FeatureMapTracker:
         if not found:
             # 提取特征
             kp_mini, des_mini = extract_minimap_features(minimap_gray, self.sift, self._mask_cache,
-                                                           texture_std=texture_std)
+                                                           texture_std=texture_std,
+                                                           mask_center=minimap_center,
+                                                           mask_radius=minimap_radius)
 
             # 超低/低纹理 + 特征过少 → 更激进的预处理重试
             # 方案A: 扩展到 low_texture（海岸线），不只限于 ocean
@@ -1311,7 +1328,9 @@ class FeatureMapTracker:
                                            self._clahe_normal, self._clahe_low,
                                            self._low_texture_thresh)
                 kp_retry, des_retry = extract_minimap_features(enhanced, self.sift, self._mask_cache,
-                                                                texture_std=texture_std)
+                                                                texture_std=texture_std,
+                                                                mask_center=minimap_center,
+                                                                mask_radius=minimap_radius)
                 if des_retry is not None and len(kp_retry) > (len(kp_mini) if kp_mini is not None else 0):
                     kp_mini, des_mini = kp_retry, des_retry
 
@@ -1332,7 +1351,8 @@ class FeatureMapTracker:
                 # ---- 冻结恢复首帧：先尝试旧坐标/局部索引的轻量恢复，再决定是否进入常规重定位 ----
                 resume_match = self._consume_freeze_resume_match(
                     kp_mini, des_mini, minimap_gray,
-                    eff_match_ratio, eff_min_match)
+                    eff_match_ratio, eff_min_match,
+                    minimap_center=minimap_center)
                 if resume_match is not None:
                     tx, ty, quality, avg_scale, source, match_count = resume_match
                     found, center_x, center_y, match_quality = True, tx, ty, quality
@@ -1380,6 +1400,7 @@ class FeatureMapTracker:
                         kp_mini, des_mini, minimap_gray.shape,
                         current_kp, current_flann, eff_match_ratio, eff_min_match,
                         self.map_width, self.map_height,
+                        minimap_center=minimap_center,
                         use_gms=_use_gms,
                         gms_train_shape=(self.map_height, self.map_width) if _is_global_round else None,
                         gms_min_matches=frame_cfg['matcher_gms_min_matches'],
@@ -1413,7 +1434,8 @@ class FeatureMapTracker:
                                 kp_mini, des_mini, minimap_gray.shape,
                                 eff_match_ratio, eff_min_match, local_match, _tp_far_candidate,
                                 frame_cfg=frame_cfg,
-                                low_texture_like=low_texture_like)
+                                low_texture_like=low_texture_like,
+                                minimap_center=minimap_center)
                             if local_match is None:
                                 self._local_success_streak = 0
                                 break
@@ -1441,7 +1463,8 @@ class FeatureMapTracker:
                         kp_mini, des_mini, minimap_gray,
                         self.last_x, self.last_y, nr,
                         allow_ecc=True,
-                        source_prefix='')
+                        source_prefix='',
+                        minimap_center=minimap_center)
                     if nearby_match is not None:
                         tx, ty, quality, avg_scale, source, match_count = nearby_match
                         found, center_x, center_y = True, tx, ty
@@ -1488,7 +1511,9 @@ class FeatureMapTracker:
                 # inner_ratio 固定用 hard 值，排除玩家箭头对 S 通道的干扰
                 kp_sat_mini, des_sat_mini = extract_minimap_features(
                     _sat_mini, self.sift, self._mask_cache,
-                    texture_std=None, inner_ratio=0.18)
+                    texture_std=None, inner_ratio=0.18,
+                    mask_center=minimap_center,
+                    mask_radius=minimap_radius)
                 if des_sat_mini is not None:
                     _sat_ratio = frame_cfg['sat_match_ratio']
                     _sat_min = frame_cfg['sat_min_match']
@@ -1496,7 +1521,8 @@ class FeatureMapTracker:
                         kp_sat_mini, des_sat_mini, _sat_mini.shape,
                         self.kp_big_sat, self.flann_global_sat,
                         _sat_ratio, _sat_min,
-                        self.map_width, self.map_height)
+                        self.map_width, self.map_height,
+                        minimap_center=minimap_center)
                     if _res_sat is not None:
                         tx, ty, inlier_count, quality, avg_scale = _res_sat
                         _jmp_ok = (self.last_x is None

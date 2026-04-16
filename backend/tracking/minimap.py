@@ -9,11 +9,21 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from backend import config
+
+
+@dataclass(frozen=True)
+class MinimapCrop:
+    """小地图裁剪结果：保留图像及其真实物理圆心/半径。"""
+
+    image: np.ndarray
+    center_xy: tuple[float, float]
+    radius: int
 
 
 class CircleCalibrator:
@@ -150,16 +160,22 @@ def _score_local_circle(gray: np.ndarray, edges: np.ndarray, cx: int, cy: int, r
     return 0.45 * center_score + 0.35 * edge_score + 0.20 * size_score
 
 
-def _extract_circle_crop(square_bgr: np.ndarray, cx: int, cy: int, r: int) -> np.ndarray | None:
-    """按圆参数裁剪小地图，失败返回 None。"""
+def _extract_circle_crop(square_bgr: np.ndarray, cx: int, cy: int, r: int) -> MinimapCrop | None:
+    """按圆参数裁剪小地图，保留裁剪后图中的真实圆心位置。"""
     h, w = square_bgr.shape[:2]
     x1, y1 = max(0, cx - r), max(0, cy - r)
     x2, y2 = min(w, cx + r), min(h, cy + r)
     minimap = square_bgr[y1:y2, x1:x2].copy()
-    return minimap if minimap.size >= 100 else None
+    if minimap.size < 100:
+        return None
+    return MinimapCrop(
+        image=minimap,
+        center_xy=(float(cx - x1), float(cy - y1)),
+        radius=int(r),
+    )
 
 
-def _extract_expected_circle_crop(square_bgr: np.ndarray, calibrator: CircleCalibrator) -> np.ndarray | None:
+def _extract_expected_circle_crop(square_bgr: np.ndarray, calibrator: CircleCalibrator) -> MinimapCrop | None:
     """按当前校准器的期望圆参数裁剪小地图。"""
     if not (calibrator._calibrated and calibrator.expected_cx is not None and calibrator.expected_r is not None):
         return None
@@ -167,11 +183,11 @@ def _extract_expected_circle_crop(square_bgr: np.ndarray, calibrator: CircleCali
     return _extract_circle_crop(square_bgr, int(det_cx), int(det_cy), int(det_r))
 
 
-def detect_and_extract(
+def detect_and_extract_with_meta(
     square_bgr: np.ndarray,
     calibrator: CircleCalibrator,
     engine_frozen: bool,
-) -> np.ndarray | None:
+) -> MinimapCrop | None:
     """
     从方形截取区域中检测圆形小地图并提取内容。
 
@@ -181,7 +197,7 @@ def detect_and_extract(
         engine_frozen: 当前 SIFT 引擎是否处于冻结状态
 
     Returns:
-        小地图 BGR 图像，或 None（未检测到有效小地图）
+        包含小地图图像、真实圆心相对坐标和半径的裁剪结果；失败返回 None。
     """
     gray = cv2.cvtColor(square_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
@@ -244,3 +260,13 @@ def detect_and_extract(
         calibrator.update(det_cx, det_cy, det_r)
 
     return _extract_circle_crop(square_bgr, int(det_cx), int(det_cy), int(det_r))
+
+
+def detect_and_extract(
+    square_bgr: np.ndarray,
+    calibrator: CircleCalibrator,
+    engine_frozen: bool,
+) -> np.ndarray | None:
+    """兼容旧接口：仅返回小地图图像。"""
+    extracted = detect_and_extract_with_meta(square_bgr, calibrator, engine_frozen)
+    return None if extracted is None else extracted.image

@@ -131,9 +131,11 @@ MINIMAP_CIRCLE_RECALIBRATE_MISS = 30
 MINIMAP_LOCAL_MIN_RADIUS_RATIO = 0.22   # 局部方形截取中，小地图半径占短边的最小比例
 MINIMAP_LOCAL_MAX_RADIUS_RATIO = 0.48   # 局部方形截取中，小地图半径占短边的最大比例
 MINIMAP_LOCAL_MIN_SCORE = 0.22          # 局部圆检测最低接受分（冻结态重建时防误判）
+MINIMAP_MASK_EDGE_MARGIN_RATIO = 0.08   # 小地图圆形 mask 外圈内缩比例，避免 UI 边框/阴影泄漏
+MINIMAP_MASK_EDGE_MARGIN_MIN_PIXELS = 6 # 小地图圆形 mask 最小内缩像素
 MINIMAP_CENTER_EXCLUDE_RATIO = 0.16        # 高纹理场景（urban）挖空比例
-MINIMAP_CENTER_EXCLUDE_RATIO_MIXED = 0.17  # 混合纹理场景（mixed）挖空比例
-MINIMAP_CENTER_EXCLUDE_RATIO_HARD = 0.18  # 低纹理/海洋场景（low_texture/ocean）挖空比例
+MINIMAP_CENTER_EXCLUDE_RATIO_MIXED = 0.18  # 混合纹理场景（mixed）挖空比例
+MINIMAP_CENTER_EXCLUDE_RATIO_HARD = 0.20  # 低纹理/海洋场景（low_texture/ocean）挖空比例
 
 # --- 全帧自动识别小地图圆（Web 屏幕捕获用） ---
 AUTO_DETECT_MAX_SIDE = 1280             # 自动定位前整帧缩放的最大边，平衡速度与精度

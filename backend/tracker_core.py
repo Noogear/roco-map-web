@@ -23,7 +23,7 @@ from threading import Lock, Thread, Event
 from backend import config
 from backend.tracker_engines import FeatureMapTracker, SharedFeatureResources, get_shared_feature
 from backend.core.data_standards import DataScope, bind_scope
-from backend.tracking.minimap import CircleCalibrator, detect_and_extract
+from backend.tracking.minimap import CircleCalibrator, detect_and_extract_with_meta
 from backend.tracking.smoother import CoordSmoother
 
 
@@ -156,7 +156,7 @@ class MapTrackerWeb:
     # ========== 场景切换检测 ==========
 
     def _detect_and_extract_minimap(self, square_bgr):
-        return detect_and_extract(square_bgr, self._circle_cal, self.feature_engine.frozen)
+        return detect_and_extract_with_meta(square_bgr, self._circle_cal, self.feature_engine.frozen)
 
     # ========== 公开 API ==========
 
@@ -436,17 +436,26 @@ class MapTrackerWeb:
         if extracted is None:
             return self._handle_missing_minimap(half_view)
 
+        if hasattr(extracted, 'image'):
+            extracted_image = extracted.image
+            extracted_center = getattr(extracted, 'center_xy', None)
+            extracted_radius = getattr(extracted, 'radius', None)
+        else:
+            extracted_image = extracted
+            extracted_center = None
+            extracted_radius = None
+
         # 小地图重现：解冻引擎状态（生成一次性恢复提示，首帧先走轻量恢复匹配）
         engine.resume_after_scene_change()
         self._scene_change_streak = 0   # 重置连续失帧计数
-        minimap_bgr = extracted  # 提取的圆内区域，与之前引擎输入格式一致
+        minimap_bgr = extracted_image  # 提取的圆内区域，与之前引擎输入格式一致
 
         # 解冻后：用冻结前后小地图 MAD 判断是否发生传送
         # 若 MAD 超阈值（画面截然不同），说明场景已切换到新地点，丢弃旧坐标恢复提示，走全局重定位
         _frozen_gray = getattr(engine, '_frozen_minimap_gray', None)
         if _frozen_gray is not None:
             engine._frozen_minimap_gray = None  # 单次消费
-            _cur_gray = cv2.cvtColor(extracted, cv2.COLOR_BGR2GRAY)
+            _cur_gray = cv2.cvtColor(extracted_image, cv2.COLOR_BGR2GRAY)
             _sz = min(64, _frozen_gray.shape[0], _frozen_gray.shape[1],
                       _cur_gray.shape[0], _cur_gray.shape[1])
             _sz = max(_sz, 16)
@@ -460,7 +469,16 @@ class MapTrackerWeb:
                 print(f'[解冻传送判定] MAD={_mad:.1f} > {_tp_mad_thresh} → 丢弃旧坐标提示，全局重定位')
         engine_snapshot = engine.snapshot_tracking_state()
 
-        result = engine.match(minimap_bgr)
+        try:
+            result = engine.match(
+                minimap_bgr,
+                minimap_center=extracted_center,
+                minimap_radius=extracted_radius,
+            )
+        except TypeError as exc:
+            if 'unexpected keyword argument' not in str(exc):
+                raise
+            result = engine.match(minimap_bgr)
 
         # A/B 原始跳点打点：仅统计真实匹配帧（非 inertial）
         self._ab_raw_jump = False

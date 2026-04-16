@@ -462,7 +462,7 @@ def recognize_single():
         enhance_minimap, make_clahe_pair, correct_color_temperature,
         classify_scene_by_color, make_scene_boosted_gray,
     )
-    from backend.tracking.minimap import detect_and_extract
+    from backend.tracking.minimap import detect_and_extract_with_meta
 
     img = _decode_image_from_request()
     if img is None:
@@ -471,13 +471,17 @@ def recognize_single():
     shared = get_shared_feature()
     input_h, input_w = img.shape[:2]
     source_tag = 'RAW'
+    minimap_center = None
+    minimap_radius = None
 
     # 1. 圆形小地图检测 + 提取（使用临时校准器，不影响共享状态）
     from backend.tracking.minimap import CircleCalibrator
     temp_cal = CircleCalibrator()
-    extracted = detect_and_extract(img, temp_cal, engine_frozen=False)
+    extracted = detect_and_extract_with_meta(img, temp_cal, engine_frozen=False)
     if extracted is not None:
-        img = extracted
+        img = extracted.image
+        minimap_center = extracted.center_xy
+        minimap_radius = extracted.radius
         source_tag = 'LOCAL_CIRCLE'
     else:
         # 1.1 当输入是整张截图时，尝试自动定位小地图圆后再裁剪
@@ -500,8 +504,13 @@ def recognize_single():
                 crop = img[ry:ry + sz, rx:rx + sz].copy()
 
                 # 再跑一次局部圆提取，确保进入与常规路径一致的小地图域
-                extracted2 = detect_and_extract(crop, CircleCalibrator(), engine_frozen=False)
-                img = extracted2 if extracted2 is not None else crop
+                extracted2 = detect_and_extract_with_meta(crop, CircleCalibrator(), engine_frozen=False)
+                if extracted2 is not None:
+                    img = extracted2.image
+                    minimap_center = extracted2.center_xy
+                    minimap_radius = extracted2.radius
+                else:
+                    img = crop
                 source_tag = f"AUTO_DETECT_{det.get('layout', 'full').upper()}"
 
     # 2. 预处理：色温补偿 + 场景细化 + CLAHE 增强
@@ -546,7 +555,12 @@ def recognize_single():
 
     # 3. 提取小地图特征点
     mask_cache = CircularMaskCache()
-    kp_mini, des_mini = extract_minimap_features(gray, shared.sift, mask_cache, texture_std=texture_std)
+    kp_mini, des_mini = extract_minimap_features(
+        gray, shared.sift, mask_cache,
+        texture_std=texture_std,
+        mask_center=minimap_center,
+        mask_radius=minimap_radius,
+    )
     if des_mini is None or len(kp_mini) < 3:
         return jsonify({
             'success': False,
@@ -583,6 +597,7 @@ def recognize_single():
         shared.kp_big_all, global_matcher,
         match_ratio, min_match,
         shared.map_width, shared.map_height,
+        minimap_center=minimap_center,
         use_gms=use_gms,
         gms_train_shape=(shared.map_height, shared.map_width),
         gms_min_matches=int(getattr(config, 'MATCHER_GMS_MIN_MATCHES', 20)),
@@ -596,6 +611,7 @@ def recognize_single():
             shared.kp_big_all, global_matcher,
             0.88, 3,
             shared.map_width, shared.map_height,
+            minimap_center=minimap_center,
             use_gms=use_gms,
             gms_train_shape=(shared.map_height, shared.map_width),
             gms_min_matches=int(getattr(config, 'MATCHER_GMS_MIN_MATCHES', 20)),
