@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "游戏地图跟点助手"
 requires-python = ">=3.9"
 dependencies = [
-    "opencv-python",
+    "opencv-contrib-python",
     "numpy",
     "mss",
     "Pillow",
@@ -20,14 +20,20 @@ dependencies = [
 
 [project.optional-dependencies]
 ai = [
-    "torch",
+    "torch>=2.2",
+    "torchvision>=0.17",
     "kornia",
+    "onnx>=1.18",
+    "onnxscript>=0.3",
+    "onnxruntime>=1.20",
+    "faiss-cpu>=1.9",
 ]
 
 [project.scripts]
 map-tracker-web  = "run_web:main"
 map-tracker-sift = "run_sift:run"
 map-tracker-build-frontend = "backend.frontend_build:main"
+map-tracker-ai-pipeline = "run_ai_pipeline:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

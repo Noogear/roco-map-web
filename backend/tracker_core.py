@@ -12,6 +12,8 @@ tracker_core.py - 追踪器编排层（无 Web 框架依赖）
 """
 
 import os
+import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -19,7 +21,7 @@ import base64
 from threading import Lock, Thread, Event
 
 from backend import config
-from backend.tracker_engines import SIFTMapTracker, SharedSIFTResources, get_shared_sift
+from backend.tracker_engines import FeatureMapTracker, SharedFeatureResources, get_shared_feature
 from backend.core.data_standards import DataScope, bind_scope
 from backend.tracking.minimap import CircleCalibrator, detect_and_extract
 from backend.tracking.smoother import CoordSmoother
@@ -51,16 +53,22 @@ class MapTrackerWeb:
     不包含任何 Web/Flask/SocketIO 代码。
     """
 
-    def __init__(self, session_id: str = 'default', shared: SharedSIFTResources | None = None):
+    def __getattr__(self, name):
+        # 兼容旧测试桩：仅注入 sift_engine 时，feature_engine 自动回退到 sift_engine。
+        if name == 'feature_engine' and 'sift_engine' in self.__dict__:
+            return self.__dict__['sift_engine']
+        raise AttributeError(f"{self.__class__.__name__!s} object has no attribute {name!r}")
+
+    def __init__(self, session_id: str = 'default', shared: SharedFeatureResources | None = None):
         bind_scope(self, DataScope.SESSION_SCOPED)
         # --- 会话标识 ---
         self.session_id = session_id
 
         # --- 加载引擎（共享只读资源）---
         if shared is None:
-            shared = get_shared_sift()
+            shared = get_shared_feature()
         self._shared = shared
-        self.sift_engine = SIFTMapTracker(shared)
+        self.feature_engine = FeatureMapTracker(shared)
         self.current_mode = 'sift'
 
         # 显示地图改为模块级共享单例
@@ -81,6 +89,13 @@ class MapTrackerWeb:
         self._render_revision = 0
         self._latest_result_image_revision = -1
         self._latest_result_jpeg_revision = -1
+
+        # === 轻量 A/B 指标（滚动窗口）===
+        self._ab_window_size = int(getattr(config, 'AB_METRICS_WINDOW', 300))
+        self._ab_latency_ms = deque(maxlen=max(20, self._ab_window_size))
+        self._ab_found_flags = deque(maxlen=max(20, self._ab_window_size))
+        self._ab_jump_flags = deque(maxlen=max(20, self._ab_window_size))
+        self._ab_prev_raw_xy: tuple[int, int] | None = None
 
         # 线性过滤器连续丢弃帧计数器已迁至 CoordSmoother
 
@@ -110,6 +125,13 @@ class MapTrackerWeb:
             'position': {'x': 0, 'y': 0},
             'found': False,
             'matches': 0,
+            'ab_metrics': {
+                'window': int(max(20, self._ab_window_size)),
+                'samples': 0,
+                'hit_rate': 0.0,
+                'jump_rate': 0.0,
+                'latency_p95_ms': 0.0,
+            },
         }
 
         # ========== 后台帧处理线程（解耦 SIFT 与 WebSocket 热路径）==========
@@ -129,12 +151,12 @@ class MapTrackerWeb:
             name='sift-worker',
         )
         self._worker_thread.start()
-        print("  ⚡ SIFT 后台处理线程已启动")
+        print("  [*] SIFT 后台处理线程已启动")
 
     # ========== 场景切换检测 ==========
 
     def _detect_and_extract_minimap(self, square_bgr):
-        return detect_and_extract(square_bgr, self._circle_cal, self.sift_engine.frozen)
+        return detect_and_extract(square_bgr, self._circle_cal, self.feature_engine.frozen)
 
     # ========== 公开 API ==========
 
@@ -183,7 +205,7 @@ class MapTrackerWeb:
         """full_reset 的实际实现，调用前必须持有 _process_lock。"""
         cleared = self.reset_history()
         # 重置 SIFT 引擎内部状态
-        eng = self.sift_engine
+        eng = self.feature_engine
         eng.last_x = None
         eng.last_y = None
         eng.lost_frames = 0
@@ -200,8 +222,8 @@ class MapTrackerWeb:
         eng._watchdog_accum_dx = 0.0
         eng._watchdog_accum_dy = 0.0
         eng._watchdog_suspect_streak = 0
-        eng._watchdog_last_sift_x = None
-        eng._watchdog_last_sift_y = None
+        eng._watchdog_last_feature_x = None
+        eng._watchdog_last_feature_y = None
         eng._watchdog_consecutive_ok = 0
         eng._watchdog_static_streak = 0
         eng._watchdog_hash_mismatch_streak = 0
@@ -231,6 +253,10 @@ class MapTrackerWeb:
         self._last_arrow_angle_out = 0
         self._last_arrow_stopped_out = True
         self._last_source = ''
+        self._ab_latency_ms.clear()
+        self._ab_found_flags.clear()
+        self._ab_jump_flags.clear()
+        self._ab_prev_raw_xy = None
         # 重置 latest_status
         self.latest_status = {
             'mode': 'sift',
@@ -238,6 +264,13 @@ class MapTrackerWeb:
             'position': {'x': 0, 'y': 0},
             'found': False,
             'matches': 0,
+            'ab_metrics': {
+                'window': int(max(20, self._ab_window_size)),
+                'samples': 0,
+                'hit_rate': 0.0,
+                'jump_rate': 0.0,
+                'latency_p95_ms': 0.0,
+            },
         }
         # 重置圆校准器
         cal = self._circle_cal
@@ -262,13 +295,13 @@ class MapTrackerWeb:
         """处理无有效小地图时的冻结 / 保持 / 预测路径。"""
         self._scene_change_streak += 1
         if self._scene_change_streak < self._scene_change_debounce:
-            last_pos = self.sift_engine.last_position
+            last_pos = self.feature_engine.last_position
             if last_pos is not None:
                 return self._render_hold_position(last_pos[0], last_pos[1], 'INERTIAL', half_view)
 
-        self.sift_engine.freeze_for_scene_change()
+        self.feature_engine.freeze_for_scene_change()
 
-        frozen_pos = self.sift_engine.frozen_position
+        frozen_pos = self.feature_engine.frozen_position
         if frozen_pos is not None:
             return self._render_hold_position(frozen_pos[0], frozen_pos[1], 'SCENE_CHANGE', half_view)
 
@@ -295,6 +328,32 @@ class MapTrackerWeb:
         with self._process_lock:
             return self._process_frame_locked(need_base64, need_jpeg)
 
+    def _update_ab_metrics(self, *, found: bool, raw_jump: bool, latency_ms: float):
+        self._ab_latency_ms.append(float(latency_ms))
+        self._ab_found_flags.append(1 if found else 0)
+        self._ab_jump_flags.append(1 if raw_jump else 0)
+
+    def _ab_metrics_snapshot(self) -> dict:
+        n = len(self._ab_latency_ms)
+        if n == 0:
+            return {
+                'window': int(max(20, self._ab_window_size)),
+                'samples': 0,
+                'hit_rate': 0.0,
+                'jump_rate': 0.0,
+                'latency_p95_ms': 0.0,
+            }
+        hit_rate = float(sum(self._ab_found_flags)) / float(max(1, len(self._ab_found_flags)))
+        jump_rate = float(sum(self._ab_jump_flags)) / float(max(1, len(self._ab_jump_flags)))
+        p95 = float(np.percentile(np.array(self._ab_latency_ms, dtype=np.float32), 95))
+        return {
+            'window': int(max(20, self._ab_window_size)),
+            'samples': int(n),
+            'hit_rate': round(hit_rate, 4),
+            'jump_rate': round(jump_rate, 4),
+            'latency_p95_ms': round(p95, 2),
+        }
+
     def _process_frame_locked(self, need_base64, need_jpeg):
         """process_frame 的实际实现，调用前必须持有 _process_lock。"""
         with self.lock:
@@ -305,9 +364,15 @@ class MapTrackerWeb:
 
         half_view = config.VIEW_SIZE // 2
 
+        t0 = time.perf_counter()
         result = self._process_sift(minimap_bgr, half_view)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
 
         found, display_crop, status_state, match_count, last_x, last_y = result
+
+        # 轻量 A/B 指标采样：命中率 / 跳点率 / P95
+        raw_jump = bool(getattr(self, '_ab_raw_jump', False))
+        self._update_ab_metrics(found=bool(found), raw_jump=raw_jump, latency_ms=dt_ms)
 
         # ====== 坐标异常值过滤（欧氏距离，避免对角线方向失衡） ======
         # CoordSmoother.update() 已在内部完成异常值过滤并维护 pos_history，此处无需重复
@@ -336,6 +401,7 @@ class MapTrackerWeb:
             'arrow_stopped': getattr(self, '_last_arrow_stopped_out', True),
             'is_teleport': _is_tp,
             'source': getattr(self, '_last_source', ''),
+            'ab_metrics': self._ab_metrics_snapshot(),
         }
         self.latest_result_token = frame_token
 
@@ -363,21 +429,23 @@ class MapTrackerWeb:
     def _process_sift(self, minimap_bgr, half_view):
         """SIFT 模式的完整处理流程，返回 (found, crop, state, matches, x, y)"""
 
+        engine = self.feature_engine
+
         # === 圆形小地图检测：从方形截取中定位并提取 ===
         extracted = self._detect_and_extract_minimap(minimap_bgr)
         if extracted is None:
             return self._handle_missing_minimap(half_view)
 
         # 小地图重现：解冻引擎状态（生成一次性恢复提示，首帧先走轻量恢复匹配）
-        self.sift_engine.resume_after_scene_change()
+        engine.resume_after_scene_change()
         self._scene_change_streak = 0   # 重置连续失帧计数
         minimap_bgr = extracted  # 提取的圆内区域，与之前引擎输入格式一致
 
         # 解冻后：用冻结前后小地图 MAD 判断是否发生传送
         # 若 MAD 超阈值（画面截然不同），说明场景已切换到新地点，丢弃旧坐标恢复提示，走全局重定位
-        _frozen_gray = self.sift_engine._frozen_minimap_gray
+        _frozen_gray = getattr(engine, '_frozen_minimap_gray', None)
         if _frozen_gray is not None:
-            self.sift_engine._frozen_minimap_gray = None  # 单次消费
+            engine._frozen_minimap_gray = None  # 单次消费
             _cur_gray = cv2.cvtColor(extracted, cv2.COLOR_BGR2GRAY)
             _sz = min(64, _frozen_gray.shape[0], _frozen_gray.shape[1],
                       _cur_gray.shape[0], _cur_gray.shape[1])
@@ -388,11 +456,14 @@ class MapTrackerWeb:
             _tp_mad_thresh = float(getattr(config, 'FREEZE_RESUME_TELEPORT_MAD', 42.0))
             if _mad > _tp_mad_thresh:
                 # 判定为传送：废弃旧坐标提示，强制全局重定位
-                self.sift_engine._pending_freeze_resume_hint = None
+                engine._pending_freeze_resume_hint = None
                 print(f'[解冻传送判定] MAD={_mad:.1f} > {_tp_mad_thresh} → 丢弃旧坐标提示，全局重定位')
-        engine_snapshot = self.sift_engine.snapshot_tracking_state()
+        engine_snapshot = engine.snapshot_tracking_state()
 
-        result = self.sift_engine.match(minimap_bgr)
+        result = engine.match(minimap_bgr)
+
+        # A/B 原始跳点打点：仅统计真实匹配帧（非 inertial）
+        self._ab_raw_jump = False
 
         # 看门狗触发：连同 Kalman/EMA 一并清空，避免旧坐标继续被预测器“续命”。
         if result.get('_watchdog_triggered'):
@@ -412,18 +483,25 @@ class MapTrackerWeb:
         self._last_match_quality = match_quality
         self._last_source = result.get('source', '')
 
+        if found and (cx is not None) and (cy is not None) and (not is_inertial):
+            _ab_prev_raw_xy = getattr(self, '_ab_prev_raw_xy', None)
+            if _ab_prev_raw_xy is not None:
+                px, py = _ab_prev_raw_xy
+                self._ab_raw_jump = (abs(cx - px) + abs(cy - py)) >= int(getattr(config, 'FEATURE_JUMP_THRESHOLD', 500))
+            self._ab_prev_raw_xy = (int(cx), int(cy))
+
         # === 坐标平滑 + 传送检测（统一由 CoordSmoother 处理）===
         smooth_x, smooth_y, tp_confirmed, measurement_rejected = self._smoother.update(
             cx, cy, found, is_inertial, match_quality, arrow_stopped,
             tp_far_candidate=result.get('_tp_far_candidate'),
         )
         if measurement_rejected and found and not is_inertial and not tp_confirmed and not result.get('_watchdog_triggered'):
-            self.sift_engine.restore_tracking_state(engine_snapshot)
-            if hasattr(self.sift_engine, 'mark_measurement_rejected'):
-                self.sift_engine.mark_measurement_rejected()
-            prev = self.sift_engine.last_position
+            engine.restore_tracking_state(engine_snapshot)
+            if hasattr(engine, 'mark_measurement_rejected'):
+                engine.mark_measurement_rejected()
+            prev = engine.last_position
             prev_x, prev_y = prev if prev is not None else (None, None)
-            arrow_angle, arrow_stopped = self.sift_engine.last_arrow_state
+            arrow_angle, arrow_stopped = engine.last_arrow_state
             self._last_arrow_angle_out = arrow_angle
             self._last_arrow_stopped_out = arrow_stopped
             self._last_match_quality = 0.0
@@ -441,7 +519,7 @@ class MapTrackerWeb:
 
         if tp_confirmed:
             self._tp_just_confirmed = True
-            self.sift_engine.sync_external_position(smooth_x, smooth_y)
+            engine.sync_external_position(smooth_x, smooth_y)
 
         # 渲染裁剪区域 + 画点
         display_crop, status_state = self._render_sift_crop(
@@ -477,7 +555,7 @@ class MapTrackerWeb:
             display_crop = display_map[y1:y2, x1:x2].copy()
             # 箭头与位置标记由前端在 canvas 上叠加，后端不再绘制
         else:
-            last_pos = self.sift_engine.last_position
+            last_pos = self.feature_engine.last_position
             if last_pos is not None:
                 last_x, last_y = last_pos
                 y1 = max(0, last_y - half_view - pad)
@@ -566,3 +644,7 @@ class MapTrackerWeb:
         self.latest_result_image = img_base64
         self._latest_result_image_revision = self._render_revision
         return img_base64
+
+
+
+

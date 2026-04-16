@@ -24,17 +24,40 @@ DISPLAY_MAP_PATH = LOGIC_MAP_PATH
 MAX_LOST_FRAMES = 50
 
 # ==========================================
-# SIFT 引擎核心参数
+# 特征匹配引擎核心参数（ORB + BEBLID）
 # ==========================================
-SIFT_REFRESH_RATE = 50
-SIFT_MATCH_RATIO = 0.82               # Lowe's Ratio (标准纹理)
-SIFT_MIN_MATCH_COUNT = 5              # 最低匹配点数 (标准纹理)
-SIFT_RANSAC_THRESHOLD = 8.0
-SIFT_CONTRAST_THRESHOLD = 0.02        # SIFT 特征对比度 (越低越多弱纹理特征)
-SIFT_MAX_HOMOGRAPHY_SCALE = 8.0
-SIFT_GLOBAL_TILE_SIZE = 1536          # 全局特征分块边长，避免全图 detectAndCompute 峰值内存过高
-SIFT_GLOBAL_TILE_OVERLAP = 96         # 分块重叠，覆盖 tile 边缘特征
-SIFT_GLOBAL_MAX_FEATURES_PER_TILE = 0 # 0 表示不额外裁剪单块特征数量
+FEATURE_REFRESH_RATE = 50
+FEATURE_MATCH_RATIO = 0.82               # Lowe's Ratio (标准纹理)
+FEATURE_MIN_MATCH_COUNT = 5              # 最低匹配点数 (标准纹理)
+FEATURE_RANSAC_THRESHOLD = 8.0
+FEATURE_CONTRAST_THRESHOLD = 0.02        # 特征检测对比度阈值（ORB FAST threshold 参考值）
+FEATURE_MAX_HOMOGRAPHY_SCALE = 8.0
+FEATURE_GLOBAL_TILE_SIZE = 1536          # 全局特征分块边长，避免全图 detectAndCompute 峰值内存过高
+FEATURE_GLOBAL_TILE_OVERLAP = 96         # 分块重叠，覆盖 tile 边缘特征
+FEATURE_GLOBAL_MAX_FEATURES_PER_TILE = 0 # 0 表示不额外裁剪单块特征数量
+
+# --- 匹配策略路由（BF / FLANN-LSH / GMS）---
+MATCHER_POLICY_ENABLE = True
+# 全局轮在高纹理场景下可优先尝试 FLANN-LSH（失败自动回退 BF）
+MATCHER_GLOBAL_USE_LSH = True
+MATCHER_LSH_CHECKS = 50
+MATCHER_LSH_MIN_KP = 120
+# GMS 仅在高纹理且特征点足够时启用（默认保守，只用于全局轮）
+MATCHER_GMS_ENABLE = True
+MATCHER_GMS_GLOBAL_ONLY = True
+MATCHER_GMS_MIN_KP = 140
+MATCHER_GMS_MIN_MATCHES = 20
+MATCHER_GMS_WITH_ROTATION = True
+MATCHER_GMS_WITH_SCALE = False
+
+# --- 特征磁盘缓存（.npz 压缩，命中时跳过全图特征提取，大幅加速冷启动）---
+FEATURE_CACHE_ENABLED = True             # 启用磁盘缓存；地图文件或提取参数变化时自动失效
+FEATURE_CACHE_PATH = _os.path.join(_ROOT, 'assets', 'feature_cache_gray.npz')
+FEATURE_CACHE_SAT_PATH = _os.path.join(_ROOT, 'assets', 'feature_cache_sat.npz')
+
+# --- 多尺度特征池（应对游戏视角缩放，坐标归一化到原图坐标系后合并）---
+FEATURE_MULTISCALE_ENABLED = True        # 启用多尺度提取；False 时退化为单尺度分块提取
+FEATURE_MULTISCALE_SCALES = [0.75, 1.0, 1.25]  # 提取倍率列表
 
 # --- CLAHE 自适应 ---
 # 双档: 纹理 std < LOW_TEXTURE_THRESHOLD → 低纹理(海洋/草/雪), clip 自动插值
@@ -46,16 +69,16 @@ CLAHE_LIMIT_LOW_TEXTURE = 6.0         # 低纹理 clip (连续插值到此)
 # --- 搜索策略 ---
 SEARCH_RADIUS = 400
 LOCAL_FAIL_LIMIT = 3
-SIFT_JUMP_THRESHOLD = 500
+FEATURE_JUMP_THRESHOLD = 500
 NEARBY_SEARCH_RADIUS = 600            # 匹配失败时邻近搜索范围
 LOCAL_REVALIDATE_INTERVAL = 3         # 连续局部命中 N 次后强制做一次全局复核（降低：防止低纹理假成功自我强化）
 LOCAL_REVALIDATE_MIN_QUALITY = 0.45   # 局部质量偏低时提前触发全局复核
 LOCAL_REVALIDATE_MARGIN = 0.08        # 全局质量至少比局部高出该冗余才覆盖局部结果
 LOCAL_REVALIDATE_DIFF = 220           # 全局/局部差异超过此值视为冲突，防局部错误自我强化
 
-# --- LK 光流加速（每帧 ~2ms，降低 SIFT 调用频率）---
+# --- LK 光流加速（每帧 ~2ms，降低特征匹配调用频率）---
 LK_ENABLED = True
-LK_SIFT_INTERVAL = 4                  # 每 N 帧强制跑一次 SIFT 做漂移校正
+LK_FEATURE_INTERVAL = 4               # 每 N 帧强制跡一次特征匹配做漂移校正
 LK_MIN_CONFIDENCE = 0.5               # 光流跟踪点中至少有此比例有效才采信
 
 # --- ECC 低纹理兜底 ---
@@ -128,20 +151,20 @@ AUTO_DETECT_TEMPLATE_SIZE = 64          # 合成圆环模板尺寸
 AUTO_DETECT_MAX_REFINED_CANDIDATES = 6  # 昂贵模板/纹理评分前最多保留的候选数
 
 # ==========================================
-# 饱和度(S)通道辅助 SIFT（低纹理/海洋场景）
+# 饱和度(S)通道辅助 ORB（低纹理/海洋场景）
 # ==========================================
 # 是否启用 S 通道辅助特征索引（启动时额外耗时 ~10-20s，内存 +30-50MB）
-SIFT_SAT_ENABLED = True
+SAT_ORB_ENABLED = True
 # S 通道分块提取边长（同灰度通道）
-SIFT_SAT_TILE_SIZE = 1536
+SAT_ORB_TILE_SIZE = 1536
 # 每块最大特征数：控制总特征量和内存，0 表示不限（建议 500-800）
-SIFT_SAT_MAX_FEATURES_PER_TILE = 600
+SAT_ORB_MAX_FEATURES_PER_TILE = 600
 # S 通道匹配 Lowe ratio（宽松，海洋特征重复性高）
-SIFT_SAT_MATCH_RATIO = 0.90
+SAT_ORB_MATCH_RATIO = 0.90
 # S 通道最低有效匹配点数
-SIFT_SAT_MIN_MATCH = 3
+SAT_ORB_MIN_MATCH = 3
 # S 通道 ECC 相关系数阈值（比灰度 ECC 稍低，因 S 通道对比度更弱）
-SIFT_SAT_ECC_MIN_CC = 0.28
+SAT_ORB_ECC_MIN_CC = 0.28
 
 # ==========================================
 # 频域归一化互相关（phaseCorrelate）—— 低纹理/海洋兜底
@@ -167,12 +190,48 @@ LOW_TEXTURE_BRIDGE_HASH_CANDIDATES = 4
 LOW_TEXTURE_BRIDGE_HASH_RADIUS = 900
 
 # ==========================================
-# 低纹理地形语义掩码（CPU）
+# ORB + BEBLID 核心参数（硬依赖 opencv-contrib-python）
 # ==========================================
-# 通过轻量色块聚类聚焦海洋/草原/雪地主地形
-TERRAIN_AI_MASK_ENABLED = True
-TERRAIN_AI_K_CLUSTERS = 3
-TERRAIN_AI_MIN_REGION_COVERAGE = 0.12
+ORB_BEBLID_NFEATURES = 7000
+ORB_BEBLID_FAST_THRESHOLD = 6
+ORB_BEBLID_EDGE_THRESHOLD = 15
+ORB_BEBLID_SCALE_FACTOR = 1.0
+ORB_BEBLID_BITS = 512
+ORB_BEBLID_RANSAC_THRESHOLD = 6.0
+ORB_BEBLID_MAX_AFFINE_SCALE = 2.0
+ORB_BEBLID_QUALITY_NORM_COUNT = 18.0
+
+# ==========================================
+# 场景颜色细化（grass/ocean/snow）
+# ==========================================
+SCENE_COLOR_ENABLED = True
+SCENE_BOOSTED_GRAY_ENABLED = True
+
+# 是否在 prior_scene='urban' 时也做颜色细化（提升草坪识别召回）
+SCENE_COLOR_REFINE_URBAN = True
+
+# 覆盖率阈值（比例）
+SCENE_COLOR_OCEAN_THRESH = 0.28
+SCENE_COLOR_GRASS_THRESH = 0.22
+SCENE_COLOR_GRASS_THRESH_URBAN = 0.30
+SCENE_COLOR_SNOW_THRESH = 0.38
+
+# H/S/V 规则阈值（OpenCV H: 0-179）
+SCENE_COLOR_OCEAN_H_MIN = 90
+SCENE_COLOR_OCEAN_H_MAX = 130
+SCENE_COLOR_OCEAN_S_MIN = 50
+SCENE_COLOR_OCEAN_V_MIN = 50
+
+SCENE_COLOR_GRASS_H_MIN = 30
+SCENE_COLOR_GRASS_H_MAX = 92
+SCENE_COLOR_GRASS_S_MIN = 28
+
+SCENE_COLOR_SNOW_S_MAX = 45
+SCENE_COLOR_SNOW_V_MIN = 185
+
+# 草坪场景强制进入低纹理稳态链路（phase/sat/hash/bridge）
+SCENE_COLOR_FORCE_LOW_TEXTURE_GRASSLAND = True
+SCENE_COLOR_FORCE_LOW_TEXTURE_STD_MAX = 36.0
 
 # --- 箭头方向 ---
 ARROW_ANGLE_SMOOTH_ALPHA = 0.35

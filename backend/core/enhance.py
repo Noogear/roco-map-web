@@ -86,8 +86,7 @@ def classify_scene_by_color(bgr: np.ndarray, prior_scene: str) -> str:
     """
     利用颜色信息对纹理分类结果做细化，弥补 texture_std 的盲区。
 
-    仅在 prior_scene != 'urban' 时调用（城市场景颜色复杂，细化意义不大；
-    跳过可节省 ~0.3ms HSV 转换开销）。
+    默认会细化所有场景；对 prior_scene='urban' 可通过配置选择是否细化。
 
     细化场景
     --------
@@ -103,7 +102,8 @@ def classify_scene_by_color(bgr: np.ndarray, prior_scene: str) -> str:
     SCENE_COLOR_GRASS_THRESH  float  0.28
     SCENE_COLOR_SNOW_THRESH   float  0.38
     """
-    if prior_scene == 'urban':
+    refine_urban = bool(getattr(config, 'SCENE_COLOR_REFINE_URBAN', True))
+    if prior_scene == 'urban' and not refine_urban:
         return prior_scene
 
     h, w = bgr.shape[:2]
@@ -122,28 +122,40 @@ def classify_scene_by_color(bgr: np.ndarray, prior_scene: str) -> str:
     v_ch = hsv[:, :, 2].ravel().astype(np.float32)
     n = float(max(1, h_ch.size))
 
-    # 海洋：蓝色 H=90-130, S>50, V>50
+    ocean_h_min = float(getattr(config, 'SCENE_COLOR_OCEAN_H_MIN', 90))
+    ocean_h_max = float(getattr(config, 'SCENE_COLOR_OCEAN_H_MAX', 130))
+    ocean_s_min = float(getattr(config, 'SCENE_COLOR_OCEAN_S_MIN', 50))
+    ocean_v_min = float(getattr(config, 'SCENE_COLOR_OCEAN_V_MIN', 50))
+    grass_h_min = float(getattr(config, 'SCENE_COLOR_GRASS_H_MIN', 30))
+    grass_h_max = float(getattr(config, 'SCENE_COLOR_GRASS_H_MAX', 92))
+    grass_s_min = float(getattr(config, 'SCENE_COLOR_GRASS_S_MIN', 28))
+    snow_s_max = float(getattr(config, 'SCENE_COLOR_SNOW_S_MAX', 45))
+    snow_v_min = float(getattr(config, 'SCENE_COLOR_SNOW_V_MIN', 185))
+
+    # 海洋：蓝色主导
     ocean_pct = float(np.sum(
-        (h_ch >= 90) & (h_ch <= 130) & (s_ch > 50) & (v_ch > 50)
+        (h_ch >= ocean_h_min) & (h_ch <= ocean_h_max) & (s_ch > ocean_s_min) & (v_ch > ocean_v_min)
     )) / n
-    # 草原：绿色 H=35-80, S>40
+    # 草原：绿色主导（范围放宽以覆盖偏黄草地）
     grass_pct = float(np.sum(
-        (h_ch >= 35) & (h_ch <= 80) & (s_ch > 40)
+        (h_ch >= grass_h_min) & (h_ch <= grass_h_max) & (s_ch > grass_s_min)
     )) / n
-    # 雪地：低饱和 S<45, 高亮 V>185
+    # 雪地：低饱和 + 高亮
     snow_pct = float(np.sum(
-        (s_ch < 45) & (v_ch > 185)
+        (s_ch < snow_s_max) & (v_ch > snow_v_min)
     )) / n
 
     ocean_thresh = float(getattr(config, 'SCENE_COLOR_OCEAN_THRESH', 0.28))
-    grass_thresh = float(getattr(config, 'SCENE_COLOR_GRASS_THRESH', 0.28))
+    grass_thresh = float(getattr(config, 'SCENE_COLOR_GRASS_THRESH', 0.22))
+    grass_thresh_urban = float(getattr(config, 'SCENE_COLOR_GRASS_THRESH_URBAN', 0.30))
     snow_thresh  = float(getattr(config, 'SCENE_COLOR_SNOW_THRESH',  0.38))
 
     if ocean_pct >= ocean_thresh and ocean_pct > grass_pct:
         return 'ocean'
     if snow_pct >= snow_thresh:
         return 'snow'
-    if grass_pct >= grass_thresh:
+    eff_grass_thresh = grass_thresh_urban if prior_scene == 'urban' else grass_thresh
+    if grass_pct >= eff_grass_thresh:
         return 'grassland'
     return prior_scene
 
@@ -155,7 +167,7 @@ _SCENE_GRAY_WEIGHTS: dict[str, tuple[float, float, float]] = {
     # 海洋：提高 B 权重，凸显蓝色区域内的梯度（岸线、水流）
     'ocean':     (0.50, 0.40, 0.10),
     # 草原：提高 G 权重，放大草地与道路/岩石之间的对比
-    'grassland': (0.07, 0.70, 0.23),
+    'grassland': (0.06, 0.78, 0.16),
     # 雪地：均等权重（雪地无主色），转换后做百分位拉伸
     'snow':      (0.114, 0.587, 0.299),
 }

@@ -8,15 +8,13 @@ from backend import config
 from backend.core.ecc import ecc_align
 
 
-def locate_hash_candidates_adaptive(hash_index, gray_raw, hash_query_lock, max_results: int = 3):
+def locate_hash_candidates_adaptive(hash_index, gray_raw, max_results: int = 3):
     """无状态场景下自适应放宽 hash 阈值，提升低纹理召回率。"""
     if hash_index is None:
         return []
 
     thresholds = [None, 16, 20]
     # 注意：不要临时改写共享索引的 _hamming_thresh，避免跨会话并发污染。
-    # hash_query_lock 参数保留用于兼容现有调用接口。
-    _ = hash_query_lock
     for th in thresholds:
         candidates = hash_index.locate(
             gray_raw,
@@ -35,7 +33,6 @@ def build_hash_ecc_or_hash_fallback_status(
     *,
     shared: Any,
     hash_index,
-    hash_query_lock,
     gray,
     gray_raw,
     source_suffix: str,
@@ -47,7 +44,6 @@ def build_hash_ecc_or_hash_fallback_status(
     candidates = locate_hash_candidates_adaptive(
         hash_index=hash_index,
         gray_raw=gray_raw,
-        hash_query_lock=hash_query_lock,
         max_results=3,
     )
     if not candidates:
@@ -57,6 +53,9 @@ def build_hash_ecc_or_hash_fallback_status(
     ecc_min_cc = float(getattr(config, 'SINGLE_ECC_MIN_CORRELATION', 0.30))
     ecc_jump = int(getattr(config, 'SINGLE_ECC_JUMP_THRESHOLD', 360))
     ecc_scale_hint = float(getattr(config, 'HASH_INDEX_PATCH_SCALE', 4.0))
+
+    best_hit = None
+    best_key = None
 
     for hx, hy, hdist in candidates:
         refined = ecc_align(
@@ -69,26 +68,46 @@ def build_hash_ecc_or_hash_fallback_status(
             shared.map_height,
             ecc_jump,
             min_cc=ecc_min_cc,
+            return_cc=True,
         )
         if refined is not None:
-            ex, ey = refined
+            ex, ey, ecc_cc = refined
             consistent = True
+            consistency_error = False
             try:
                 consistent = bool(hash_index.check_consistency(gray_raw, int(ex), int(ey)))
             except Exception:
-                consistent = True
+                # fail-closed: 一致性检查异常时不再“放行”，而是降权。
+                consistent = False
+                consistency_error = True
+
             base_q = max(0.18, 0.42 - float(hdist) * 0.015)
             if consistent:
                 base_q = max(base_q, 0.35)
-            return {
-                'state': 'FOUND',
-                'found': True,
-                'source': f'HASH_ECC_{source_suffix}',
-                'position': {'x': int(ex), 'y': int(ey)},
-                'matches': 0,
-                'match_quality': float(min(base_q, 0.65)),
-                'mode': 'sift',
-            }
+            else:
+                base_q = min(base_q, 0.30)
+                if consistency_error:
+                    base_q = min(base_q, 0.24)
+
+            hit_key = (float(ecc_cc), 1 if consistent else 0, float(base_q), -int(hdist))
+            if best_key is None or hit_key > best_key:
+                best_key = hit_key
+                best_hit = {
+                    'x': int(ex),
+                    'y': int(ey),
+                    'quality': float(min(base_q, 0.65)),
+                }
+
+    if best_hit is not None:
+        return {
+            'state': 'FOUND',
+            'found': True,
+            'source': f'HASH_ECC_{source_suffix}',
+            'position': {'x': best_hit['x'], 'y': best_hit['y']},
+            'matches': 0,
+            'match_quality': best_hit['quality'],
+            'mode': 'sift',
+        }
 
     hx, hy, hdist = candidates[0]
     return {

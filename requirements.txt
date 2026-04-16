@@ -1,4 +1,4 @@
-opencv-python
+opencv-contrib-python
 numpy
 mss
 Pillow
@@ -10,3 +10,9 @@ orjson>=3.10           # 高性能 JSON 编解码
 flask-compress>=1.15   # gzip/br 压缩，降低带宽占用
 gevent>=25.0           # 高并发 SocketIO worker
 gevent-websocket>=0.10 # gevent WebSocket worker 支持
+onnx>=1.18             # ONNX 模型导出/校验
+onnxscript>=0.3        # PyTorch 新版 dynamo ONNX exporter 依赖
+onnxruntime>=1.20      # CPU ONNX 推理
+faiss-cpu>=1.9         # 向量检索
+torch>=2.2             # 训练
+torchvision>=0.17      # MobileNetV3

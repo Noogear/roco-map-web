@@ -66,7 +66,9 @@ def phase_correlate(
 
     if not (0 <= map_x < map_width and 0 <= map_y < map_height):
         return None
-    if abs(map_x - cx_hint) + abs(map_y - cy_hint) < jump_threshold:
+    # 给 1px 容忍带，避免浮点→整数取整在阈值边界造成假阴性。
+    jump_limit = max(0, int(jump_threshold)) + 1
+    if abs(map_x - cx_hint) + abs(map_y - cy_hint) <= jump_limit:
         return map_x, map_y
     return None
 
@@ -81,13 +83,16 @@ def ecc_align(
     map_height: int,
     jump_threshold: int,
     min_cc: float = 0.15,
-) -> tuple[int, int] | None:
+    return_cc: bool = False,
+) -> tuple[int, int] | tuple[int, int, float] | None:
     """
     ECC（增强相关系数）像素级匹配。
     在 (cx_hint, cy_hint) 附近、1.5 倍 crop 范围内寻找当前小地图的位置。
 
     Returns:
-        (map_x, map_y) 大地图坐标，或 None（失败/超跳变阈值）。
+        return_cc=False: (map_x, map_y)
+        return_cc=True : (map_x, map_y, cc)
+        失败时返回 None（失败/超跳变阈值）。
     """
     s = last_sift_scale
     h_mm, w_mm = minimap_gray.shape[:2]
@@ -128,6 +133,10 @@ def ecc_align(
 
     if not (0 <= map_x < map_width and 0 <= map_y < map_height):
         return None
-    if abs(map_x - cx_hint) + abs(map_y - cy_hint) < jump_threshold:
+    # 给 1px 容忍带，避免浮点→整数取整在阈值边界造成假阴性。
+    jump_limit = max(0, int(jump_threshold)) + 1
+    if abs(map_x - cx_hint) + abs(map_y - cy_hint) <= jump_limit:
+        if return_cc:
+            return map_x, map_y, float(cc)
         return map_x, map_y
     return None

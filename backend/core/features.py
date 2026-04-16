@@ -1,14 +1,102 @@
 """
-core/features.py - SIFT 特征提取与匹配（含 RootSIFT 后处理）
+core/features.py - ORB + BEBLID 特征提取与匹配
 
-所有返回值均基本数据类型或 numpy array，无 Web 框架依赖。
+说明：
+- 运行时强依赖 opencv-contrib 的 xfeatures2d.BEBLID。
 """
 
 from __future__ import annotations
 
 import numpy as np
 import cv2
+import hashlib
+import os
 from backend import config
+
+
+class _StaticBFMatcher:
+    """静态描述子匹配器：封装 BFMatcher 接口，兼容旧 knnMatch 调用。"""
+
+    def __init__(self, train_des: np.ndarray) -> None:
+        self._train_des = np.asarray(train_des, dtype=np.uint8)
+        self._bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+    def knnMatch(self, query_des: np.ndarray, k: int = 2):
+        query = np.asarray(query_des, dtype=np.uint8)
+        return self._bf.knnMatch(query, self._train_des, k=k)
+
+
+class _StaticFlannLSHMatcher:
+    """静态描述子匹配器：FLANN-LSH（用于二进制描述子大规模候选加速）。"""
+
+    def __init__(self, train_des: np.ndarray, *, checks: int = 50) -> None:
+        self._train_des = np.ascontiguousarray(train_des, dtype=np.uint8)
+        index_params = dict(
+            algorithm=6,          # FLANN_INDEX_LSH
+            table_number=6,
+            key_size=12,
+            multi_probe_level=1,
+        )
+        search_params = dict(checks=max(1, int(checks)))
+        self._flann = cv2.FlannBasedMatcher(index_params, search_params)
+        self._flann.add([self._train_des])
+        self._flann.train()
+
+    def knnMatch(self, query_des: np.ndarray, k: int = 2):
+        query = np.ascontiguousarray(query_des, dtype=np.uint8)
+        return self._flann.knnMatch(query, k=k)
+
+
+class ORBBeblidFeature2D:
+    """组合特征算子：ORB 提取关键点 + BEBLID 计算描述子。"""
+
+    def __init__(self) -> None:
+        ensure_beblid_runtime()
+        nfeatures = int(getattr(config, 'ORB_BEBLID_NFEATURES', 7000))
+        scale_factor = float(getattr(config, 'ORB_BEBLID_SCALE_FACTOR', 1.0))
+        n_bits = int(getattr(config, 'ORB_BEBLID_BITS', 512))
+        fast_threshold = int(getattr(config, 'ORB_BEBLID_FAST_THRESHOLD', 6))
+        edge_threshold = int(getattr(config, 'ORB_BEBLID_EDGE_THRESHOLD', 15))
+
+        self._orb = cv2.ORB_create(
+            nfeatures=nfeatures,
+            scaleFactor=1.2,
+            nlevels=8,
+            edgeThreshold=edge_threshold,
+            firstLevel=0,
+            WTA_K=2,
+            scoreType=cv2.ORB_HARRIS_SCORE,
+            patchSize=31,
+            fastThreshold=fast_threshold,
+        )
+        if n_bits == 256:
+            beblid_bits = cv2.xfeatures2d.BEBLID_SIZE_256_BITS
+        else:
+            beblid_bits = cv2.xfeatures2d.BEBLID_SIZE_512_BITS
+        self._beblid = cv2.xfeatures2d.BEBLID_create(scale_factor, beblid_bits)
+
+    def detectAndCompute(self, image_gray: np.ndarray, mask: np.ndarray | None):
+        kp = self._orb.detect(image_gray, mask)
+        if not kp:
+            return [], None
+        kp, des = self._beblid.compute(image_gray, kp)
+        if des is None or len(kp) < 2:
+            return [], None
+        return kp, np.asarray(des, dtype=np.uint8)
+
+
+def ensure_beblid_runtime() -> None:
+    """启动期强校验：缺少 BEBLID 能力时直接失败。"""
+    has_xf = hasattr(cv2, 'xfeatures2d')
+    has_beblid = has_xf and hasattr(cv2.xfeatures2d, 'BEBLID_create')
+    if not has_beblid:
+        raise RuntimeError(
+            'BEBLID 不可用：请安装 opencv-contrib-python，并确认 cv2.xfeatures2d.BEBLID_create 可用。'
+        )
+
+
+def create_orb_beblid_feature2d() -> ORBBeblidFeature2D:
+    return ORBBeblidFeature2D()
 
 
 # ---------------------------------------------------------------------------
@@ -46,32 +134,28 @@ class CircularMaskCache:
 
 
 # ---------------------------------------------------------------------------
-# FLANN 索引工厂
+# 匹配器工厂（兼容旧接口名 create_flann）
 # ---------------------------------------------------------------------------
 
-def create_flann(descriptors: np.ndarray) -> cv2.FlannBasedMatcher:
-    """
-    从 des 数组构造 FLANN L2 索引。
-    des 需为 float32，每行一个描述子。
-    """
-    des = np.asarray(descriptors, dtype=np.float32)
-    index_params = dict(algorithm=1, trees=5)
-    search_params = dict(checks=50)
-    flann = cv2.FlannBasedMatcher(index_params, search_params)
-    flann.add([des])
-    flann.train()
-    return flann
+def create_flann(descriptors: np.ndarray):
+    """兼容旧函数名：二进制描述子走 BF-Hamming，浮点描述子走 FLANN(KDTree)。"""
+    des = np.asarray(descriptors)
+    if np.issubdtype(des.dtype, np.floating):
+        des = np.asarray(des, dtype=np.float32)
+        index_params = dict(algorithm=1, trees=5)
+        search_params = dict(checks=50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
+        flann.add([des])
+        flann.train()
+        return flann
+    des = np.asarray(des, dtype=np.uint8)
+    return _StaticBFMatcher(des)
 
 
-# ---------------------------------------------------------------------------
-# RootSIFT 后处理（Hellinger 核映射，L2 距离等价 Hellinger 距离）
-# ---------------------------------------------------------------------------
-
-def _apply_rootsift(des: np.ndarray) -> np.ndarray:
-    """将 SIFT 描述符映射到 Hellinger 核空间（RootSIFT），就地修改并返回。"""
-    des /= (des.sum(axis=1, keepdims=True) + 1e-7)
-    np.sqrt(des, out=des)
-    return des
+def create_flann_lsh(descriptors: np.ndarray, *, checks: int = 50):
+    """二进制描述子 FLANN-LSH 匹配器（大候选场景加速）。"""
+    des = np.asarray(descriptors, dtype=np.uint8)
+    return _StaticFlannLSHMatcher(des, checks=checks)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +164,7 @@ def _apply_rootsift(des: np.ndarray) -> np.ndarray:
 
 def extract_minimap_features(
     minimap_gray: np.ndarray,
-    sift: cv2.SIFT,
+    sift,
     mask_cache: CircularMaskCache,
     *,
     texture_std: float | None = None,
@@ -111,13 +195,12 @@ def extract_minimap_features(
     kp, des = sift.detectAndCompute(minimap_gray, mask)
     if des is None or len(kp) < 2:
         return None, None
-    _apply_rootsift(des)
-    return kp, des
+    return kp, np.asarray(des)
 
 
 def extract_map_features_tiled(
     map_gray: np.ndarray,
-    sift: cv2.SIFT,
+    sift,
     *,
     tile_size: int,
     overlap: int = 0,
@@ -167,7 +250,7 @@ def extract_map_features_tiled(
                 top = np.argpartition(responses, -max_features_per_tile)[-max_features_per_tile:]
                 kept = [kept[i] for i in sorted(top)]
 
-            descriptor_chunks.append(des_tile[[idx for idx, _, _ in kept]])
+            descriptor_chunks.append(np.asarray(des_tile[[idx for idx, _, _ in kept]]))
             for idx, gx, gy in kept:
                 kp = kp_tile[idx]
                 all_keypoints.append(cv2.KeyPoint(
@@ -183,37 +266,80 @@ def extract_map_features_tiled(
     if not descriptor_chunks:
         return [], None
 
-    des_all = np.vstack(descriptor_chunks).astype(np.float32, copy=False)
-    _apply_rootsift(des_all)
+    des_all = np.vstack(descriptor_chunks)
     return all_keypoints, des_all
 
 
 # ---------------------------------------------------------------------------
-# SIFT 区域匹配
+# 区域匹配
 # ---------------------------------------------------------------------------
 
-def sift_match_region(
+def match_region(
     kp_mini: list,
     des_mini: np.ndarray,
     mm_shape: tuple[int, int],
     region_kp: list,
-    region_flann: cv2.FlannBasedMatcher,
+    region_flann,
     ratio: float,
     min_match: int,
     map_width: int,
     map_height: int,
+    *,
+    use_gms: bool = False,
+    gms_train_shape: tuple[int, int] | None = None,
+    gms_min_matches: int = 20,
+    gms_with_rotation: bool = True,
+    gms_with_scale: bool = False,
 ) -> tuple[int, int, int, float, float] | None:
     """
-    通用 SIFT 区域匹配。
+    通用 ORB+BEBLID 区域匹配（保留旧函数名）。
     返回 (tx, ty, inlier_count, quality, avg_scale) 或 None。
     """
-    try:
-        matches = region_flann.knnMatch(des_mini, k=2)
-    except cv2.error:
+    if des_mini is None or len(kp_mini) < 2:
         return None
 
-    good = [m for m_n in matches if len(m_n) == 2
-            for m, n in [m_n] if m.distance < ratio * n.distance]
+    query = np.asarray(des_mini)
+    matches = None
+    for _query in (query, np.asarray(query, dtype=np.uint8), np.asarray(query, dtype=np.float32)):
+        try:
+            matches = region_flann.knnMatch(_query, k=2)
+            break
+        except cv2.error:
+            continue
+    if matches is None:
+        return None
+
+    ratio_good = [m for m_n in matches if len(m_n) == 2
+                  for m, n in [m_n] if m.distance < ratio * n.distance]
+
+    good = ratio_good
+
+    # 可选 GMS：仅在样本足够时启用；失败自动回退 ratio_good。
+    if use_gms and len(kp_mini) >= max(min_match, 6):
+        has_xf = hasattr(cv2, 'xfeatures2d') and hasattr(cv2.xfeatures2d, 'matchGMS')
+        if has_xf:
+            try:
+                tentative = [m_n[0] for m_n in matches if len(m_n) >= 1]
+                if len(tentative) >= max(gms_min_matches, min_match):
+                    hq, wq = mm_shape[:2]
+                    if gms_train_shape is not None:
+                        ht, wt = gms_train_shape[:2]
+                    else:
+                        _xs = [kp.pt[0] for kp in region_kp]
+                        _ys = [kp.pt[1] for kp in region_kp]
+                        wt = max(16, int(max(_xs) - min(_xs) + 1)) if _xs else wq
+                        ht = max(16, int(max(_ys) - min(_ys) + 1)) if _ys else hq
+                    gms_matches = cv2.xfeatures2d.matchGMS(
+                        (int(wq), int(hq)), (int(wt), int(ht)),
+                        kp_mini, region_kp, tentative,
+                        withRotation=bool(gms_with_rotation),
+                        withScale=bool(gms_with_scale),
+                    )
+                    if gms_matches is not None and len(gms_matches) >= max(min_match, gms_min_matches):
+                        good = list(gms_matches)
+            except Exception:
+                # GMS 不可用/异常，回退 ratio 结果
+                good = ratio_good
 
     if len(good) < min_match:
         return None
@@ -222,7 +348,7 @@ def sift_match_region(
     dst_pts = np.float32([region_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
     M, inliers = cv2.estimateAffinePartial2D(
         src_pts, dst_pts, method=cv2.RANSAC,
-        ransacReprojThreshold=config.SIFT_RANSAC_THRESHOLD)
+        ransacReprojThreshold=float(getattr(config, 'ORB_BEBLID_RANSAC_THRESHOLD', 6.0)))
     if M is None:
         return None
 
@@ -232,7 +358,7 @@ def sift_match_region(
 
     # AffinePartial2D 返回 2x3 矩阵: [[s*cos, -s*sin, tx], [s*sin, s*cos, ty]]
     avg_scale = np.sqrt(M[0, 0] ** 2 + M[1, 0] ** 2)
-    max_scale = getattr(config, 'SIFT_MAX_HOMOGRAPHY_SCALE', 8.0)
+    max_scale = float(getattr(config, 'ORB_BEBLID_MAX_AFFINE_SCALE', 2.0))
     if avg_scale > max_scale or avg_scale < 1.0 / max_scale:
         return None
 
@@ -245,6 +371,142 @@ def sift_match_region(
         return None
 
     inlier_ratio = inlier_count / max(len(good), 1)
-    count_conf = min(1.0, inlier_count / 12.0)
+    count_conf = min(1.0, inlier_count / max(1.0, float(getattr(config, 'ORB_BEBLID_QUALITY_NORM_COUNT', 18.0))))
     quality = min(1.0, inlier_ratio * count_conf)
     return tx, ty, inlier_count, quality, avg_scale
+
+
+# ---------------------------------------------------------------------------
+# 特征磁盘缓存
+# ---------------------------------------------------------------------------
+
+def _compute_feature_fingerprint(
+    map_path: str,
+    scales: list[float],
+    tile_size: int,
+    overlap: int,
+    nfeatures: int,
+    n_bits: int,
+) -> str:
+    """计算特征缓存指纹（地图文件属性 + 提取参数）。任一变化则缓存自动失效。"""
+    try:
+        stat = os.stat(map_path)
+        file_info = f"{stat.st_size}:{int(stat.st_mtime * 1000)}"
+    except OSError:
+        file_info = "?"
+    params = (
+        f"scales={sorted(scales)}|tile={tile_size}|overlap={overlap}"
+        f"|nf={nfeatures}|bits={n_bits}"
+    )
+    return hashlib.md5(f"{file_info}|{params}".encode()).hexdigest()[:16]
+
+
+def save_features_npz(
+    path: str,
+    kp_list: list,
+    des: np.ndarray,
+    fingerprint: str = '',
+) -> None:
+    """将关键点列表和描述子压缩保存到 .npz。"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    kp_arr = np.array(
+        [
+            (kp.pt[0], kp.pt[1], kp.size, kp.angle, kp.response, kp.octave, kp.class_id)
+            for kp in kp_list
+        ],
+        dtype=[
+            ('x', 'f4'), ('y', 'f4'), ('size', 'f4'), ('angle', 'f4'),
+            ('response', 'f4'), ('octave', 'i4'), ('class_id', 'i4'),
+        ],
+    )
+    np.savez_compressed(path, keypoints=kp_arr, descriptors=des,
+                        fingerprint=np.array([fingerprint]))
+
+
+def load_features_npz(
+    path: str,
+    fingerprint: str = '',
+) -> tuple[list, np.ndarray] | None:
+    """从 .npz 恢复关键点和描述子；fingerprint 不匹配或文件损坏时返回 None。"""
+    npz_path = path if path.endswith('.npz') else path + '.npz'
+    if not os.path.exists(npz_path):
+        return None
+    try:
+        data = np.load(npz_path, allow_pickle=False)
+        if fingerprint:
+            saved_fp = str(data['fingerprint'][0])
+            if saved_fp != fingerprint:
+                return None
+        kp_arr = data['keypoints']
+        des = np.asarray(data['descriptors'])
+        kp_list = [
+            cv2.KeyPoint(
+                x=float(r['x']), y=float(r['y']), size=float(r['size']),
+                angle=float(r['angle']), response=float(r['response']),
+                octave=int(r['octave']), class_id=int(r['class_id']),
+            )
+            for r in kp_arr
+        ]
+        return kp_list, des
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 多尺度特征提取
+# ---------------------------------------------------------------------------
+
+def extract_map_features_multiscale(
+    map_gray: np.ndarray,
+    sift,
+    scales: list[float],
+    *,
+    tile_size: int,
+    overlap: int = 0,
+    max_features_per_tile: int = 0,
+) -> tuple[list, np.ndarray | None]:
+    """
+    多尺度分块特征提取：在多个缩放倍率下提取，坐标归一化回原图坐标系后合并。
+
+    相比单尺度，能有效应对游戏视角缩放（小地图 FOV 变化）时的匹配率下降问题。
+    scales 为空时等价于单尺度 extract_map_features_tiled。
+    """
+    if not scales:
+        return extract_map_features_tiled(
+            map_gray, sift, tile_size=tile_size, overlap=overlap,
+            max_features_per_tile=max_features_per_tile)
+
+    h0, w0 = map_gray.shape[:2]
+    all_kp: list = []
+    all_des_chunks: list[np.ndarray] = []
+
+    for s in scales:
+        if abs(s - 1.0) < 1e-6:
+            layer = map_gray
+        else:
+            nw = max(16, int(round(w0 * s)))
+            nh = max(16, int(round(h0 * s)))
+            layer = cv2.resize(map_gray, (nw, nh), interpolation=cv2.INTER_LINEAR)
+
+        kp_s, des_s = extract_map_features_tiled(
+            layer, sift,
+            tile_size=tile_size,
+            overlap=overlap,
+            max_features_per_tile=max_features_per_tile,
+        )
+        if des_s is None or not kp_s:
+            continue
+
+        # 坐标归一化：缩放坐标 → 原图坐标系
+        if abs(s - 1.0) >= 1e-6:
+            for kp in kp_s:
+                kp.pt = (kp.pt[0] / s, kp.pt[1] / s)
+
+        all_kp.extend(kp_s)
+        all_des_chunks.append(des_s)
+
+    if not all_des_chunks:
+        return [], None
+
+    return all_kp, np.vstack(all_des_chunks)
+

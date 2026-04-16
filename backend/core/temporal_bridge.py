@@ -63,7 +63,14 @@ class LowTextureTemporalBridge:
     # ------------------------------------------------------------------
     @staticmethod
     def _is_strong_source(source: str) -> bool:
-        return source in {'SIFT_LOCAL', 'SIFT_GLOBAL', 'SIFT_GLOBAL_REVALIDATED'}
+        if not source:
+            return False
+        # 兼容旧命名(SIFT_*)与当前命名(ORB_*)
+        return (
+            source in {'SIFT_LOCAL', 'SIFT_GLOBAL', 'SIFT_GLOBAL_REVALIDATED'}
+            or source == 'ORB_LOCAL'
+            or source.startswith('ORB_GLOBAL')
+        )
 
     # ------------------------------------------------------------------
     @staticmethod

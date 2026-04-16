@@ -37,7 +37,7 @@ CONFIG_RUNTIME_RULES = {
         'description': '局部匹配连续失败多少次后退回全局搜索。',
         'editable': True,
     },
-    'SIFT_JUMP_THRESHOLD': {
+    'FEATURE_JUMP_THRESHOLD': {
         'type': 'int', 'min': 80, 'max': 2000,
         'group': '识别引擎', 'label': '跳变阈值',
         'description': '识别结果与上一帧距离过大时，用于判定异常跳点。',
@@ -75,13 +75,13 @@ CONFIG_RUNTIME_RULES = {
     },
     'LK_ENABLED': {
         'type': 'bool', 'group': '识别引擎', 'label': '启用 LK 光流',
-        'description': '开启后可降低部分帧的 SIFT 压力。',
+        'description': '开启后可降低部分帧的特征匹配压力。',
         'editable': True,
     },
-    'LK_SIFT_INTERVAL': {
+    'LK_FEATURE_INTERVAL': {
         'type': 'int', 'min': 1, 'max': 30,
-        'group': '识别引擎', 'label': 'LK 强制 SIFT 周期',
-        'description': '每隔多少帧强制做一次 SIFT 纠偏。',
+        'group': '识别引擎', 'label': 'LK 强制特征匹配周期',
+        'description': '每隔多少帧强制做一次特征匹配纠偏。',
         'editable': True,
     },
     'LK_MIN_CONFIDENCE': {
@@ -218,7 +218,7 @@ CONFIG_RUNTIME_RULES = {
 
 CONFIG_RESTART_REQUIRED = {
     'PORT', 'WINDOW_GEOMETRY', 'VIEW_SIZE', 'LOGIC_MAP_PATH', 'DISPLAY_MAP_PATH',
-    'SIFT_CONTRAST_THRESHOLD', 'MINIMAP', 'MINIMAP_CAPTURE_MARGIN',
+    'FEATURE_CONTRAST_THRESHOLD', 'MINIMAP', 'MINIMAP_CAPTURE_MARGIN',
     'MINIMAP_CIRCLE_CALIBRATION_FRAMES', 'MINIMAP_CIRCLE_R_TOLERANCE',
     'MINIMAP_CIRCLE_CENTER_TOLERANCE', 'MINIMAP_CIRCLE_RECALIBRATE_MISS',
 }
@@ -392,7 +392,7 @@ _ENGINE_ATTR_UPDATERS: dict[str, tuple[str, str]] = {
     'SEARCH_RADIUS': ('SEARCH_RADIUS', 'SEARCH_RADIUS'),
     'NEARBY_SEARCH_RADIUS': ('NEARBY_SEARCH_RADIUS', 'NEARBY_SEARCH_RADIUS'),
     'LOCAL_FAIL_LIMIT': ('LOCAL_FAIL_LIMIT', 'LOCAL_FAIL_LIMIT'),
-    'SIFT_JUMP_THRESHOLD': ('JUMP_THRESHOLD', 'SIFT_JUMP_THRESHOLD'),
+    'FEATURE_JUMP_THRESHOLD': ('JUMP_THRESHOLD', 'FEATURE_JUMP_THRESHOLD'),
     'LOCAL_REVALIDATE_INTERVAL': ('_local_revalidate_interval', 'LOCAL_REVALIDATE_INTERVAL'),
     'LOCAL_REVALIDATE_MIN_QUALITY': ('_local_revalidate_min_quality', 'LOCAL_REVALIDATE_MIN_QUALITY'),
     'LOCAL_REVALIDATE_MARGIN': ('_local_revalidate_margin', 'LOCAL_REVALIDATE_MARGIN'),
@@ -401,7 +401,7 @@ _ENGINE_ATTR_UPDATERS: dict[str, tuple[str, str]] = {
 
 _LK_ATTR_UPDATERS: dict[str, tuple[str, str]] = {
     'LK_ENABLED': ('enabled', 'LK_ENABLED'),
-    'LK_SIFT_INTERVAL': ('sift_every', 'LK_SIFT_INTERVAL'),
+    'LK_FEATURE_INTERVAL': ('feature_every', 'LK_FEATURE_INTERVAL'),
     'LK_MIN_CONFIDENCE': ('min_conf', 'LK_MIN_CONFIDENCE'),
 }
 
@@ -441,7 +441,7 @@ def _apply_engine_updates(engine, updates: dict) -> None:
 
 
 def _apply_updates_to_tracker(tracker_obj, updates: dict):
-    engine = tracker_obj.sift_engine
+    engine = tracker_obj.feature_engine
     process_lock = getattr(tracker_obj, '_process_lock', None)
     lock_acquired = False
     if process_lock is not None:
@@ -536,3 +536,4 @@ def apply_runtime_config_command(command_line: str, session_registry) -> dict:
     if not approved and rejected:
         payload['error'] = '配置未生效，请检查 rejected 字段。'
     return payload
+

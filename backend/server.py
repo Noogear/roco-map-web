@@ -8,7 +8,7 @@ server.py - Web 控制层（Flask + SocketIO 路由）
   - 圆形选区持久化
 
 识别引擎和编排逻辑已拆分到:
-  backend/tracker_engines.py   SIFTMapTracker (纯识别)
+  backend/tracker_engines.py   FeatureMapTracker (纯识别)
   backend/tracker_core.py      MapTrackerWeb (平滑/过滤/渲染编排)
 """
 
@@ -31,7 +31,12 @@ from flask import Flask, jsonify, redirect, request, send_file, send_from_direct
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_compress import Compress
 from backend.tracker_core import MapTrackerWeb
-from backend.tracker_engines import get_shared_sift
+try:
+    # 新版特征引擎入口
+    from backend.tracker_engines import get_shared_feature
+except ImportError:
+    # 兼容测试替身/旧实现：仅暴露 get_shared_sift 的场景
+    from backend.tracker_engines import get_shared_sift as get_shared_feature
 from backend.core.context import SessionRegistry
 from backend.core.data_standards import DataScope, audit_tracker_scope
 from backend.core.fastjson import OrjsonProvider, dumps_bytes
@@ -39,7 +44,6 @@ from backend.core.config_runtime import (
     apply_runtime_config_command,
     build_config_payload,
 )
-from backend.core.recognize_single_fallback import build_hash_ecc_or_hash_fallback_status
 from backend.map_data import (
     get_marker_chunks,
     get_marker_details,
@@ -48,6 +52,7 @@ from backend.map_data import (
 )
 from backend.store import get_route_files, load_route_data
 from backend.frontend_build import load_active_manifest, resolve_preferred_static_root
+from backend.core.recognize_single_fallback import build_hash_ecc_or_hash_fallback_status
 
 # 项目目录路径（backend/ 的上一级）
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -190,7 +195,6 @@ _jpeg_mgr = JpegPushManager()
 _SESSION_ROOM_PREFIX = 'session:'
 _sid_token: dict[str, str] = {}
 _sid_token_lock = threading.Lock()
-_hash_query_lock = threading.Lock()
 _command_listener_started = False
 _command_listener_lock = threading.Lock()
 _CONFIG_HTTP_READONLY_ERROR = '出于安全与稳定性考虑，后端配置仅允许在服务端后台通过指令热更新，或直接修改 config.py。'
@@ -453,15 +457,18 @@ def upload_minimap():
 def recognize_single():
     """无状态单次识别：直接做全局 SIFT 匹配，不操作/不依赖共享 tracker 状态。
     适用于上传截图测试场景。"""
-    from backend.core.features import extract_minimap_features, sift_match_region, CircularMaskCache
-    from backend.core.enhance import enhance_minimap, make_clahe_pair, correct_color_temperature
+    from backend.core.features import extract_minimap_features, match_region, CircularMaskCache
+    from backend.core.enhance import (
+        enhance_minimap, make_clahe_pair, correct_color_temperature,
+        classify_scene_by_color, make_scene_boosted_gray,
+    )
     from backend.tracking.minimap import detect_and_extract
 
     img = _decode_image_from_request()
     if img is None:
         return jsonify({'error': 'No image data'}), 400
 
-    shared = get_shared_sift()
+    shared = get_shared_feature()
     input_h, input_w = img.shape[:2]
     source_tag = 'RAW'
 
@@ -497,13 +504,45 @@ def recognize_single():
                 img = extracted2 if extracted2 is not None else crop
                 source_tag = f"AUTO_DETECT_{det.get('layout', 'full').upper()}"
 
-    # 2. 预处理：色温补偿 + CLAHE 增强
+    # 2. 预处理：色温补偿 + 场景细化 + CLAHE 增强
     img = correct_color_temperature(img)
     gray_raw = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     texture_std = float(np.std(gray_raw))
+
+    # 与主链一致的粗场景分类
+    if texture_std < 15:
+        scene = 'ocean'
+    elif texture_std < 35:
+        scene = 'low_texture'
+    elif texture_std < 55:
+        scene = 'mixed'
+    else:
+        scene = 'urban'
+
+    scene_detail = classify_scene_by_color(img, scene)
+    if (scene_detail == 'grassland'
+            and bool(getattr(config, 'SCENE_COLOR_FORCE_LOW_TEXTURE_GRASSLAND', True))
+            and scene in ('mixed', 'low_texture')
+            and texture_std <= float(getattr(config, 'SCENE_COLOR_FORCE_LOW_TEXTURE_STD_MAX', 36.0))):
+        scene = 'low_texture'
+    elif scene_detail == 'snow' and scene in ('mixed', 'low_texture'):
+        scene = 'low_texture'
+
+    low_texture_like = (
+        scene in ('ocean', 'low_texture')
+        or scene_detail == 'grassland'
+        or texture_std < float(getattr(config, 'LOW_TEXTURE_LIKE_STD_THRESHOLD', 40.0))
+    )
+
+    sift_input = gray_raw
+    if bool(getattr(config, 'SCENE_BOOSTED_GRAY_ENABLED', True)) and scene_detail in ('ocean', 'grassland', 'snow'):
+        boosted = make_scene_boosted_gray(img, scene_detail)
+        if boosted is not None:
+            sift_input = boosted
+
     clahe_normal, clahe_low = make_clahe_pair()
     low_thresh = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
-    gray = enhance_minimap(gray_raw, texture_std, clahe_normal, clahe_low, low_thresh)
+    gray = enhance_minimap(sift_input, texture_std, clahe_normal, clahe_low, low_thresh)
 
     # 3. 提取小地图特征点
     mask_cache = CircularMaskCache()
@@ -520,41 +559,59 @@ def recognize_single():
 
     hash_index = getattr(shared, '_hash_index', None)
 
-    def _build_fallback_response(source_suffix: str):
-        status = build_hash_ecc_or_hash_fallback_status(
-            shared=shared,
-            hash_index=hash_index,
-            hash_query_lock=_hash_query_lock,
-            gray=gray,
-            gray_raw=gray_raw,
-            source_suffix=source_suffix,
-        )
-        if status is None:
-            return None
-        return jsonify({'success': True, 'status': status})
+    # 4. 全局匹配（与主链策略保持一致：高纹理可选 LSH/GMS）
+    match_ratio = getattr(config, 'FEATURE_MATCH_RATIO', 0.82)
+    min_match = getattr(config, 'FEATURE_MIN_MATCH_COUNT', 5)
 
-    # 4. 全局 SIFT 匹配（使用共享只读 FLANN 索引，线程安全）
-    match_ratio = getattr(config, 'SIFT_MATCH_RATIO', 0.82)
-    min_match = getattr(config, 'SIFT_MIN_MATCH_COUNT', 5)
-    result = sift_match_region(
+    use_lsh = (
+        bool(getattr(config, 'MATCHER_POLICY_ENABLE', True))
+        and bool(getattr(config, 'MATCHER_GLOBAL_USE_LSH', True))
+        and (not low_texture_like)
+        and (getattr(shared, 'flann_global_lsh', None) is not None)
+        and len(kp_mini) >= int(getattr(config, 'MATCHER_LSH_MIN_KP', 120))
+    )
+    use_gms = (
+        bool(getattr(config, 'MATCHER_POLICY_ENABLE', True))
+        and bool(getattr(config, 'MATCHER_GMS_ENABLE', True))
+        and (not low_texture_like)
+        and len(kp_mini) >= int(getattr(config, 'MATCHER_GMS_MIN_KP', 140))
+    )
+
+    global_matcher = shared.flann_global_lsh if use_lsh else shared.flann_global
+    result = match_region(
         kp_mini, des_mini, gray.shape,
-        shared.kp_big_all, shared.flann_global,
+        shared.kp_big_all, global_matcher,
         match_ratio, min_match,
-        shared.map_width, shared.map_height)
+        shared.map_width, shared.map_height,
+        use_gms=use_gms,
+        gms_train_shape=(shared.map_height, shared.map_width),
+        gms_min_matches=int(getattr(config, 'MATCHER_GMS_MIN_MATCHES', 20)),
+        gms_with_rotation=bool(getattr(config, 'MATCHER_GMS_WITH_ROTATION', True)),
+        gms_with_scale=bool(getattr(config, 'MATCHER_GMS_WITH_SCALE', False)))
 
     if result is None:
         # 尝试宽松参数
-        result = sift_match_region(
+        result = match_region(
             kp_mini, des_mini, gray.shape,
-            shared.kp_big_all, shared.flann_global,
+            shared.kp_big_all, global_matcher,
             0.88, 3,
-            shared.map_width, shared.map_height)
+            shared.map_width, shared.map_height,
+            use_gms=use_gms,
+            gms_train_shape=(shared.map_height, shared.map_width),
+            gms_min_matches=int(getattr(config, 'MATCHER_GMS_MIN_MATCHES', 20)),
+            gms_with_rotation=bool(getattr(config, 'MATCHER_GMS_WITH_ROTATION', True)),
+            gms_with_scale=bool(getattr(config, 'MATCHER_GMS_WITH_SCALE', False)))
 
     if result is None:
-        # SIFT 失败：走 hash+ECC 兜底链，提高低纹理召回率
-        fallback_resp = _build_fallback_response(source_tag)
-        if fallback_resp is not None:
-            return fallback_resp
+        fallback_status = build_hash_ecc_or_hash_fallback_status(
+            shared=shared,
+            hash_index=hash_index,
+            gray=gray,
+            gray_raw=gray_raw,
+            source_suffix=source_tag,
+        )
+        if fallback_status is not None:
+            return jsonify({'success': True, 'status': fallback_status})
         return jsonify({
             'success': False,
             'status': {
@@ -567,11 +624,11 @@ def recognize_single():
     tx, ty, inlier_count, quality, avg_scale = result
     # 5. 无状态识别安全闸门：低置信或视觉不一致时不直接返回 FOUND
     # 目的：避免出现“识别到了，但坐标错”的误报。
-    min_inliers = int(getattr(config, 'SIFT_MIN_MATCH_COUNT', 5))
+    min_inliers = int(getattr(config, 'FEATURE_MIN_MATCH_COUNT', 5))
     min_quality = float(getattr(config, 'SINGLE_RECOGNIZE_MIN_QUALITY', 0.12))
-    sift_confident = (int(inlier_count) >= max(3, min_inliers)) and (float(quality) >= min_quality)
-    # 哈希索引是粗校验，不宜压过“非常强”的 SIFT 命中（避免误拒真阳性）。
-    sift_very_strong = (int(inlier_count) >= 8) and (float(quality) >= 0.55)
+    feature_confident = (int(inlier_count) >= max(3, min_inliers)) and (float(quality) >= min_quality)
+    # 哈希索引是粗校验，不宜压过“非常强”的特征匹配命中（避免误拒真阳性）。
+    feature_very_strong = (int(inlier_count) >= 8) and (float(quality) >= 0.55)
 
     hash_consistent = True
     if hash_index is not None:
@@ -580,18 +637,14 @@ def recognize_single():
         except Exception:
             hash_consistent = True
 
-    if (not sift_confident) or ((not hash_consistent) and (not sift_very_strong)):
-        fallback_resp = _build_fallback_response(source_tag)
-        if fallback_resp is not None:
-            return fallback_resp
-
+    if (not feature_confident) or ((not hash_consistent) and (not feature_very_strong)):
         return jsonify({
             'success': False,
             'status': {
                 'state': 'LOW_CONFIDENCE', 'found': False,
                 'position': {'x': 0, 'y': 0}, 'matches': int(inlier_count),
                 'match_quality': float(quality), 'mode': 'sift',
-                'source': f'SIFT_GLOBAL_{source_tag}',
+                'source': f'ORB_GLOBAL_{source_tag}',
             }
         })
 
@@ -615,11 +668,18 @@ def recognize_single():
     _, jpeg_buf = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
     img_b64 = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_buf.tobytes()).decode('utf-8')
 
+    source_parts = ['ORB_GLOBAL']
+    if use_lsh:
+        source_parts.append('LSH')
+    if use_gms:
+        source_parts.append('GMS')
+    source_name = '_'.join(source_parts) + f'_{source_tag}'
+
     return jsonify({
         'success': True,
         'image': img_b64,
         'status': {
-            'state': 'FOUND', 'found': True, 'source': f'SIFT_GLOBAL_{source_tag}',
+            'state': 'FOUND', 'found': True, 'source': source_name,
             'position': {'x': int(tx), 'y': int(ty)}, 'matches': int(inlier_count),
             'match_quality': float(quality), 'mode': 'sift',
         }
@@ -657,17 +717,18 @@ def detect_minimap_circle_api():
     从上传的全屏截图中自动检测小地图圆形位置，返回归一化坐标供前端更新 selCircle。
     前端"自动定位小地图"按钮调用此接口。
     """
-    from backend.tracking.autodetect import detect_minimap_circle
+    from backend.tracking.autodetect import detect_minimap_circle, detect_minimap_circle_batch
 
-    img = _decode_image_from_request()
-    if img is None:
+    images = _decode_images_from_request(max_count=8)
+    if not images:
         return jsonify({'ok': False, 'error': '无法解析图片'}), 400
 
-    h, w = img.shape[:2]
+    img0 = images[0]
+    h, w = img0.shape[:2]
     if max(h, w) < 200:
         return jsonify({'ok': False, 'error': '图片太小，请上传全屏截图'}), 400
 
-    det = detect_minimap_circle(img)
+    det = detect_minimap_circle_batch(images) if len(images) > 1 else detect_minimap_circle(img0)
     if det is None:
         return jsonify({'ok': False, 'error': '未检测到小地图圆形，请确保游戏小地图可见'})
 
@@ -1217,3 +1278,5 @@ def main():
     print("  WebSocket: ws://0.0.0.0:" + str(config.PORT) + "/socket.io/?transport=websocket")
     print("=" * 50)
     socketio.run(app, host='0.0.0.0', port=config.PORT, debug=False, allow_unsafe_werkzeug=True)
+
+

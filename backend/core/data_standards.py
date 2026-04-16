@@ -52,14 +52,14 @@ def audit_tracker_scope(tracker_obj) -> None:
     """
     运行时审计：
       - tracker 必须是 SESSION_SCOPED
-      - tracker.sift_engine 必须是 SESSION_SCOPED
+      - tracker.feature_engine 必须是 SESSION_SCOPED
       - tracker._shared 必须是 GLOBAL_SHARED
     """
     ensure_scope(tracker_obj, DataScope.SESSION_SCOPED, 'MapTrackerWeb')
-    if hasattr(tracker_obj, 'sift_engine'):
-        ensure_scope(getattr(tracker_obj, 'sift_engine'), DataScope.SESSION_SCOPED, 'SIFTMapTracker')
+    if hasattr(tracker_obj, 'feature_engine'):
+        ensure_scope(getattr(tracker_obj, 'feature_engine'), DataScope.SESSION_SCOPED, 'FeatureMapTracker')
     if hasattr(tracker_obj, '_shared'):
-        ensure_scope(getattr(tracker_obj, '_shared'), DataScope.GLOBAL_SHARED, 'SharedSIFTResources')
+        ensure_scope(getattr(tracker_obj, '_shared'), DataScope.GLOBAL_SHARED, 'SharedFeatureResources')
 
 
 GLOBAL_SHARED_CONTRACTS: tuple[DataContract, ...] = (

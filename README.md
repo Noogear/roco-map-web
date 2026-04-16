@@ -1,12 +1,12 @@
 # 🗺️ 游戏地图跟点助手（Web）
 
-基于 SIFT 的游戏小地图识别与大地图实时定位工具。
+基于 ORB + BEBLID 的游戏小地图识别与大地图实时定位工具。
 
 ## 项目介绍
 
 本项目用于在网页端实时显示玩家在大地图中的位置，核心流程如下：
 
-1. 捕获并识别游戏小地图（SIFT）
+1. 捕获并识别游戏小地图（ORB + BEBLID）
 2. 将识别结果映射到完整大地图坐标
 3. 通过 Flask + Socket.IO 实时推送给前端展示
 
@@ -22,6 +22,14 @@
 - 前端：原生 JS（启动前自动预构建）
 - 默认入口：`python run_web.py`
 
+识别主链：
+
+- 关键点：ORB
+- 描述子：BEBLID（`cv2.xfeatures2d.BEBLID_create`）
+- 几何验证：`estimateAffinePartial2D + RANSAC`
+
+> 运行时强依赖 `opencv-contrib-python`。若缺少 BEBLID，服务会在启动时直接报错并退出。
+
 ## 快速开始
 
 ```bash
@@ -33,6 +41,7 @@ python run_web.py
 ```
 
 服务启动后访问：`http://127.0.0.1:8686`
+
 
 ## 启动参数总览
 
@@ -95,7 +104,7 @@ SOCKETIO_ASYNC_MODE=gevent gunicorn -w 4 --threads 2 -k geventwebsocket.gunicorn
 # 启动 Web 后端（默认入口）
 python run_web.py
 
-# 启动 SIFT 模式入口
+# 启动识别模式入口
 python run_sift.py
 
 # 仅执行前端预构建（不启动服务）

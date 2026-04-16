@@ -836,13 +836,17 @@ const prefs = AppCommon.loadPrefs();
             return resp.json();
         }
 
+        function isGlobalFeatureSource(src) {
+            return src.indexOf('SIFT_GLOBAL_') === 0 || src.indexOf('ORB_GLOBAL_') === 0;
+        }
+
         function getStatusScore(st) {
             if (!st) return -1;
             var q = Number(st.match_quality || 0);
             var m = Number(st.matches || 0);
             var src = String(st.source || '');
             var score = q + Math.min(80, m) / 180.0;
-            if (src.indexOf('SIFT_GLOBAL_') === 0) score += 0.20;
+            if (isGlobalFeatureSource(src)) score += 0.20;
             else if (src.indexOf('HASH_ECC_') === 0) score += 0.02;
             else if (src.indexOf('HASH_INDEX_') === 0) score -= 0.25;
             return score;
@@ -862,8 +866,8 @@ const prefs = AppCommon.loadPrefs();
                 return q >= 0.35;
             }
 
-            // SIFT 主路径：放宽但保持可信门槛
-            if (src.indexOf('SIFT_GLOBAL_') === 0) {
+            // 全局特征主路径（SIFT/ORB）：放宽但保持可信门槛
+            if (isGlobalFeatureSource(src)) {
                 return (m >= 8 && q >= 0.20) || (m >= 20 && q >= 0.12) || q >= 0.55;
             }
 
