@@ -1,0 +1,12 @@
+{
+  "name": "game-map-web-frontend-build",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Frontend prebuild pipeline for game-map-web",
+  "scripts": {
+    "build:frontend": "node ./tools/build-frontend.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.3"
+  }
+}

@@ -27,6 +27,7 @@ ai = [
 [project.scripts]
 map-tracker-web  = "run_web:main"
 map-tracker-sift = "run_sift:run"
+map-tracker-build-frontend = "backend.frontend_build:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

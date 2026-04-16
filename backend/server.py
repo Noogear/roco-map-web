@@ -18,6 +18,7 @@ import time
 import struct
 import threading
 import importlib.util
+from pathlib import Path
 from importlib import metadata as importlib_metadata
 
 import cv2
@@ -46,16 +47,43 @@ from backend.map_data import (
     get_marker_search_index,
 )
 from backend.store import get_route_files, load_route_data
+from backend.frontend_build import load_active_manifest, resolve_preferred_static_root
 
 # 项目目录路径（backend/ 的上一级）
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND_DIR = os.path.join(_BASE_DIR, 'frontend')
 ASSETS_DIR   = os.path.join(_BASE_DIR, 'assets')
+FRONTEND_BUILD_DIR = os.environ.get('FRONTEND_BUILD_DIR', os.path.join(_BASE_DIR, 'frontend_build'))
 
 
 # ==================== 路线文件管理 ====================
 
 _ROUTES_DIR = os.path.join(_BASE_DIR, 'routes')
+
+
+def _get_frontend_static_roots() -> list[str]:
+    roots = []
+    if _FRONTEND_STATIC_ROOT is not None:
+        roots.append(str(_FRONTEND_STATIC_ROOT))
+    roots.append(FRONTEND_DIR)
+    return roots
+
+
+def _resolve_frontend_static_path(filename: str):
+    safe_filename = str(filename or '').lstrip('/\\')
+    for root in _get_frontend_static_roots():
+        candidate = os.path.join(root, safe_filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+_FRONTEND_BUILD_MANIFEST = load_active_manifest(Path(_BASE_DIR))
+_FRONTEND_STATIC_ROOT = resolve_preferred_static_root(Path(_BASE_DIR))
+if _FRONTEND_BUILD_MANIFEST and _FRONTEND_STATIC_ROOT is not None:
+    print(f"[frontend-build] 已检测到可用构建产物目录: {_FRONTEND_STATIC_ROOT}")
+else:
+    print('[frontend-build] 未检测到可用 active 构建产物，静态资源将回退到 frontend/ 源码目录。')
 
 
 # 固定使用 SIFT 引擎
@@ -333,10 +361,10 @@ def serve_settings():
 
 @app.route('/<path:filename>')
 def serve_static(filename):
-    """提供静态资源：先尝试 frontend/，不存在则找 assets/"""
-    frontend_path = os.path.join(FRONTEND_DIR, filename)
-    if os.path.isfile(frontend_path):
-        return send_from_directory(FRONTEND_DIR, filename)
+    """提供静态资源：先尝试 active 构建产物，再回退 frontend/ 和 assets/。"""
+    frontend_path = _resolve_frontend_static_path(filename)
+    if frontend_path and os.path.isfile(frontend_path):
+        return send_file(frontend_path)
     return send_from_directory(ASSETS_DIR, filename)
 
 

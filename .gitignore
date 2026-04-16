@@ -6,10 +6,12 @@ __pycache__/
 .venv/
 venv/
 env/
+node_modules/
 
 
 # 构建产物
 *.egg-info/
+frontend_build/
 
 _debug/
 
