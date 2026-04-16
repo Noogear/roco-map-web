@@ -1,19 +1,15 @@
-/* settings.js — Personal settings: frontend prefs, theme, backend tuning, import/export */
+/* settings.js — Personal settings: frontend prefs, theme, import/export */
 import * as AppCommon from './common.js';
 
 AppCommon.buildDock();
 
-var PREFS_META = AppCommon.FRONTEND_PREFS_META;
 var SECTION_ORDER = ['外观主题', '地图页', '识别页'];
 var SECTION_ICONS = { '外观主题': '🎨', '地图页': '🗺️', '识别页': '🎮' };
 var SECTION_DESCRIPTIONS = {
     '外观主题': '调整主题、配色与基础界面观感。',
     '地图页': '控制地图展示、路线样式与浏览体验。',
-    '识别页': '管理识别页面相关的交互与显示偏好。',
-    'backend': '后端识别引擎的热更新参数，保存后立即生效。',
-    'data': '导入、导出或重置当前浏览器中的本地设置。'
+    '识别页': '管理识别页面相关的交互与显示偏好。'
 };
-var BACKEND_STATE = null;
 var THEME_VAR_GROUPS = [
     {
         key: 'global',
@@ -87,14 +83,12 @@ function saveThemeVars(nextVars) {
     savePref('themeCssVarsJson', stableStringifyThemeVars(nextVars));
 }
 
-function getSectionStorageKey() { return 'stg_active_section'; }
-
 function getActiveSectionKey(fallback) {
-    return localStorage.getItem(getSectionStorageKey()) || fallback;
+    return localStorage.getItem('stg_active_section') || fallback;
 }
 
 function setActiveSectionKey(key) {
-    localStorage.setItem(getSectionStorageKey(), key);
+    localStorage.setItem('stg_active_section', key);
 }
 
 /* ── Build all sections ── */
@@ -120,7 +114,7 @@ function buildSettings() {
 
     var grouped = {};
     var sections = [];
-    PREFS_META.forEach(function (m) { if (!grouped[m.group]) grouped[m.group] = []; grouped[m.group].push(m); });
+    AppCommon.FRONTEND_PREFS_META.forEach(function (m) { if (!grouped[m.group]) grouped[m.group] = []; grouped[m.group].push(m); });
     if (!grouped['外观主题']) grouped['外观主题'] = [];
     grouped['外观主题'].push({
         key: 'themePaletteGlobal',
@@ -143,7 +137,6 @@ function buildSettings() {
     SECTION_ORDER.forEach(function (gn) {
         if (grouped[gn]) sections.push(buildFrontendSection(gn, SECTION_ICONS[gn] || '⚙️', grouped[gn]));
     });
-    sections.push(buildBackendSection());
     sections.push(buildDataSection());
 
     sections.forEach(function (section) {
@@ -160,7 +153,6 @@ function buildSettings() {
         setActiveSection(activeKey);
     }
 
-    loadBackendConfig();
 }
 
 /* ── Frontend section ── */
@@ -233,7 +225,7 @@ function buildItem(meta, value) {
 
     var ctrl = document.createElement('div');
     ctrl.className = 'settings-item-control';
-    ctrl.appendChild(createControl(meta, value, false));
+    ctrl.appendChild(createControl(meta, value));
 
     item.appendChild(info);
     item.appendChild(ctrl);
@@ -241,27 +233,25 @@ function buildItem(meta, value) {
 }
 
 /* ── Create control element ── */
-function createControl(meta, value, isBackend) {
+function createControl(meta, value) {
     var type = meta.type || 'string';
-    var keyAttr = isBackend ? 'data-backend-key' : 'data-key';
 
-    if (!isBackend && meta.type === 'theme-palette') {
+    if (meta.type === 'theme-palette') {
         return createThemePaletteEditor(AppCommon.loadPrefs().themeCssVarsJson, meta.editorGroupKeys || []);
     }
 
     if (type === 'bool') {
         var lbl = document.createElement('label'); lbl.className = 'settings-toggle';
         var cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = !!value;
-        cb.setAttribute(keyAttr, meta.key);
-        if (!isBackend) cb.addEventListener('change', function () { savePref(meta.key, cb.checked); });
+        cb.addEventListener('change', function () { savePref(meta.key, cb.checked); });
         var track = document.createElement('span'); track.className = 'settings-toggle-track';
         lbl.appendChild(cb); lbl.appendChild(track); return lbl;
     }
 
     if (type === 'color') {
         var ci = document.createElement('input'); ci.type = 'color'; ci.className = 'settings-color-input';
-        ci.value = value || '#000000'; ci.setAttribute(keyAttr, meta.key);
-        if (!isBackend) ci.addEventListener('input', function () { savePref(meta.key, ci.value); });
+        ci.value = value || '#000000';
+        ci.addEventListener('input', function () { savePref(meta.key, ci.value); });
         return ci;
     }
 
@@ -271,13 +261,12 @@ function createControl(meta, value, isBackend) {
         rng.min = meta.min != null ? meta.min : 0; rng.max = meta.max != null ? meta.max : 100;
         rng.step = meta.step != null ? meta.step : (type === 'int' ? 1 : 0.01);
         rng.value = value != null ? value : rng.min;
-        rng.setAttribute(keyAttr, meta.key);
         var valEl = document.createElement('span'); valEl.className = 'settings-range-val';
         valEl.textContent = type === 'float' ? Number(rng.value).toFixed(2) : rng.value;
         rng.addEventListener('input', function () {
             var v = type === 'int' ? parseInt(rng.value, 10) : parseFloat(rng.value);
             valEl.textContent = type === 'float' ? v.toFixed(2) : String(v);
-            if (!isBackend) savePref(meta.key, v);
+            savePref(meta.key, v);
         });
         wrap.appendChild(rng); wrap.appendChild(valEl); return wrap;
     }
@@ -285,14 +274,11 @@ function createControl(meta, value, isBackend) {
     /* string */
     var si = document.createElement('input'); si.type = 'text'; si.className = 'app-field';
     si.value = value != null ? String(value) : ''; si.placeholder = meta.description || '';
-    si.setAttribute(keyAttr, meta.key);
-    if (!isBackend) {
-        var dt = null;
-        si.addEventListener('input', function () {
-            clearTimeout(dt);
-            dt = setTimeout(function () { savePref(meta.key, si.value); }, 400);
-        });
-    }
+    var dt = null;
+    si.addEventListener('input', function () {
+        clearTimeout(dt);
+        dt = setTimeout(function () { savePref(meta.key, si.value); }, 400);
+    });
     return si;
 }
 
@@ -407,110 +393,17 @@ function normalizeCssColorText(value) {
     if (!value) return '';
     var text = String(value).trim();
     if (/^#[0-9a-f]{3}$/i.test(text)) {
-        return '#' + text.slice(1).split('').map(function (ch) { return ch + ch; }).join('');
+        return text.toLowerCase().replace(/^#(.)(.)(.)$/, '#$1$1$2$2$3$3');
     }
     if (/^#[0-9a-f]{6}$/i.test(text)) return text.toLowerCase();
     return text;
 }
 
-/* ── Save a frontend pref (auto-save on change) ── */
+/* ── Save pref (auto-save on change) ── */
 function savePref(key, value) {
-    AppCommon.updatePref(key, value);
-    AppCommon.syncPrefsToScatteredKeys(AppCommon.loadPrefs());
+    var prefs = AppCommon.updatePref(key, value);
+    AppCommon.syncPrefsToScatteredKeys(prefs);
     AppCommon.applyTheme();
-}
-
-/* ── Backend config section (editable items only) ── */
-function buildBackendSection() {
-    var section = document.createElement('section');
-    section.className = 'settings-section settings-panel'; section.id = 'backendSection';
-    section.dataset.sectionKey = 'backend';
-
-    var toggle = document.createElement('div');
-    toggle.className = 'settings-section-toggle';
-    toggle.innerHTML = '<span class="settings-section-icon">🔧</span><span class="settings-section-title-wrap"><span>识别参数微调</span>' +
-        '<small>' + AppCommon.escapeHtml(SECTION_DESCRIPTIONS.backend) + '</small></span>' +
-        '<span class="settings-section-count" id="backendCount">加载中</span>';
-
-    var body = document.createElement('div');
-    body.className = 'settings-section-body';
-    body.innerHTML = '<div class="settings-backend-note">以下为后端识别引擎的可热更新参数，修改后立即生效。注意：调整会影响所有连接用户。</div>' +
-        '<div id="backendGrid" class="settings-items"></div>' +
-        '<div style="margin-top:14px;display:flex;gap:8px;">' +
-        '<button class="app-btn-soft" type="button" id="saveBackendBtn">💾 保存修改</button>' +
-        '<button class="app-btn-ghost" type="button" id="refreshBackendBtn">↻ 重新读取</button></div>';
-
-    section.appendChild(toggle); section.appendChild(body);
-    return {
-        key: 'backend',
-        icon: '🔧',
-        title: '识别参数微调',
-        description: SECTION_DESCRIPTIONS.backend,
-        countText: '加载中',
-        element: section
-    };
-}
-
-function loadBackendConfig() {
-    AppCommon.fetchJSON('/api/config').then(function (p) {
-        BACKEND_STATE = p; renderBackendConfig();
-    }).catch(function (e) {
-        var g = document.getElementById('backendGrid');
-        if (g) g.innerHTML = '<div class="empty-note">读取配置失败：' + AppCommon.escapeHtml(e.message) + '</div>';
-        updateSectionCount('backend', '读取失败');
-    });
-}
-
-function updateSectionCount(sectionKey, text) {
-    var countEl = document.querySelector('.settings-panel[data-section-key="' + sectionKey + '"] .settings-section-count');
-    if (countEl) countEl.textContent = text;
-    var navCountEl = document.querySelector('.settings-nav-item[data-section-key="' + sectionKey + '"] .settings-nav-item-count');
-    if (navCountEl) navCountEl.textContent = text;
-}
-
-function renderBackendConfig() {
-    if (!BACKEND_STATE) return;
-    var grid = document.getElementById('backendGrid');
-    if (!grid) return;
-    grid.innerHTML = '';
-    var count = 0;
-    BACKEND_STATE.editableKeys.forEach(function (key) {
-        var meta = BACKEND_STATE.meta[key], value = BACKEND_STATE.values[key];
-        if (!meta) return;
-        count++;
-        var item = document.createElement('div'); item.className = 'settings-item';
-        var info = document.createElement('div'); info.className = 'settings-item-info';
-        info.innerHTML = '<div class="settings-item-label">' + AppCommon.escapeHtml(meta.label) +
-            '</div><div class="settings-item-desc">' + AppCommon.escapeHtml(meta.description || meta.key) + '</div>';
-        var ctrl = document.createElement('div'); ctrl.className = 'settings-item-control';
-        ctrl.appendChild(createControl(meta, value, true));
-        item.appendChild(info); item.appendChild(ctrl); grid.appendChild(item);
-    });
-    updateSectionCount('backend', count + ' 项');
-}
-
-function saveBackendConfig() {
-    if (!BACKEND_STATE) return;
-    var updates = {};
-    BACKEND_STATE.editableKeys.forEach(function (key) {
-        var meta = BACKEND_STATE.meta[key];
-        var el = document.querySelector('[data-backend-key="' + key + '"]');
-        if (!el) return;
-        var nv;
-        if (meta.type === 'bool') nv = !!el.checked;
-        else if (meta.type === 'int') nv = parseInt(el.value, 10);
-        else if (meta.type === 'float') nv = parseFloat(el.value);
-        else nv = el.value;
-        if (String(nv) !== String(BACKEND_STATE.values[key])) updates[key] = nv;
-    });
-    if (!Object.keys(updates).length) { AppCommon.toast('没有检测到变更', 'warning'); return; }
-    fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ updates: updates }) })
-        .then(function (r) { return r.json().then(function (p) { return { ok: r.ok, payload: p }; }); })
-        .then(function (res) {
-            if (res.payload.values) { BACKEND_STATE = res.payload; renderBackendConfig(); }
-            if (res.ok) AppCommon.toast('后端配置已应用', 'success');
-            else AppCommon.toast(res.payload.error || '保存失败', 'danger', 4000);
-        }).catch(function (e) { AppCommon.toast('保存失败：' + e.message, 'danger', 4000); });
 }
 
 /* ── Data management section ── */
@@ -522,7 +415,7 @@ function buildDataSection() {
     var toggle = document.createElement('div');
     toggle.className = 'settings-section-toggle';
     toggle.innerHTML = '<span class="settings-section-icon">💾</span><span class="settings-section-title-wrap"><span>数据管理</span>' +
-        '<small>' + AppCommon.escapeHtml(SECTION_DESCRIPTIONS.data) + '</small></span>' +
+        '<small>导入、导出或重置当前浏览器中的本地设置。</small></span>' +
         '<span class="settings-section-count">3 项</span>';
 
     var body = document.createElement('div');
@@ -537,7 +430,7 @@ function buildDataSection() {
         key: 'data',
         icon: '💾',
         title: '数据管理',
-        description: SECTION_DESCRIPTIONS.data,
+        description: '导入、导出或重置当前浏览器中的本地设置。',
         countText: '3 项',
         element: section
     };
@@ -579,7 +472,7 @@ var _resetArmed = false, _resetTimer = null;
 function resetAll() {
     if (_resetArmed) {
         clearTimeout(_resetTimer); _resetArmed = false;
-        localStorage.removeItem('game-map-web:web:prefs');
+        AppCommon.savePrefs({});
         SCATTERED_KEYS.forEach(function (k) { localStorage.removeItem(k); });
         AppCommon.applyTheme();
         buildSettings();
@@ -605,8 +498,6 @@ document.addEventListener('click', function (e) {
     if (id === 'exportAllBtn') exportSettings();
     else if (id === 'importAllBtn') document.getElementById('importFile').click();
     else if (id === 'resetAllBtn') resetAll();
-    else if (id === 'saveBackendBtn') saveBackendConfig();
-    else if (id === 'refreshBackendBtn') loadBackendConfig();
 });
 
 /* ── Boot ── */

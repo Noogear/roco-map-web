@@ -85,11 +85,14 @@ def extract_minimap_features(
     *,
     texture_std: float | None = None,
     inner_ratio: float | None = None,
+    exclude_mask: np.ndarray | None = None,
 ) -> tuple[list | None, np.ndarray | None]:
     """提取小地图特征（带圆形掩码）。返回 (kp, des) 或 (None, None)。
 
-    texture_std: 当提供时，按场景分类（ocean/low_texture/mixed/urban）自动选择挖空比例。
+    texture_std:  按场景分类（ocean/low_texture/mixed/urban）自动选择挖空比例。
     inner_ratio:  直接指定挖空比例，覆盖 config 及 texture_std 逻辑（多用于测试）。
+    exclude_mask: uint8 (h, w)，255 = 排除区域（UI 图标），0 = 保留区域。
+                  来自 detect_ui_icon_exclusion_mask()，与圆形掩码求 AND 后传给 SIFT。
     """
     h, w = minimap_gray.shape[:2]
     if inner_ratio is None:
@@ -105,9 +108,16 @@ def extract_minimap_features(
                 inner_ratio = r_urban
         else:
             inner_ratio = r_urban
-            
+
     mask = mask_cache.get(h, w, inner_ratio=inner_ratio)
-    
+
+    if exclude_mask is not None:
+        # 安全尺寸对齐（小地图偶有单像素尺寸抖动）
+        if exclude_mask.shape[:2] != (h, w):
+            exclude_mask = cv2.resize(exclude_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        # mask: 255=保留, exclude: 255=排除 → combined: 255 仅当保留且非排除
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(exclude_mask))
+
     kp, des = sift.detectAndCompute(minimap_gray, mask)
     if des is None or len(kp) < 2:
         return None, None

@@ -80,3 +80,239 @@ def correct_color_temperature(bgr: np.ndarray) -> np.ndarray:
         if abs(g - 1.0) > 0.01:
             corrected[:, :, i] = np.clip(corrected[:, :, i] * g, 0, 255)
     return corrected.astype(np.uint8)
+
+
+def classify_scene_by_color(bgr: np.ndarray, prior_scene: str) -> str:
+    """
+    利用颜色信息对纹理分类结果做细化，弥补 texture_std 的盲区。
+
+    仅在 prior_scene != 'urban' 时调用（城市场景颜色复杂，细化意义不大；
+    跳过可节省 ~0.3ms HSV 转换开销）。
+
+    细化场景
+    --------
+    ocean     : 蓝色主导（H≈90-130, S>50, V>50），覆盖率≥ocean_thresh
+    grassland : 绿色主导（H≈35-80, S>40），覆盖率≥grass_thresh
+    snow      : 低饱和+高亮度（S<45, V>185），覆盖率≥snow_thresh
+
+    若任何细化条件不满足则返回 prior_scene（保持原有分类）。
+
+    Config keys
+    -----------
+    SCENE_COLOR_OCEAN_THRESH  float  0.28
+    SCENE_COLOR_GRASS_THRESH  float  0.28
+    SCENE_COLOR_SNOW_THRESH   float  0.38
+    """
+    if prior_scene == 'urban':
+        return prior_scene
+
+    h, w = bgr.shape[:2]
+    cx, cy = w // 2, h // 2
+    r = max(8, min(cx, cy) - 4)
+    # 只分析中心圆形区域，避免扫描整张图
+    y0, y1 = max(0, cy - r), min(h, cy + r)
+    x0, x1 = max(0, cx - r), min(w, cx + r)
+    roi = bgr[y0:y1, x0:x1]
+    if roi.size < 100:
+        return prior_scene
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    h_ch = hsv[:, :, 0].ravel().astype(np.float32)  # OpenCV H: 0-179
+    s_ch = hsv[:, :, 1].ravel().astype(np.float32)
+    v_ch = hsv[:, :, 2].ravel().astype(np.float32)
+    n = float(max(1, h_ch.size))
+
+    # 海洋：蓝色 H=90-130, S>50, V>50
+    ocean_pct = float(np.sum(
+        (h_ch >= 90) & (h_ch <= 130) & (s_ch > 50) & (v_ch > 50)
+    )) / n
+    # 草原：绿色 H=35-80, S>40
+    grass_pct = float(np.sum(
+        (h_ch >= 35) & (h_ch <= 80) & (s_ch > 40)
+    )) / n
+    # 雪地：低饱和 S<45, 高亮 V>185
+    snow_pct = float(np.sum(
+        (s_ch < 45) & (v_ch > 185)
+    )) / n
+
+    ocean_thresh = float(getattr(config, 'SCENE_COLOR_OCEAN_THRESH', 0.28))
+    grass_thresh = float(getattr(config, 'SCENE_COLOR_GRASS_THRESH', 0.28))
+    snow_thresh  = float(getattr(config, 'SCENE_COLOR_SNOW_THRESH',  0.38))
+
+    if ocean_pct >= ocean_thresh and ocean_pct > grass_pct:
+        return 'ocean'
+    if snow_pct >= snow_thresh:
+        return 'snow'
+    if grass_pct >= grass_thresh:
+        return 'grassland'
+    return prior_scene
+
+
+# BGR channel weights for scene-optimized grayscale conversion
+# Key: scene_detail → (B_weight, G_weight, R_weight)
+# Standard cv2.BGR2GRAY uses (0.114, 0.587, 0.299) — optimal for urban
+_SCENE_GRAY_WEIGHTS: dict[str, tuple[float, float, float]] = {
+    # 海洋：提高 B 权重，凸显蓝色区域内的梯度（岸线、水流）
+    'ocean':     (0.50, 0.40, 0.10),
+    # 草原：提高 G 权重，放大草地与道路/岩石之间的对比
+    'grassland': (0.07, 0.70, 0.23),
+    # 雪地：均等权重（雪地无主色），转换后做百分位拉伸
+    'snow':      (0.114, 0.587, 0.299),
+}
+
+
+def make_scene_boosted_gray(bgr: np.ndarray, scene_detail: str) -> np.ndarray | None:
+    """
+    按场景类型生成色彩优化灰度图，最大化该场景下 SIFT 特征数量。
+
+    仅对 ocean / grassland / snow 三种场景做优化；其余返回 None，
+    调用方退回到标准 cv2.BGR2GRAY 路径。
+
+    海洋
+        B 通道权重提至 0.50，岸线轮廓在灰度图中对比更强，SIFT 可提取
+        到更多描述岸线走向的特征点。
+    草原
+        G 通道权重提至 0.70，草地 vs 细小道路/石块的亮度差被放大，
+        低纹理草原中的稀疏路径能产生更多可重复匹配的特征。
+    雪地
+        标准灰度转换后做 5%~95% 百分位拉伸，将雪地中的微弱纹理（
+        坡度阴影、融雪水迹）拉伸至全动态范围，供 SIFT 抓取。
+
+    Returns
+    -------
+    uint8 grayscale ndarray，或 None（非目标场景）。
+    """
+    weights = _SCENE_GRAY_WEIGHTS.get(scene_detail)
+    if weights is None:
+        return None
+
+    bw, gw, rw = weights
+    bgr_f = bgr.astype(np.float32)
+    gray = bgr_f[:, :, 0] * bw + bgr_f[:, :, 1] * gw + bgr_f[:, :, 2] * rw
+
+    if scene_detail == 'snow':
+        lo = float(np.percentile(gray, 5))
+        hi = float(np.percentile(gray, 95))
+        if hi - lo > 8:
+            gray = (gray - lo) / (hi - lo) * 255.0
+
+    return np.clip(gray, 0, 255).astype(np.uint8)
+
+
+
+def classify_scene_by_color(bgr: np.ndarray, prior_scene: str) -> str:
+    """
+    利用颜色信息对纹理分类结果做细化，弥补 texture_std 的盲区。
+
+    仅在 prior_scene != 'urban' 时调用（城市场景颜色复杂，细化意义不大；
+    跳过可节省 ~0.3ms HSV 转换开销）。
+
+    细化场景
+    --------
+    ocean     : 蓝色主导（H≈90-130, S>50, V>50），覆盖率≥ocean_thresh
+    grassland : 绿色主导（H≈35-80, S>40），覆盖率≥grass_thresh
+    snow      : 低饱和+高亮度（S<45, V>185），覆盖率≥snow_thresh
+
+    若任何细化条件不满足则返回 prior_scene（保持原有分类）。
+
+    Config keys
+    -----------
+    SCENE_COLOR_OCEAN_THRESH  float  0.28
+    SCENE_COLOR_GRASS_THRESH  float  0.28
+    SCENE_COLOR_SNOW_THRESH   float  0.38
+    """
+    if prior_scene == 'urban':
+        return prior_scene
+
+    h, w = bgr.shape[:2]
+    cx, cy = w // 2, h // 2
+    r = max(8, min(cx, cy) - 4)
+    # 只分析中心圆形区域，避免扫描整张图
+    y0, y1 = max(0, cy - r), min(h, cy + r)
+    x0, x1 = max(0, cx - r), min(w, cx + r)
+    roi = bgr[y0:y1, x0:x1]
+    if roi.size < 100:
+        return prior_scene
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    h_ch = hsv[:, :, 0].ravel().astype(np.float32)  # OpenCV H: 0-179
+    s_ch = hsv[:, :, 1].ravel().astype(np.float32)
+    v_ch = hsv[:, :, 2].ravel().astype(np.float32)
+    n = float(max(1, h_ch.size))
+
+    # 海洋：蓝色 H=90-130, S>50, V>50
+    ocean_pct = float(np.sum(
+        (h_ch >= 90) & (h_ch <= 130) & (s_ch > 50) & (v_ch > 50)
+    )) / n
+    # 草原：绿色 H=35-80, S>40
+    grass_pct = float(np.sum(
+        (h_ch >= 35) & (h_ch <= 80) & (s_ch > 40)
+    )) / n
+    # 雪地：低饱和 S<45, 高亮 V>185
+    snow_pct = float(np.sum(
+        (s_ch < 45) & (v_ch > 185)
+    )) / n
+
+    ocean_thresh = float(getattr(config, 'SCENE_COLOR_OCEAN_THRESH', 0.28))
+    grass_thresh = float(getattr(config, 'SCENE_COLOR_GRASS_THRESH', 0.28))
+    snow_thresh  = float(getattr(config, 'SCENE_COLOR_SNOW_THRESH',  0.38))
+
+    if ocean_pct >= ocean_thresh and ocean_pct > grass_pct:
+        return 'ocean'
+    if snow_pct >= snow_thresh:
+        return 'snow'
+    if grass_pct >= grass_thresh:
+        return 'grassland'
+    return prior_scene
+
+
+# BGR channel weights for scene-optimized grayscale conversion
+# Key: scene_detail → (B_weight, G_weight, R_weight)
+# Standard cv2.BGR2GRAY uses (0.114, 0.587, 0.299) — optimal for urban
+_SCENE_GRAY_WEIGHTS: dict[str, tuple[float, float, float]] = {
+    # 海洋：提高 B 权重，凸显蓝色区域内的梯度（岸线、水流）
+    'ocean':     (0.50, 0.40, 0.10),
+    # 草原：提高 G 权重，放大草地与道路/岩石之间的对比
+    'grassland': (0.07, 0.70, 0.23),
+    # 雪地：均等权重（雪地无主色），转换后做百分位拉伸
+    'snow':      (0.114, 0.587, 0.299),
+}
+
+
+def make_scene_boosted_gray(bgr: np.ndarray, scene_detail: str) -> np.ndarray | None:
+    """
+    按场景类型生成色彩优化灰度图，最大化该场景下 SIFT 特征数量。
+
+    仅对 ocean / grassland / snow 三种场景做优化；其余返回 None，
+    调用方退回到标准 cv2.BGR2GRAY 路径。
+
+    海洋
+        B 通道权重提至 0.50，岸线轮廓在灰度图中对比更强，SIFT 可提取
+        到更多描述岸线走向的特征点。
+    草原
+        G 通道权重提至 0.70，草地 vs 细小道路/石块的亮度差被放大，
+        低纹理草原中的稀疏路径能产生更多可重复匹配的特征。
+    雪地
+        标准灰度转换后做 5%~95% 百分位拉伸，将雪地中的微弱纹理（
+        坡度阴影、融雪水迹）拉伸至全动态范围，供 SIFT 抓取。
+
+    Returns
+    -------
+    uint8 grayscale ndarray，或 None（非目标场景）。
+    """
+    weights = _SCENE_GRAY_WEIGHTS.get(scene_detail)
+    if weights is None:
+        return None
+
+    bw, gw, rw = weights
+    bgr_f = bgr.astype(np.float32)
+    gray = bgr_f[:, :, 0] * bw + bgr_f[:, :, 1] * gw + bgr_f[:, :, 2] * rw
+
+    if scene_detail == 'snow':
+        lo = float(np.percentile(gray, 5))
+        hi = float(np.percentile(gray, 95))
+        if hi - lo > 8:
+            gray = (gray - lo) / (hi - lo) * 255.0
+
+    return np.clip(gray, 0, 255).astype(np.uint8)
+

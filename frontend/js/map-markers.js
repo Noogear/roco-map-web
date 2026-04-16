@@ -52,6 +52,42 @@ export const MapMarkers = {
             clearTimeout(handle.id);
         }
 
+        function createMarkerApiClient() {
+            function markerVersionTag() {
+                return A.markerDataVersion || 'static';
+            }
+
+            function fetchMarkerJson(path, scope, identity) {
+                var versionTag = markerVersionTag();
+                var version = encodeURIComponent(versionTag);
+                var cacheKey = scope + ':' + versionTag + ':' + identity;
+                var sep = path.indexOf('?') >= 0 ? '&' : '?';
+                var url = path + sep + 'v=' + version;
+                return AppCommon.fetchJSONCached(url, {
+                    cacheKey: cacheKey,
+                    persistent: true,
+                    memory: false,
+                    clone: false,
+                });
+            }
+
+            return {
+                fetchChunks: function (keys) {
+                    var identity = (keys || []).join('|');
+                    return fetchMarkerJson('/api/markers/chunks?keys=' + encodeURIComponent((keys || []).join(',')), 'markers-chunks', identity);
+                },
+                fetchDetails: function (ids) {
+                    var identity = (ids || []).join('|');
+                    return fetchMarkerJson('/api/markers/details?ids=' + encodeURIComponent((ids || []).join(',')), 'markers-details', identity);
+                },
+                fetchSearchIndex: function () {
+                    return fetchMarkerJson('/api/markers/search_index', 'markers-search-index', 'all');
+                }
+            };
+        }
+
+        var markerApiClient = createMarkerApiClient();
+
         function currentMarkerLoadGeneration() {
             return Number(A.markerLoadGeneration || 0);
         }
@@ -664,15 +700,7 @@ export const MapMarkers = {
             });
             updateMarkerLayerChip();
 
-            var version = encodeURIComponent(A.markerDataVersion || 'static');
-            var url = '/api/markers/chunks?keys=' + encodeURIComponent(missing.join(',')) + '&v=' + version;
-            var cacheKey = 'markers-chunks:' + (A.markerDataVersion || 'static') + ':' + missing.join('|');
-            return AppCommon.fetchJSONCached(url, {
-                cacheKey: cacheKey,
-                persistent: true,
-                memory: false,
-                clone: false,
-            }).then(function (payload) {
+            return markerApiClient.fetchChunks(missing).then(function (payload) {
                 if (!isCurrentMarkerLoadGeneration(generation)) return [];
                 var chunks = payload.chunks || {};
                 missing.forEach(function (key) {
@@ -764,17 +792,9 @@ export const MapMarkers = {
                 return waiters.length ? Promise.all(waiters).then(function () { return A.markerDetails; }) : Promise.resolve(A.markerDetails);
             }
 
-            var version = encodeURIComponent(A.markerDataVersion || 'static');
-            var url = '/api/markers/details?ids=' + encodeURIComponent(missingIds.join(',')) + '&v=' + version;
-            var cacheKey = 'markers-details:' + (A.markerDataVersion || 'static') + ':' + missingIds.join('|');
             var generation = currentMarkerLoadGeneration();
             var requestMap = A.markerDetailRequests;
-            var requestPromise = AppCommon.fetchJSONCached(url, {
-                cacheKey: cacheKey,
-                persistent: true,
-                memory: false,
-                clone: false,
-            }).then(function (payload) {
+            var requestPromise = markerApiClient.fetchDetails(missingIds).then(function (payload) {
                 if (!isCurrentMarkerLoadGeneration(generation)) return A.markerDetails;
                 var items = payload.items || {};
                 Object.keys(items).forEach(function (id) {
@@ -851,15 +871,7 @@ export const MapMarkers = {
 
                 A.searchIndexLoading = true;
                 updateMarkerLayerChip();
-                var version = encodeURIComponent(A.markerDataVersion || 'static');
-                var url = '/api/markers/search_index?v=' + version;
-                var cacheKey = 'markers-search-index:' + (A.markerDataVersion || 'static');
-                return AppCommon.fetchJSONCached(url, {
-                    cacheKey: cacheKey,
-                    persistent: true,
-                    memory: false,
-                    clone: false,
-                }).then(function (payload) {
+                return markerApiClient.fetchSearchIndex().then(function (payload) {
                     if (!isCurrentMarkerLoadGeneration(generation)) return [];
                     var items = Array.isArray(payload.items) ? payload.items : [];
                     hydrateSearchIndex(items);

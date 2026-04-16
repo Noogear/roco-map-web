@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from collections import defaultdict
 
 
@@ -25,9 +26,14 @@ _MAP_DATA_PATHS = (
 _CHUNK_SIZE = 768
 _MAX_CHUNK_KEYS = 128
 _MAX_DETAIL_IDS = 128
+_VERSION_PROBE_INTERVAL_SEC = 0.8
 
 _DATA_LOCK = threading.Lock()
 _DATA_CACHE = None
+_VERSION_CACHE = {
+    'value': None,
+    'checked_at': 0.0,
+}
 
 
 def _load_json(path: str):
@@ -46,6 +52,22 @@ def _compute_version() -> str:
         digest.update(str(stat.st_mtime_ns).encode('ascii'))
         digest.update(b'|')
     return digest.hexdigest()[:12]
+
+
+def _get_current_version(force_refresh: bool = False) -> str:
+    now = time.monotonic()
+    cached_value = _VERSION_CACHE['value']
+    if (
+        not force_refresh
+        and cached_value is not None
+        and (now - float(_VERSION_CACHE['checked_at'])) < _VERSION_PROBE_INTERVAL_SEC
+    ):
+        return cached_value
+
+    version = _compute_version()
+    _VERSION_CACHE['value'] = version
+    _VERSION_CACHE['checked_at'] = now
+    return version
 
 
 def _normalize_chunk_key(raw_key: str) -> str | None:
@@ -193,11 +215,12 @@ def _build_store() -> dict:
 
 def get_map_data_store(force_reload: bool = False) -> dict:
     global _DATA_CACHE
-
-    current_version = _compute_version()
     with _DATA_LOCK:
+        current_version = _get_current_version(force_refresh=force_reload)
         if force_reload or _DATA_CACHE is None or _DATA_CACHE['version'] != current_version:
             _DATA_CACHE = _build_store()
+            _VERSION_CACHE['value'] = _DATA_CACHE['version']
+            _VERSION_CACHE['checked_at'] = time.monotonic()
         return _DATA_CACHE
 
 
