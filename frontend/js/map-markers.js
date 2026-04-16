@@ -13,6 +13,13 @@ export const MapMarkers = {
         var prefetchGeneration = 0;
         var SEARCH_INDEX_OFFLINE_KEY = 'markers-search-index';
         var CLIENT_PROFILE = buildClientProfile();
+        var searchFilterCache = {
+            query: null,
+            activeSig: null,
+            sourceTag: null,
+            sourceLen: -1,
+            results: null,
+        };
 
         function buildClientProfile() {
             var nav = typeof navigator !== 'undefined' ? navigator : {};
@@ -161,6 +168,10 @@ export const MapMarkers = {
 
         function getSearchCollection() {
             return A.searchIndexLoaded && A.searchIndex.length ? A.searchIndex : A.markers;
+        }
+
+        function buildActiveTypesSignature() {
+            return Array.from(A.activeTypes).sort().join('|');
         }
 
         function getSelectedMarkerRef() {
@@ -338,9 +349,28 @@ export const MapMarkers = {
         }
 
         function getFilteredSearchCollection(search) {
-            return getSearchCollection().filter(function (marker) {
+            var source = getSearchCollection();
+            var sourceTag = (A.searchIndexLoaded && A.searchIndex.length) ? 'search-index' : 'markers';
+            var sourceLen = source.length;
+            var activeSig = buildActiveTypesSignature();
+            if (searchFilterCache.results &&
+                searchFilterCache.query === search &&
+                searchFilterCache.activeSig === activeSig &&
+                searchFilterCache.sourceTag === sourceTag &&
+                searchFilterCache.sourceLen === sourceLen) {
+                return searchFilterCache.results;
+            }
+
+            var results = source.filter(function (marker) {
                 return A.activeTypes.has(String(marker.markType || '')) && (!search || getMarkerSearchText(marker).indexOf(search) >= 0);
             });
+
+            searchFilterCache.query = search;
+            searchFilterCache.activeSig = activeSig;
+            searchFilterCache.sourceTag = sourceTag;
+            searchFilterCache.sourceLen = sourceLen;
+            searchFilterCache.results = results;
+            return results;
         }
 
         function updateMarkerCountChipText(search, loadedVisibleCount, totalVisibleCount) {

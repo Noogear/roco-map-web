@@ -150,6 +150,23 @@ def _score_local_circle(gray: np.ndarray, edges: np.ndarray, cx: int, cy: int, r
     return 0.45 * center_score + 0.35 * edge_score + 0.20 * size_score
 
 
+def _extract_circle_crop(square_bgr: np.ndarray, cx: int, cy: int, r: int) -> np.ndarray | None:
+    """按圆参数裁剪小地图，失败返回 None。"""
+    h, w = square_bgr.shape[:2]
+    x1, y1 = max(0, cx - r), max(0, cy - r)
+    x2, y2 = min(w, cx + r), min(h, cy + r)
+    minimap = square_bgr[y1:y2, x1:x2].copy()
+    return minimap if minimap.size >= 100 else None
+
+
+def _extract_expected_circle_crop(square_bgr: np.ndarray, calibrator: CircleCalibrator) -> np.ndarray | None:
+    """按当前校准器的期望圆参数裁剪小地图。"""
+    if not (calibrator._calibrated and calibrator.expected_cx is not None and calibrator.expected_r is not None):
+        return None
+    det_cx, det_cy, det_r = calibrator.expected_cx, calibrator.expected_cy, calibrator.expected_r
+    return _extract_circle_crop(square_bgr, int(det_cx), int(det_cy), int(det_r))
+
+
 def detect_and_extract(
     square_bgr: np.ndarray,
     calibrator: CircleCalibrator,
@@ -185,13 +202,9 @@ def detect_and_extract(
         minRadius=min_r, maxRadius=max_r,
     )
     if circles is None:
-        if calibrator._calibrated and calibrator.expected_cx is not None:
-            det_cx, det_cy, det_r = calibrator.expected_cx, calibrator.expected_cy, calibrator.expected_r
-            x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
-            x2, y2 = min(w, det_cx + det_r), min(h, det_cy + det_r)
-            minimap = square_bgr[y1:y2, x1:x2].copy()
-            if minimap.size >= 100:
-                return minimap
+        fallback = _extract_expected_circle_crop(square_bgr, calibrator)
+        if fallback is not None:
+            return fallback
         if not engine_frozen:
             calibrator.record_miss()
         return None
@@ -208,13 +221,9 @@ def detect_and_extract(
             best = c
 
     if best is None or best_score < float(getattr(config, 'MINIMAP_LOCAL_MIN_SCORE', 0.22)):
-        if calibrator._calibrated and calibrator.expected_cx is not None:
-            det_cx, det_cy, det_r = calibrator.expected_cx, calibrator.expected_cy, calibrator.expected_r
-            x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
-            x2, y2 = min(w, det_cx + det_r), min(h, det_cy + det_r)
-            minimap = square_bgr[y1:y2, x1:x2].copy()
-            if minimap.size >= 100:
-                return minimap
+        fallback = _extract_expected_circle_crop(square_bgr, calibrator)
+        if fallback is not None:
+            return fallback
         if not engine_frozen:
             calibrator.record_miss()
         return None
@@ -226,7 +235,7 @@ def detect_and_extract(
             # 冻结态下旧校准可能已经陈旧：接受当前检测结果并重新播种，
             # 让 thaw 后的后续帧重新积累历史，而不是继续抱着旧圆心不放。
             calibrator.reseed(det_cx, det_cy, det_r)
-        elif calibrator._calibrated and calibrator.expected_cx is not None:
+        elif calibrator._calibrated and calibrator.expected_cx is not None and calibrator.expected_r is not None:
             det_cx, det_cy, det_r = calibrator.expected_cx, calibrator.expected_cy, calibrator.expected_r
         else:
             calibrator.record_miss()
@@ -234,11 +243,4 @@ def detect_and_extract(
     else:
         calibrator.update(det_cx, det_cy, det_r)
 
-    x1, y1 = max(0, det_cx - det_r), max(0, det_cy - det_r)
-    x2, y2 = min(w, det_cx + det_r), min(h, det_cy + det_r)
-    minimap = square_bgr[y1:y2, x1:x2].copy()
-
-    if minimap.size < 100:
-        return None
-
-    return minimap
+    return _extract_circle_crop(square_bgr, int(det_cx), int(det_cy), int(det_r))

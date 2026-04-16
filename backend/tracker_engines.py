@@ -26,7 +26,6 @@ from backend.core.features import (CircularMaskCache, create_flann,
 from backend.core.flow import LKTracker
 from backend.core.ecc import ecc_align, phase_correlate
 from backend.core.hash_index import MapHashIndex
-from backend.core.icon_mask import detect_ui_icon_exclusion_mask
 from backend.core.temporal_bridge import LowTextureTemporalBridge, BridgeObservation
 from backend.core.data_standards import DataScope, bind_scope
 from backend.tracking.direction import ArrowDirectionSystem
@@ -954,7 +953,6 @@ class SIFTMapTracker:
             'bridge_hash_candidates': int(getattr(config, 'LOW_TEXTURE_BRIDGE_HASH_CANDIDATES', 4)),
             'bridge_hash_radius': int(getattr(config, 'LOW_TEXTURE_BRIDGE_HASH_RADIUS', 900)),
             # 色彩智能增强开关
-            'icon_mask_enabled': bool(getattr(config, 'ICON_MASK_ENABLED', True)),
             'scene_color_enabled': bool(getattr(config, 'SCENE_COLOR_ENABLED', True)),
             'scene_boosted_gray_enabled': bool(getattr(config, 'SCENE_BOOSTED_GRAY_ENABLED', True)),
         }
@@ -1009,13 +1007,6 @@ class SIFTMapTracker:
                                        self._clahe_normal, self._clahe_low,
                                        self._low_texture_thresh)
 
-        # ── 任务图标排除遮罩（~1ms，高饱和色块检测）────────────────────────
-        # 游戏任务图标（！/？/其他标记）为高饱和度彩色圆点，在低纹理区会产生
-        # 大量"假特征"污染全局 SIFT 匹配池；检测并在特征提取时排除。
-        _icon_excl: np.ndarray | None = None
-        if frame_cfg['icon_mask_enabled']:
-            _icon_excl = detect_ui_icon_exclusion_mask(minimap_bgr)
-
         self._lk.frame_num += 1
         run_sift = self._lk.should_run_sift()
 
@@ -1026,6 +1017,14 @@ class SIFTMapTracker:
             self._relocalize_cd -= 1
 
         _tp_far_candidate = None  # 传送候选：全局 SIFT 匹配成功但超跳变阈值
+        _sat_mini_cached: np.ndarray | None = None
+
+        def _get_sat_mini_cached() -> np.ndarray:
+            nonlocal _sat_mini_cached
+            if _sat_mini_cached is None:
+                _hsv_mini = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
+                _sat_mini_cached = self._clahe_sat.apply(_hsv_mini[:, :, 1])
+            return _sat_mini_cached
 
         # ======================================================
         # 第一层：LK 光流快速跟踪（每帧 ~2ms，跳过部分 SIFT 调用）
@@ -1056,8 +1055,7 @@ class SIFTMapTracker:
         if not found:
             # 提取特征
             kp_mini, des_mini = extract_minimap_features(minimap_gray, self.sift, self._mask_cache,
-                                                           texture_std=texture_std,
-                                                           exclude_mask=_icon_excl)
+                                                           texture_std=texture_std)
 
             # 超低/低纹理 + 特征过少 → 更激进的预处理重试
             # 方案A: 扩展到 low_texture（海岸线），不只限于 ocean
@@ -1066,8 +1064,7 @@ class SIFTMapTracker:
                                            self._clahe_normal, self._clahe_low,
                                            self._low_texture_thresh)
                 kp_retry, des_retry = extract_minimap_features(enhanced, self.sift, self._mask_cache,
-                                                                texture_std=texture_std,
-                                                                exclude_mask=_icon_excl)
+                                                                texture_std=texture_std)
                 if des_retry is not None and len(kp_retry) > (len(kp_mini) if kp_mini is not None else 0):
                     kp_mini, des_mini = kp_retry, des_retry
 
@@ -1183,8 +1180,7 @@ class SIFTMapTracker:
                 # 2. S 通道（海洋场景辨别力更强）
                 if not found and self._logic_map_sat_clahe is not None \
                         and self._clahe_sat is not None:
-                    _hsv_pc = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
-                    _sat_mini_pc = self._clahe_sat.apply(_hsv_pc[:, :, 1])
+                    _sat_mini_pc = _get_sat_mini_cached()
                     _pc_s = phase_correlate(
                         _sat_mini_pc, self._logic_map_sat_clahe,
                         self.last_x, self.last_y,
@@ -1198,12 +1194,11 @@ class SIFTMapTracker:
             # ---- 方案B: S通道辅助匹配（低纹理/海洋场景最终兜底）----
             # 灰度 SIFT 全链路失败后才触发，运行时开销 ~3-5ms（含 cvtColor + SIFT）
             if not found and low_texture_like and self._clahe_sat is not None:
-                _hsv_mini = cv2.cvtColor(minimap_bgr, cv2.COLOR_BGR2HSV)
-                _sat_mini = self._clahe_sat.apply(_hsv_mini[:, :, 1])
+                _sat_mini = _get_sat_mini_cached()
                 # inner_ratio 固定用 hard 值，排除玩家箭头对 S 通道的干扰
                 kp_sat_mini, des_sat_mini = extract_minimap_features(
                     _sat_mini, self.sift, self._mask_cache,
-                    texture_std=None, inner_ratio=0.18, exclude_mask=_icon_excl)
+                    texture_std=None, inner_ratio=0.18)
                 if des_sat_mini is not None:
                     _sat_ratio = frame_cfg['sat_match_ratio']
                     _sat_min = frame_cfg['sat_min_match']

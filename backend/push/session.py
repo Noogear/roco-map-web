@@ -29,12 +29,11 @@ class PushSession:
             cx, cy : 当前地图坐标（像素）
             margin : JPEG_PAD 中保留的缓冲像素数
         """
-        pad = getattr(config, 'JPEG_PAD', 40)
-        budget = pad - margin
-        dist = math.sqrt(
-            (cx - self._last_jpeg_x) ** 2 + (cy - self._last_jpeg_y) ** 2
-        )
-        return dist >= budget
+        pad = int(getattr(config, 'JPEG_PAD', 40))
+        budget = max(4, pad - margin)
+        dx = cx - self._last_jpeg_x
+        dy = cy - self._last_jpeg_y
+        return (dx * dx + dy * dy) >= (budget * budget)
 
     def mark_jpeg_sent(self, cx: int, cy: int) -> None:
         """记录本次 JPEG 发送时的坐标锚点。"""

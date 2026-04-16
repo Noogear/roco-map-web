@@ -50,7 +50,7 @@ const prefs = AppCommon.loadPrefs();
     var _sceneChangeMissCount = 0;   /* 连续 SCENE_CHANGE 帧计数，用于触发校准提示 */
     var _sceneChangeWarnAt = 0;      /* 避免重复提示的冷却时间戳 */
     var wsReconnectAt = 0, nullBlobWarnAt = 0, S_nullBlobCount = 0;
-    var screenAutoRunning = false, screenAutoId = null;
+    var screenAutoRunning = false, screenAutoTimeoutId = null, screenAutoRafId = null;
     /* Broadcast */
     var bcastName = null;           // null = 未展示，string = 当前展示名
     var bcastViewerCount = 0;
@@ -262,7 +262,7 @@ const prefs = AppCommon.loadPrefs();
         },
         onScreenStart: function () { TC.mode = 'screen'; updateScreenButtons(); },
         onScreenStop: function () {
-            if (screenAutoId) { clearTimeout(screenAutoId); screenAutoId = null; }
+            clearScreenAutoSchedulers();
             screenAutoRunning = false;
             TC.mode = 'file'; updateScreenButtons();
             /* 停止屏幕时也停止展示 */
@@ -415,14 +415,32 @@ const prefs = AppCommon.loadPrefs();
         });
     }
 
+    function clearScreenAutoSchedulers() {
+        if (screenAutoTimeoutId) {
+            clearTimeout(screenAutoTimeoutId);
+            screenAutoTimeoutId = null;
+        }
+        if (screenAutoRafId) {
+            cancelAnimationFrame(screenAutoRafId);
+            screenAutoRafId = null;
+        }
+    }
+
     function runScreenAutoLoop() {
         if (!screenAutoRunning || TC.mode !== 'screen') return;
         if (!document.hidden || R.pipRAFActive) captureAndSendScreenFrame();
         if (document.hidden && R.pipRAFActive) {
-            screenAutoId = setTimeout(runScreenAutoLoop, SCREEN_INTERVAL_MS);
+            clearScreenAutoSchedulers();
+            screenAutoTimeoutId = setTimeout(runScreenAutoLoop, SCREEN_INTERVAL_MS);
             return;
         }
-        screenAutoId = setTimeout(function () { requestAnimationFrame(runScreenAutoLoop); }, SCREEN_INTERVAL_MS);
+        clearScreenAutoSchedulers();
+        screenAutoTimeoutId = setTimeout(function () {
+            screenAutoRafId = requestAnimationFrame(function () {
+                screenAutoRafId = null;
+                runScreenAutoLoop();
+            });
+        }, SCREEN_INTERVAL_MS);
     }
 
     async function toggleScreenAutoTrack() {
@@ -438,6 +456,7 @@ const prefs = AppCommon.loadPrefs();
             TC.log('📍 屏幕自动追踪已开启');
             runScreenAutoLoop();
         } else {
+            clearScreenAutoSchedulers();
             TC.log('⏸ 屏幕自动追踪已暂停');
         }
         updateScreenButtons();
@@ -518,19 +537,39 @@ const prefs = AppCommon.loadPrefs();
     async function startBroadcast(name) {
         if (bcastStarting || bcastName) return;
         bcastStarting = true;
-        if (!TC.wsConnected) {
-            try { await TC.connectWS(); }
-            catch (e) {
-                bcastStarting = false;
-                AppCommon.toast('WS 连接失败：' + e.message, 'danger');
+        try {
+            if (!TC.wsConnected) {
+                await TC.connectWS();
+            }
+            bindRecognizeSocketLifecycle();
+
+            var ack = await new Promise(function (resolve, reject) {
+                var sock = TC.wsSocket;
+                if (!sock) { reject(new Error('WS 未就绪')); return; }
+                var settled = false;
+                var onJoined = function (data) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    sock.off('broadcast_joined', onJoined);
+                    resolve(data || { ok: false, error: '空响应' });
+                };
+                var timer = setTimeout(function () {
+                    if (settled) return;
+                    settled = true;
+                    sock.off('broadcast_joined', onJoined);
+                    reject(new Error('等待展示确认超时，请重试'));
+                }, 5000);
+
+                sock.on('broadcast_joined', onJoined);
+                sock.emit('broadcast_join', { name: name });
+            });
+
+            if (!ack.ok) {
+                AppCommon.toast('展示失败：' + (ack.error || '未知错误'), 'danger');
                 return;
             }
-        }
-        bindRecognizeSocketLifecycle();
-        TC.wsSocket.emit('broadcast_join', { name: name });
-        TC.wsSocket.once('broadcast_joined', function (ack) {
-            bcastStarting = false;
-            if (!ack.ok) { AppCommon.toast('展示失败：' + ack.error, 'danger'); return; }
+
             bcastName = ack.name;
             bcastViewerCount = 0;
             setBroadcastButtonState(true, bcastName);
@@ -539,7 +578,11 @@ const prefs = AppCommon.loadPrefs();
             AppCommon.toast('已开始展示「' + bcastName + '」', 'success');
             TC.log('📡 展示已开始：' + bcastName);
             runBcastLoop();
-        });
+        } catch (e) {
+            AppCommon.toast('WS 连接失败：' + e.message, 'danger');
+        } finally {
+            bcastStarting = false;
+        }
     }
 
     function stopBroadcast() {
@@ -668,7 +711,7 @@ const prefs = AppCommon.loadPrefs();
         if (R.renderMapCanvas) R.renderMapCanvas();
         if (R.mapState && !R.mapRAFActive) R.startMapRAF();
 
-        if (screenAutoRunning && TC.mode === 'screen' && !screenAutoId) runScreenAutoLoop();
+        if (screenAutoRunning && TC.mode === 'screen' && !screenAutoTimeoutId && !screenAutoRafId) runScreenAutoLoop();
         if (bcastName && !bcastAutoId) runBcastLoop();
     }
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections import deque
+import shlex
 
 from backend import config
 
@@ -124,7 +125,7 @@ CONFIG_RUNTIME_RULES = {
         'description': '连续多少帧接近静止后才视为停下。',
         'editable': True,
     },
-    'ARROW_SNAP_THRESHOLD': {
+    'ARROW_BIG_CHANGE_THRESHOLD': {
         'type': 'float', 'min': 5.0, 'max': 180.0,
         'group': '箭头', 'label': '箭头吸附阈值',
         'description': '方向突变超过该角度时直接吸附到新方向。',
@@ -270,6 +271,9 @@ def build_config_meta(key: str, value):
     rule = CONFIG_RUNTIME_RULES.get(key, {})
     editable = bool(rule.get('editable', False))
     restart_required = key in CONFIG_RESTART_REQUIRED or (not editable and key not in CONFIG_RUNTIME_RULES)
+    reason = rule.get('reason') or (
+        '该配置需要重启相关引擎或服务后才能安全生效。' if restart_required else '当前版本仅开放只读查看。'
+    )
     return {
         'key': key,
         'label': rule.get('label', key.replace('_', ' ')),
@@ -281,9 +285,7 @@ def build_config_meta(key: str, value):
         'max': rule.get('max'),
         'step': rule.get('step'),
         'description': rule.get('description', ''),
-        'reason': rule.get('reason') or (
-            '该配置需要重启相关引擎或服务后才能安全生效。' if restart_required else '当前版本仅开放只读查看。'
-        ),
+        'reason': reason,
     }
 
 
@@ -412,7 +414,7 @@ _ARROW_ATTR_UPDATERS: dict[str, tuple[str, str]] = {
     'ARROW_ANGLE_SMOOTH_ALPHA': ('_ema_alpha', 'ARROW_ANGLE_SMOOTH_ALPHA'),
     'ARROW_MOVE_MIN_DISPLACEMENT': ('_stop_speed_px', 'ARROW_MOVE_MIN_DISPLACEMENT'),
     'ARROW_STOPPED_DEBOUNCE': ('_stop_debounce', 'ARROW_STOPPED_DEBOUNCE'),
-    'ARROW_SNAP_THRESHOLD': ('_snap_threshold', 'ARROW_SNAP_THRESHOLD'),
+    'ARROW_BIG_CHANGE_THRESHOLD': ('_snap_threshold', 'ARROW_BIG_CHANGE_THRESHOLD'),
 }
 
 
@@ -462,3 +464,75 @@ def apply_runtime_config_updates(updates: dict, session_registry):
 
     for ctx in session_registry.snapshot_contexts():
         _apply_updates_to_tracker(ctx.tracker, updates)
+
+
+def apply_runtime_config_command(command_line: str, session_registry) -> dict:
+    """服务端后台配置指令入口。
+
+        支持命令：
+            - set KEY=VALUE [KEY2=VALUE2 ...]
+            - show
+            - help
+    """
+    raw = str(command_line or '').strip()
+    if not raw:
+        return {'success': False, 'error': '空命令。输入 help 查看示例。'}
+
+    try:
+        tokens = shlex.split(raw)
+    except ValueError as exc:
+        return {'success': False, 'error': f'命令解析失败: {exc}'}
+
+    if not tokens:
+        return {'success': False, 'error': '空命令。输入 help 查看示例。'}
+
+    action = tokens[0].strip().lower()
+    if action == 'help':
+        return {
+            'success': True,
+            'message': '用法: set KEY=VALUE [KEY2=VALUE2 ...]；示例: set SEARCH_RADIUS=500 LK_ENABLED=false',
+        }
+
+    if action == 'show':
+        payload = build_config_payload()
+        payload['message'] = '当前后端配置快照（服务端指令模式）'
+        return payload
+
+    if action != 'set':
+        return {'success': False, 'error': f'不支持的命令: {tokens[0]}（输入 help 查看用法）'}
+
+    updates: dict[str, str] = {}
+    malformed: list[str] = []
+    for item in tokens[1:]:
+        part = str(item).strip()
+        if not part:
+            continue
+        if '=' not in part:
+            malformed.append(part)
+            continue
+        key, value = part.split('=', 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            malformed.append(part)
+            continue
+        updates[key] = value
+
+    if malformed:
+        return {'success': False, 'error': f'参数格式错误（需 KEY=VALUE）: {", ".join(malformed)}'}
+    if not updates:
+        return {'success': False, 'error': '未提供可更新项。示例: set SEARCH_RADIUS=500'}
+
+    approved, rejected = validate_runtime_config_updates(updates)
+    if approved:
+        apply_runtime_config_updates(approved, session_registry)
+
+    payload = {
+        'success': not rejected,
+        'partial': bool(approved and rejected),
+        'applied': {key: serialize_config_value(value) for key, value in approved.items()},
+        'rejected': rejected,
+    }
+    if not approved and rejected:
+        payload['error'] = '配置未生效，请检查 rejected 字段。'
+    return payload

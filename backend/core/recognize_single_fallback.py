@@ -14,18 +14,21 @@ def locate_hash_candidates_adaptive(hash_index, gray_raw, hash_query_lock, max_r
         return []
 
     thresholds = [None, 16, 20]
-    with hash_query_lock:
-        original = int(getattr(hash_index, '_hamming_thresh', 12))
-        try:
-            for th in thresholds:
-                if th is not None:
-                    hash_index._hamming_thresh = int(th)
-                candidates = hash_index.locate(gray_raw, last_x=None, last_y=None, radius=0, max_results=max_results)
-                if candidates:
-                    return candidates
-            return []
-        finally:
-            hash_index._hamming_thresh = original
+    # 注意：不要临时改写共享索引的 _hamming_thresh，避免跨会话并发污染。
+    # hash_query_lock 参数保留用于兼容现有调用接口。
+    _ = hash_query_lock
+    for th in thresholds:
+        candidates = hash_index.locate(
+            gray_raw,
+            last_x=None,
+            last_y=None,
+            radius=0,
+            max_results=max_results,
+            hamming_threshold=th,
+        )
+        if candidates:
+            return candidates
+    return []
 
 
 def build_hash_ecc_or_hash_fallback_status(

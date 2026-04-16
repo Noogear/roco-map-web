@@ -153,6 +153,7 @@ class MapHashIndex:
         last_y: int | None = None,
         radius: int = 0,
         max_results: int = 5,
+        hamming_threshold: int | None = None,
     ) -> list[tuple[int, int, int]]:
         """
         查找与小地图最匹配的候选位置。
@@ -162,6 +163,7 @@ class MapHashIndex:
             last_x/y:     有位置提示时，优先返回距此处较近的候选。
             radius:       >0 时只搜索 last_x±radius 范围内的候选。
             max_results:  最多返回几个候选。
+            hamming_threshold: 可选汉明阈值；None 表示使用索引默认阈值。
 
         Returns:
             [(x, y, hamming_distance), ...] 按汉明距离升序排列。
@@ -188,7 +190,8 @@ class MapHashIndex:
         dists = _compute_hamming_distances(candidate_hashes, query_hash)
 
         # 阈值过滤
-        ok = dists <= self._hamming_thresh
+        threshold = self._hamming_thresh if hamming_threshold is None else int(hamming_threshold)
+        ok = dists <= threshold
         ok_indices = indices[ok]
         ok_dists = dists[ok]
         if len(ok_indices) == 0:

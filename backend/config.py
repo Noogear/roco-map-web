@@ -155,28 +155,16 @@ LOW_TEXTURE_BRIDGE_HASH_RADIUS = 900
 # ==========================================
 # 低纹理地形语义掩码（CPU）
 # ==========================================
-# 通过轻量色块聚类聚焦海洋/草原/雪地主地形，并可抑制任务图标干扰
+# 通过轻量色块聚类聚焦海洋/草原/雪地主地形
 TERRAIN_AI_MASK_ENABLED = True
-TERRAIN_AI_ICON_SUPPRESS_ENABLED = True
 TERRAIN_AI_K_CLUSTERS = 3
 TERRAIN_AI_MIN_REGION_COVERAGE = 0.12
-TERRAIN_AI_ICON_MIN_AREA = 10
-TERRAIN_AI_ICON_MAX_AREA_RATIO = 0.03
-
-# ==========================================
-# 小地图图标掩码（动态高饱和小圆检测）
-# ==========================================
-ICON_MASK_ENABLED = True
-ICON_MASK_SAT_THRESHOLD = 160
-ICON_MASK_MIN_RADIUS = 3
-ICON_MASK_MAX_RADIUS = 14
 
 # --- 箭头方向 ---
 ARROW_ANGLE_SMOOTH_ALPHA = 0.35
 ARROW_MOVE_MIN_DISPLACEMENT = 6
 ARROW_POS_HISTORY_LEN = 4
 ARROW_STOPPED_DEBOUNCE = 20
-# 新增防抖阈值：小变化防抖与大方向敏感的分界线
 ARROW_SMALL_CHANGE_THRESHOLD = 12.0    # 小于此角度变化时抑制输出（防抖）
 ARROW_BIG_CHANGE_THRESHOLD = 45.0      # 大于此角度变化时立即切换（保持敏感）
 

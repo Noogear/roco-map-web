@@ -173,6 +173,35 @@ const TrackerCore = (() => {
         }
     };
 
+    var _getCaptureRect = function(vw, vh, sc) {
+        var bs = Math.min(vw, vh);
+        var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
+        var margin = 1.4;
+        var sz = Math.max(10, Math.round(r * 2 * margin));
+        return {
+            sz: sz,
+            rx: Math.round(cx - sz / 2),
+            ry: Math.round(cy - sz / 2),
+        };
+    };
+
+    var _drawCaptureToCanvas = function(vid, rect) {
+        if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
+        var c = S.captureCanvas;
+        if (c.width !== rect.sz || c.height !== rect.sz) { c.width = rect.sz; c.height = rect.sz; }
+
+        var ctx = c.getContext('2d', { willReadFrequently: true });
+        if (!ctx) {
+            S.captureCanvas = document.createElement('canvas');
+            c = S.captureCanvas;
+            c.width = rect.sz; c.height = rect.sz;
+            ctx = c.getContext('2d', { willReadFrequently: true });
+            if (!ctx) return null;
+        }
+        ctx.drawImage(vid, rect.rx, rect.ry, rect.sz, rect.sz, 0, 0, rect.sz, rect.sz);
+        return c;
+    };
+
     var _bindSocketTransportEvents = function(sock, self) {
         if (!sock || sock.__tcTransportEventsBound) return;
         if (!sock.io || !sock.io.engine || typeof sock.io.engine.on !== 'function') return;
@@ -473,27 +502,9 @@ const TrackerCore = (() => {
             var vh = vid.videoHeight || S.videoH;
             if (!vw || !vh) return null;
 
-            var sc = S.selCircle;
-            var bs = Math.min(vw, vh);
-            var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
-            var margin = 1.4;
-            var sz = Math.max(10, Math.round(r * 2 * margin));
-            var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
-
-            // 复用 canvas 避免每帧创建新元素导致 GPU 内存堆积
-            if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
-            var c = S.captureCanvas;
-            if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
-            var ctx = c.getContext('2d', { willReadFrequently: true });
-            if (!ctx) {
-                // context 丢失（内存压力等），强制重建 canvas
-                S.captureCanvas = document.createElement('canvas');
-                c = S.captureCanvas;
-                c.width = sz; c.height = sz;
-                ctx = c.getContext('2d', { willReadFrequently: true });
-                if (!ctx) return null;
-            }
-            ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
+            var rect = _getCaptureRect(vw, vh, S.selCircle);
+            var c = _drawCaptureToCanvas(vid, rect);
+            if (!c) return null;
             return c.toDataURL('image/jpeg', 0.80);
         },
 
@@ -510,27 +521,9 @@ const TrackerCore = (() => {
             var vh = vid.videoHeight || S.videoH;
             if (!vw || !vh) return Promise.resolve(null);
 
-            var sc = S.selCircle;
-            var bs = Math.min(vw, vh);
-            var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
-            var margin = 1.4;
-            var sz = Math.max(10, Math.round(r * 2 * margin));
-            var rx = Math.round(cx - sz / 2), ry = Math.round(cy - sz / 2);
-
-            // 复用 canvas 避免每帧创建新元素导致 GPU 内存堆积
-            if (!S.captureCanvas) S.captureCanvas = document.createElement('canvas');
-            var c = S.captureCanvas;
-            if (c.width !== sz || c.height !== sz) { c.width = sz; c.height = sz; }
-            var ctx = c.getContext('2d', { willReadFrequently: true });
-            if (!ctx) {
-                // context 丢失，强制重建
-                S.captureCanvas = document.createElement('canvas');
-                c = S.captureCanvas;
-                c.width = sz; c.height = sz;
-                ctx = c.getContext('2d', { willReadFrequently: true });
-                if (!ctx) return Promise.resolve(null);
-            }
-            ctx.drawImage(vid, rx, ry, sz, sz, 0, 0, sz, sz);
+            var rect = _getCaptureRect(vw, vh, S.selCircle);
+            var c = _drawCaptureToCanvas(vid, rect);
+            if (!c) return Promise.resolve(null);
 
             return new Promise(function(resolve) {
                 if (typeof c.toBlob === 'function') {

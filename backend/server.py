@@ -35,10 +35,8 @@ from backend.core.context import SessionRegistry
 from backend.core.data_standards import DataScope, audit_tracker_scope
 from backend.core.fastjson import OrjsonProvider, dumps_bytes
 from backend.core.config_runtime import (
-    apply_runtime_config_updates,
+    apply_runtime_config_command,
     build_config_payload,
-    serialize_config_value,
-    validate_runtime_config_updates,
 )
 from backend.core.recognize_single_fallback import build_hash_ecc_or_hash_fallback_status
 from backend.map_data import (
@@ -165,6 +163,9 @@ _SESSION_ROOM_PREFIX = 'session:'
 _sid_token: dict[str, str] = {}
 _sid_token_lock = threading.Lock()
 _hash_query_lock = threading.Lock()
+_command_listener_started = False
+_command_listener_lock = threading.Lock()
+_CONFIG_HTTP_READONLY_ERROR = '出于安全与稳定性考虑，后端配置仅允许在服务端后台通过指令热更新，或直接修改 config.py。'
 
 
 def _normalize_session_token(token) -> str:
@@ -243,6 +244,15 @@ def _get_sid_token(sid: str) -> str:
 _bcast_rooms: dict[str, dict] = {}
 _bcast_lock = threading.Lock()
 _BCAST_MIN_INTERVAL = 0.10          # 10 fps 硬上限（10fps 已足够观看）
+
+
+def _sleep_for_broadcast_flush(delay: float) -> None:
+    """展示流冲刷延时：优先使用 SocketIO 的协作式 sleep，失败时回退到 time.sleep。"""
+    delay = max(0.0, float(delay))
+    try:
+        socketio.sleep(delay)
+    except Exception:
+        time.sleep(delay)
 
 
 def _make_status_json(tracker_obj: MapTrackerWeb) -> bytes:
@@ -716,27 +726,71 @@ def api_categories():
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def api_config_runtime():
-    """读取/更新后端配置。只开放热更新安全子集，其他配置只读展示。"""
+    """读取后端配置（前端只读）。"""
     if request.method == 'GET':
         return jsonify(build_config_payload())
 
-    data = request.get_json(silent=True) or {}
-    updates = data.get('updates') if isinstance(data, dict) else None
-    if not isinstance(updates, dict) or not updates:
-        return jsonify({'success': False, 'error': 'updates 必须是非空对象'}), 400
+    return jsonify({
+        'success': False,
+        'error': _CONFIG_HTTP_READONLY_ERROR,
+    }), 403
 
-    approved, rejected = validate_runtime_config_updates(updates)
-    if approved:
-        apply_runtime_config_updates(approved, _session_registry)
 
-    payload = build_config_payload()
-    payload.update({
-        'success': not rejected,
-        'partial': bool(approved and rejected),
-        'applied': {key: serialize_config_value(value) for key, value in approved.items()},
-        'rejected': rejected,
-    })
-    return jsonify(payload), (200 if not rejected else 400)
+def _run_server_command_listener():
+    """服务端后台命令监听：仅允许在服务器控制台输入配置热更新指令。"""
+    print('[config-cmd] 已启用服务端后台配置指令。输入 help 查看用法。')
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except Exception as exc:
+            print(f'[config-cmd] 读取命令失败: {exc}')
+            return
+
+        if line == '':
+            # stdin 关闭/不可用，结束监听线程
+            print('[config-cmd] stdin 不可用，已停止命令监听。')
+            return
+
+        command = line.strip()
+        if not command:
+            continue
+
+        if command.lower() in ('quit', 'exit'):
+            print('[config-cmd] 已忽略 quit/exit（不会停止服务）。')
+            continue
+
+        result = apply_runtime_config_command(command, _session_registry)
+        if result.get('success'):
+            applied = result.get('applied') or {}
+            if applied:
+                print(f"[config-cmd] 已应用: {applied}")
+            else:
+                msg = result.get('message') or '执行成功'
+                print(f"[config-cmd] {msg}")
+            rejected = result.get('rejected') or {}
+            if rejected:
+                print(f"[config-cmd] 已拒绝: {rejected}")
+        else:
+            print(f"[config-cmd] 失败: {result.get('error', result)}")
+
+
+def _start_server_command_listener_if_possible():
+    global _command_listener_started
+    with _command_listener_lock:
+        if _command_listener_started:
+            return
+        stdin_obj = getattr(sys, 'stdin', None)
+        if stdin_obj is None or not hasattr(stdin_obj, 'readline'):
+            print('[config-cmd] 未检测到可读 stdin，跳过后台命令监听。')
+            _command_listener_started = True
+            return
+        t = threading.Thread(
+            target=_run_server_command_listener,
+            daemon=True,
+            name='config-command-listener',
+        )
+        t.start()
+        _command_listener_started = True
 
 
 @app.route('/api/result')
@@ -1034,6 +1088,7 @@ def ws_bcast_frame(raw_bytes):
     """
     if not raw_bytes:
         return
+    frame_bytes = bytes(raw_bytes)
     # 找出该 sid 对应的房间
     with _bcast_lock:
         room_name = None
@@ -1048,7 +1103,7 @@ def ws_bcast_frame(raw_bytes):
 
         now = time.monotonic()
         if now - room['last_ts'] < _BCAST_MIN_INTERVAL:
-            room['last_frame'] = bytes(raw_bytes)  # 暂存最新帧
+            room['last_frame'] = frame_bytes  # 暂存最新帧
             # 若尚无冲刷任务在路上，调度一个在间隔结束后补发
             if not room.get('flush_scheduled'):
                 room['flush_scheduled'] = True
@@ -1077,13 +1132,15 @@ def ws_bcast_frame(raw_bytes):
                             if rv:
                                 rv['viewers'] -= dead
 
-                socketio.start_background_task(lambda d=delay, f=_flush: (
-                    __import__('time').sleep(d), f()
-                ))
+                def _delayed_flush(d=delay, f=_flush):
+                    _sleep_for_broadcast_flush(d)
+                    f()
+
+                socketio.start_background_task(_delayed_flush)
             return
 
         room['last_ts'] = now
-        room['last_frame'] = bytes(raw_bytes)
+        room['last_frame'] = frame_bytes
         room['flush_scheduled'] = False
         viewers = list(room['viewers'])
 
@@ -1094,7 +1151,7 @@ def ws_bcast_frame(raw_bytes):
     dead = set()
     for vsid in viewers:
         try:
-            socketio.emit('broadcast_frame', {'name': room_name, 'frame': raw_bytes}, to=vsid)
+            socketio.emit('broadcast_frame', {'name': room_name, 'frame': frame_bytes}, to=vsid)
         except Exception:
             dead.add(vsid)
 
@@ -1127,6 +1184,7 @@ def main():
     print(f"  SocketIO async_mode: {_SOCKETIO_ASYNC_MODE}")
     print(f"  SocketIO allow_upgrades: {_SOCKETIO_ALLOW_UPGRADES}")
     _log_socketio_runtime_diagnostics()
+    _start_server_command_listener_if_possible()
     print("  \u6253\u5f00\u6d4f\u89c8\u5668\u8bbf\u95ee: http://0.0.0.0:" + str(config.PORT))
     print("  WebSocket: ws://0.0.0.0:" + str(config.PORT) + "/socket.io/?transport=websocket")
     print("=" * 50)

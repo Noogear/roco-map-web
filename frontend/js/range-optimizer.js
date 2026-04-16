@@ -20,6 +20,15 @@
 
 'use strict';
 
+import {
+    buildDistMatrix,
+    findStartIndex,
+    greedyTSP,
+    totalCost,
+    twoOpt,
+    pruneTeleports
+} from './route-core.js';
+
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    §1  几何工具函数
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
@@ -27,6 +36,11 @@
 function euclidean(a, b) {
     var dx = a.x - b.x, dy = a.y - b.y;
     return Math.sqrt(dx * dx + dy * dy);
+}
+
+function distSquared(ax, ay, bx, by) {
+    var dx = ax - bx, dy = ay - by;
+    return dx * dx + dy * dy;
 }
 
 /**
@@ -75,8 +89,8 @@ function findChebyshevCenter(circles, tol) {
     // 快速配对可行性检查：任意一对不交叉则整体无解（必要条件）
     for (var i = 0; i < n; i++) {
         for (var j = i + 1; j < n; j++) {
-            var d = euclidean(circles[i], circles[j]);
-            if (d > circles[i].radius + circles[j].radius + tol) return null;
+            var maxR = circles[i].radius + circles[j].radius + tol;
+            if (distSquared(circles[i].x, circles[i].y, circles[j].x, circles[j].y) > maxR * maxR) return null;
         }
     }
 
@@ -121,7 +135,7 @@ function findChebyshevCenter(circles, tol) {
         var minSlack = Infinity;
         for (var ci = 0; ci < n; ci++) {
             var c = circles[ci];
-            var d = euclidean({ x: px, y: py }, c);
+            var d = Math.sqrt(distSquared(px, py, c.x, c.y));
             var slack = c.radius - d;
             if (slack < minSlack) minSlack = slack;
         }
@@ -157,8 +171,8 @@ function buildClusters(resources) {
     for (var i = 0; i < n; i++) {
         adj.push(new Array(n).fill(false));
         for (var j = 0; j < i; j++) {
-            var d = euclidean(resources[i], resources[j]);
-            var overlap = d < resources[i].radius + resources[j].radius;
+            var rr = resources[i].radius + resources[j].radius;
+            var overlap = distSquared(resources[i].x, resources[i].y, resources[j].x, resources[j].y) < rr * rr;
             adj[i][j] = adj[j][i] = overlap;
         }
     }
@@ -344,105 +358,6 @@ function buildRangeOptimizedWaypoints(waypoints) {
         virtualResourceCount: virtN,
         savingsPercent: origN > 0 ? Math.round((origN - virtN) / origN * 100) : 0,
     };
-}
-
-
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   §4  TSP 工具（内联，避免循环依赖）
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-function buildDistMatrix(points, tpCost) {
-    var n = points.length;
-    var D = new Array(n);
-    for (var i = 0; i < n; i++) {
-        D[i] = new Array(n);
-        for (var j = 0; j < n; j++) {
-            if (i === j) { D[i][j] = 0; continue; }
-            D[i][j] = (points[i].isTeleport && points[j].isTeleport)
-                ? tpCost
-                : euclidean(points[i], points[j]);
-        }
-    }
-    return D;
-}
-
-function findStartIndex(points) {
-    var tpIdxs = [];
-    var resIdxs = [];
-    points.forEach(function (p, i) {
-        if (p.isTeleport) tpIdxs.push(i); else resIdxs.push(i);
-    });
-    if (!tpIdxs.length) return 0;
-    if (!resIdxs.length) return tpIdxs[0];
-    var cx = 0, cy = 0;
-    resIdxs.forEach(function (i) { cx += points[i].x; cy += points[i].y; });
-    cx /= resIdxs.length; cy /= resIdxs.length;
-    var best = tpIdxs[0], bestD = Infinity;
-    tpIdxs.forEach(function (i) {
-        var d = euclidean(points[i], { x: cx, y: cy });
-        if (d < bestD) { bestD = d; best = i; }
-    });
-    return best;
-}
-
-function greedyTSP(D, startIdx, fixedEndIdx) {
-    var n = D.length;
-    var visited = new Array(n).fill(false);
-    if (fixedEndIdx != null) visited[fixedEndIdx] = true;
-    var order = [startIdx]; visited[startIdx] = true;
-    for (var step = 1; step < n - (fixedEndIdx != null ? 1 : 0); step++) {
-        var last = order[order.length - 1], bestJ = -1, bestDv = Infinity;
-        for (var j = 0; j < n; j++) {
-            if (!visited[j] && D[last][j] < bestDv) { bestDv = D[last][j]; bestJ = j; }
-        }
-        if (bestJ === -1) break;
-        order.push(bestJ); visited[bestJ] = true;
-    }
-    if (fixedEndIdx != null) order.push(fixedEndIdx);
-    return order;
-}
-
-function totalCost(order, D) {
-    var s = 0;
-    for (var i = 0; i < order.length - 1; i++) s += D[order[i]][order[i + 1]];
-    return s;
-}
-
-function twoOpt(order, D, maxIter, fixBoundaries) {
-    var improved = true, iter = 0;
-    var jMax = fixBoundaries ? order.length - 2 : order.length - 1;
-    if (order.length > 200) maxIter = Math.min(maxIter, 20);
-    if (order.length > 500) maxIter = Math.min(maxIter, 2);
-    while (improved && iter < maxIter) {
-        improved = false; iter++;
-        for (var i = 1; i < jMax; i++) {
-            for (var j = i + 1; j <= jMax; j++) {
-                var nj = (j + 1 < order.length) ? order[j + 1] : -1;
-                var oldD = D[order[i - 1]][order[i]] + (nj >= 0 ? D[order[j]][nj] : 0);
-                var newD = D[order[i - 1]][order[j]] + (nj >= 0 ? D[order[i]][nj] : 0);
-                if (newD < oldD - 0.01) {
-                    var l = i, r = j;
-                    while (l < r) { var t = order[l]; order[l] = order[r]; order[r] = t; l++; r--; }
-                    improved = true;
-                }
-            }
-        }
-    }
-    return order;
-}
-
-function pruneTeleports(order, points, D) {
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (var i = 1; i < order.length - 1; i++) {
-            if (!points[order[i]].isTeleport) continue;
-            if (D[order[i - 1]][order[i + 1]] <= D[order[i - 1]][order[i]] + D[order[i]][order[i + 1]] + 0.01) {
-                order.splice(i, 1); changed = true; break;
-            }
-        }
-    }
-    return order;
 }
 
 
