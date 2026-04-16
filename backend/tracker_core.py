@@ -372,6 +372,24 @@ class MapTrackerWeb:
         self.sift_engine.resume_after_scene_change()
         self._scene_change_streak = 0   # 重置连续失帧计数
         minimap_bgr = extracted  # 提取的圆内区域，与之前引擎输入格式一致
+
+        # 解冻后：用冻结前后小地图 MAD 判断是否发生传送
+        # 若 MAD 超阈值（画面截然不同），说明场景已切换到新地点，丢弃旧坐标恢复提示，走全局重定位
+        _frozen_gray = self.sift_engine._frozen_minimap_gray
+        if _frozen_gray is not None:
+            self.sift_engine._frozen_minimap_gray = None  # 单次消费
+            _cur_gray = cv2.cvtColor(extracted, cv2.COLOR_BGR2GRAY)
+            _sz = min(64, _frozen_gray.shape[0], _frozen_gray.shape[1],
+                      _cur_gray.shape[0], _cur_gray.shape[1])
+            _sz = max(_sz, 16)
+            _ref = cv2.resize(_frozen_gray, (_sz, _sz), interpolation=cv2.INTER_AREA)
+            _cur = cv2.resize(_cur_gray, (_sz, _sz), interpolation=cv2.INTER_AREA)
+            _mad = float(np.mean(np.abs(_ref.astype(np.int16) - _cur.astype(np.int16))))
+            _tp_mad_thresh = float(getattr(config, 'FREEZE_RESUME_TELEPORT_MAD', 42.0))
+            if _mad > _tp_mad_thresh:
+                # 判定为传送：废弃旧坐标提示，强制全局重定位
+                self.sift_engine._pending_freeze_resume_hint = None
+                print(f'[解冻传送判定] MAD={_mad:.1f} > {_tp_mad_thresh} → 丢弃旧坐标提示，全局重定位')
         engine_snapshot = self.sift_engine.snapshot_tracking_state()
 
         result = self.sift_engine.match(minimap_bgr)

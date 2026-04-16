@@ -340,6 +340,13 @@ class SIFTMapTracker:
         self._frozen_local_kp = None
         self._frozen_local_flann = None
         self._pending_freeze_resume_hint = None
+        self._frozen_minimap_gray: np.ndarray | None = None  # 冻结时保存的最后一帧小地图灰度，用于解冻时传送判断
+
+        # 低纹理弱来源重定位防飘：对 phase/hash/ecc 的大跳点做连续确认
+        self._weak_relocate_cand_x: int | None = None
+        self._weak_relocate_cand_y: int | None = None
+        self._weak_relocate_cand_src: str = ''
+        self._weak_relocate_cand_streak: int = 0
 
 
     # ---- 状态冻结 / 恢复 ----
@@ -350,6 +357,10 @@ class SIFTMapTracker:
         self._pending_freeze_resume_hint = None
         self._frozen_last_x = self.last_x
         self._frozen_last_y = self.last_y
+        # 保存冻结前最后一帧小地图灰度（LK reset 前），用于解冻时判断是否发生了传送
+        self._frozen_minimap_gray = (
+            self._lk.prev_gray.copy() if self._lk.prev_gray is not None else None
+        )
         self._frozen_local_kp = None
         self._frozen_local_flann = None
         if self.using_local:
@@ -365,6 +376,10 @@ class SIFTMapTracker:
         self.last_y = None
         self._switch_to_global()
         self._nearby_flann_cache.clear()
+        self._weak_relocate_cand_x = None
+        self._weak_relocate_cand_y = None
+        self._weak_relocate_cand_src = ''
+        self._weak_relocate_cand_streak = 0
 
     def _thaw_state(self):
         if not self._frozen:
@@ -388,6 +403,10 @@ class SIFTMapTracker:
         self.local_fail_count = 0
         self._watchdog_consecutive_ok = 0
         self._watchdog_static_streak = 0
+        self._weak_relocate_cand_x = None
+        self._weak_relocate_cand_y = None
+        self._weak_relocate_cand_src = ''
+        self._weak_relocate_cand_streak = 0
 
         # thaw 后首帧不要复用冻结前的 LK 帧缓存，也不要保留旧 nearby cache。
         self._lk.reset()
@@ -681,6 +700,10 @@ class SIFTMapTracker:
             self._watchdog_triggered = False
             self._force_global_revalidate = False
             self._bridge.reset()
+            self._weak_relocate_cand_x = None
+            self._weak_relocate_cand_y = None
+            self._weak_relocate_cand_src = ''
+            self._weak_relocate_cand_streak = 0
             
             # === 清空缓存 ===
             self._nearby_flann_cache.clear()
@@ -742,6 +765,10 @@ class SIFTMapTracker:
             self._watchdog_cooldown,
             int(getattr(config, 'WATCHDOG_TRIGGER_COOLDOWN', 24)),
         )
+        self._weak_relocate_cand_x = None
+        self._weak_relocate_cand_y = None
+        self._weak_relocate_cand_src = ''
+        self._weak_relocate_cand_streak = 0
         print(f"[看门狗] {reason} → 进入 {self._watchdog_cooldown} 帧冷却")
 
     def _resolve_local_revalidation(self, local_match, global_match, tp_far_candidate):
@@ -816,6 +843,103 @@ class SIFTMapTracker:
             'source': source,
             '_watchdog_triggered': _watchdog_triggered,
         }
+
+    def _apply_weak_relocate_guard(
+        self,
+        found: bool,
+        center_x: int | None,
+        center_y: int | None,
+        match_quality: float,
+        source: str,
+        low_texture_like: bool,
+        lk_result,
+    ) -> tuple[bool, int | None, int | None, float, str]:
+        """低纹理场景下，对弱来源的大跳点做连续确认，抑制单帧误跳乱飘。"""
+        if not bool(getattr(config, 'WEAK_RELOCATE_GUARD_ENABLED', True)):
+            return found, center_x, center_y, match_quality, source
+
+        if (not found or center_x is None or center_y is None
+                or self.last_x is None or self.last_y is None):
+            self._weak_relocate_cand_x = None
+            self._weak_relocate_cand_y = None
+            self._weak_relocate_cand_src = ''
+            self._weak_relocate_cand_streak = 0
+            return found, center_x, center_y, match_quality, source
+
+        weak_sources = {'PHASE_CORRELATE', 'PHASE_CORRELATE_SAT', 'HASH_INDEX', 'ECC', 'SIFT_NEARBY', 'SIFT_SAT'}
+        if source not in weak_sources:
+            self._weak_relocate_cand_x = None
+            self._weak_relocate_cand_y = None
+            self._weak_relocate_cand_src = ''
+            self._weak_relocate_cand_streak = 0
+            return found, center_x, center_y, match_quality, source
+
+        # 仅对低纹理/纯色块段启用（其他场景保持原有响应速度）
+        if not low_texture_like:
+            return found, center_x, center_y, match_quality, source
+
+        jump = abs(center_x - self.last_x) + abs(center_y - self.last_y)
+        jump_thresh = int(getattr(config, 'WEAK_RELOCATE_GUARD_JUMP', 120))
+        if jump < jump_thresh:
+            self._weak_relocate_cand_x = None
+            self._weak_relocate_cand_y = None
+            self._weak_relocate_cand_src = ''
+            self._weak_relocate_cand_streak = 0
+            return found, center_x, center_y, match_quality, source
+
+        radius = int(getattr(config, 'WEAK_RELOCATE_GUARD_RADIUS', 90))
+        need_frames = int(getattr(config, 'WEAK_RELOCATE_GUARD_FRAMES', 2))
+        if bool(getattr(config, 'WEAK_RELOCATE_GUARD_ADAPTIVE', True)):
+            lk_conf = float(lk_result[2]) if lk_result is not None else 0.0
+            conf_floor = float(getattr(config, 'WEAK_RELOCATE_GUARD_CONF_FLOOR', 0.35))
+            conf_floor = max(0.05, min(0.95, conf_floor))
+
+            # conf_norm: 0(低可信) -> 1(高可信)
+            if lk_conf <= conf_floor:
+                conf_norm = 0.0
+            else:
+                conf_norm = max(0.0, min(1.0, (lk_conf - conf_floor) / max(1.0 - conf_floor, 1e-6)))
+
+            jump_s_min = float(getattr(config, 'WEAK_RELOCATE_GUARD_JUMP_SCALE_MIN', 0.70))
+            jump_s_max = float(getattr(config, 'WEAK_RELOCATE_GUARD_JUMP_SCALE_MAX', 1.25))
+            radius_s_min = float(getattr(config, 'WEAK_RELOCATE_GUARD_RADIUS_SCALE_MIN', 0.70))
+            radius_s_max = float(getattr(config, 'WEAK_RELOCATE_GUARD_RADIUS_SCALE_MAX', 1.20))
+            jump_scale = jump_s_min + (jump_s_max - jump_s_min) * conf_norm
+            radius_scale = radius_s_min + (radius_s_max - radius_s_min) * conf_norm
+
+            jump_thresh = int(round(jump_thresh * jump_scale))
+            radius = int(round(radius * radius_scale))
+
+            # 低可信时增加确认帧；phase 系来源再额外加严一档
+            frames_max = int(getattr(config, 'WEAK_RELOCATE_GUARD_FRAMES_MAX', 3))
+            if conf_norm < 0.35:
+                need_frames = min(need_frames + 1, frames_max)
+            if source in {'PHASE_CORRELATE', 'PHASE_CORRELATE_SAT'} and conf_norm < 0.5:
+                need_frames = min(need_frames + 1, frames_max)
+
+            jump_thresh = max(40, jump_thresh)
+            radius = max(30, radius)
+
+        if (self._weak_relocate_cand_x is not None
+                and self._weak_relocate_cand_src == source
+                and abs(center_x - self._weak_relocate_cand_x) + abs(center_y - self._weak_relocate_cand_y) <= radius):
+            self._weak_relocate_cand_streak += 1
+        else:
+            self._weak_relocate_cand_x = center_x
+            self._weak_relocate_cand_y = center_y
+            self._weak_relocate_cand_src = source
+            self._weak_relocate_cand_streak = 1
+
+        if self._weak_relocate_cand_streak < need_frames:
+            # 第一跳只记候选，不立即采信；让状态机走 inertial/后续重试，避免乱飘
+            return False, None, None, 0.0, ''
+
+        # 连续命中确认后才放行，并清候选
+        self._weak_relocate_cand_x = None
+        self._weak_relocate_cand_y = None
+        self._weak_relocate_cand_src = ''
+        self._weak_relocate_cand_streak = 0
+        return found, center_x, center_y, match_quality, source
 
     def _collect_bridge_observations(
         self,
@@ -1391,6 +1515,11 @@ class SIFTMapTracker:
             match_quality, source,
             lk_result,
             frame_cfg=frame_cfg,
+        )
+
+        # 低纹理弱来源重定位防飘：抑制 phase/hash/ecc 单帧误跳
+        found, center_x, center_y, match_quality, source = self._apply_weak_relocate_guard(
+            found, center_x, center_y, match_quality, source, low_texture_like, lk_result
         )
 
         # 更新 LK 上一帧（不论用哪层跟踪，都更新灰度图）
