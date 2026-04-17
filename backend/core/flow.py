@@ -28,7 +28,7 @@ class LKTracker:
       prev_gray   : 上一帧灰度图
       prev_pts    : 上一帧跟踪点 (N,1,2)
       map_scale   : 当前小地图→大地图的像素比例
-      frame_num   : 已处理帧计数（供外部决定是否运行 SIFT）
+    frame_num   : 已处理帧计数（供外部决定是否运行特征匹配）
       
     动态间隔调度：
       - 基于场景和最近 LK 质量
@@ -83,7 +83,7 @@ class LKTracker:
 
     def get_dynamic_feature_interval(self, scene: str = 'mixed') -> int:
         """
-        基于场景动态计算 SIFT 间隔。
+        基于场景动态计算特征匹配间隔。
         高纹理（urban）延长到 8，低纹理（ocean/grassland/snow）加密到 3。
         """
         if self._force_feature_on_next:
@@ -93,12 +93,12 @@ class LKTracker:
         if scene in ('ocean', 'grassland', 'snow'):
             return 3  # 低纹理加密采样
         elif scene == 'urban':
-            return 8  # 高纹理延长间隔
+            return 12  # 高纹理延长间隔
         else:
             return self.feature_every  # mixed 保持默认
 
-    def should_run_sift(self, scene: str = 'mixed') -> bool:
-        """判断是否应运行 SIFT，基于动态间隔。"""
+    def should_run_feature(self, scene: str = 'mixed') -> bool:
+        """判断是否应运行特征匹配，基于动态间隔。"""
         interval = self.get_dynamic_feature_interval(scene)
         return self.frame_num % interval == 0
 

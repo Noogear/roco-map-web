@@ -313,7 +313,7 @@ const TrackerCore = (() => {
         formatStatus(status) {
             var text = '--', cls = 'green', label = '';
             var found = !!status.found;
-            if (status.mode === 'sift') {
+            if (status.mode === 'orb') {
                 if (status.state === 'SCENE_CHANGE') {
                     text = '切场'; cls = 'yellow'; label = '场景切换';
                 } else if (!found) {
@@ -321,7 +321,7 @@ const TrackerCore = (() => {
                 } else if (status.state === 'INERTIAL') {
                     text = '惯性'; cls = 'yellow'; label = '惯性导航';
                 } else {
-                    text = '正常'; cls = 'green'; label = 'SIFT追踪';
+                    text = '正常'; cls = 'green'; label = 'ORB追踪';
                 }
             } else {
                 if (status.state === 'GLOBAL_SCAN') {
@@ -356,7 +356,7 @@ const TrackerCore = (() => {
 
             if (me && status.mode) {
                 me.textContent = status.mode.toUpperCase();
-                me.style.color = status.mode === 'sift' ? '#ffa726' : '#00d4ff';
+                me.style.color = status.mode === 'orb' ? '#ffa726' : '#00d4ff';
             }
             if (xe && status.position) xe.textContent = status.position.x;
             if (ye && status.position) ye.textContent = status.position.y;

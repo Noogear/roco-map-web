@@ -39,8 +39,9 @@ class CoordSmoother:
         self._kalman_initialized: bool = False
 
         # 3. 渲染 EMA
-        self._display_x: int | None = None
-        self._display_y: int | None = None
+        # 使用 float 保存内部渲染坐标，避免小位移在 int 截断下长期卡住不更新。
+        self._display_x: float | None = None
+        self._display_y: float | None = None
 
         # 传送检测候选缓冲
         self._tp_candidate_buffer: deque[tuple[int, int]] = deque(maxlen=10)
@@ -168,8 +169,8 @@ class CoordSmoother:
         """传送确认后立即重置所有过滤器到新位置。"""
         self.pos_history.clear()
         self._kalman_reset(x, y)
-        self._display_x = x
-        self._display_y = y
+        self._display_x = float(x)
+        self._display_y = float(y)
         self._tp_candidate_buffer.clear()
         # 重置惯性帧计数，新传送位置重新建立基线
         self._inertial_frame_count = 0
@@ -277,28 +278,30 @@ class CoordSmoother:
         ema_fast_dist = getattr(config, 'RENDER_EMA_FAST_DIST', 45)
 
         if arrow_stopped and not is_inertial:
-            still_threshold = getattr(config, 'RENDER_STOPPED_STILL_THRESHOLD', 10)
+            # 历史默认值 10 在慢速移动时会造成“坐标几秒不动”的体感。
+            # 未显式配置时，默认与 RENDER_STILL_THRESHOLD 一致，避免隐式加大死区。
+            still_threshold = getattr(config, 'RENDER_STOPPED_STILL_THRESHOLD', still_threshold)
 
         if self._display_x is None:
-            self._display_x = smooth_x
-            self._display_y = smooth_y
+            self._display_x = float(smooth_x)
+            self._display_y = float(smooth_y)
             return smooth_x, smooth_y
 
         # 惯性帧 + TP 候选积累中：冻结渲染坐标，防止速度外推漂向错误方向
         if is_inertial and self._tp_candidate_buffer:
-            return self._display_x, self._display_y
+            return int(round(self._display_x)), int(round(self._display_y))
 
         ddx = smooth_x - self._display_x
         ddy = smooth_y - self._display_y
         dist = math.sqrt(ddx * ddx + ddy * ddy)
 
         if not is_inertial and dist <= still_threshold:
-            return self._display_x, self._display_y
+            return int(round(self._display_x)), int(round(self._display_y))
 
         t = max(0.0, min(1.0, (dist - ema_slow_dist) / max(ema_fast_dist - ema_slow_dist, 1)))
         alpha = ema_alpha_min + t * (ema_alpha_max - ema_alpha_min)
-        self._display_x = int(self._display_x + alpha * ddx)
-        self._display_y = int(self._display_y + alpha * ddy)
-        return self._display_x, self._display_y
+        self._display_x = float(self._display_x + alpha * ddx)
+        self._display_y = float(self._display_y + alpha * ddy)
+        return int(round(self._display_x)), int(round(self._display_y))
 
 

@@ -34,7 +34,7 @@ class ArrowDirectionSystem:
         ema_alpha: float = 0.35,
         stop_speed_px: float = 6.0,
         stop_debounce: int = 20,
-        small_change_threshold: float = 12.0,  # 兼容旧参数名
+        small_change_threshold: float = 12.0,
         big_change_threshold: float = 90.0,
     ) -> None:
         self._history: deque[tuple[int, int]] = deque(maxlen=history_size)

@@ -134,7 +134,7 @@ class MapHashIndex:
         self._hashes = np.array(hash_list, dtype=np.uint64)
         self._means = np.array(mean_list, dtype=np.float32)
 
-        print(f'✅ 哈希索引构建完成: {len(self._xs)} 条目')
+        print(f'[OK] 哈希索引构建完成: {len(self._xs)} 条目')
 
         if cache:
             os.makedirs(os.path.dirname(cache), exist_ok=True)

@@ -64,10 +64,10 @@ def audit_tracker_scope(tracker_obj) -> None:
 
 GLOBAL_SHARED_CONTRACTS: tuple[DataContract, ...] = (
     DataContract(
-        name='SharedSIFTResources',
+        name='SharedFeatureResources',
         scope=DataScope.GLOBAL_SHARED,
         mutable=False,
-        description='大地图 SIFT 特征、全局 FLANN、Hash 索引，只读共享。',
+        description='大地图 ORB 特征、全局 FLANN、Hash 索引，只读共享。',
     ),
     DataContract(
         name='MapDataStore',

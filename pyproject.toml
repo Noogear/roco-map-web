@@ -31,7 +31,6 @@ ai = [
 
 [project.scripts]
 map-tracker-web  = "run_web:main"
-map-tracker-sift = "run_sift:run"
 map-tracker-build-frontend = "backend.frontend_build:main"
 map-tracker-ai-pipeline = "run_ai_pipeline:main"
 

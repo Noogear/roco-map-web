@@ -51,7 +51,7 @@ class SharedFeatureResources:
         print("正在加载共享特征资源...")
 
         ensure_beblid_runtime()
-        self.sift = create_orb_beblid_feature2d()
+        self.feature_extractor = create_orb_beblid_feature2d()
 
         logic_map_gray = cv2.imread(config.LOGIC_MAP_PATH, cv2.IMREAD_GRAYSCALE)
         if logic_map_gray is None:
@@ -89,7 +89,7 @@ class SharedFeatureResources:
             if _multiscale_enabled:
                 print(f"正在多尺度提取大地图特征点... scales={_extract_scales}, tile={_global_tile_size}")
                 self.kp_big_all, self.des_big_all = extract_map_features_multiscale(
-                    logic_map_enhanced, self.sift, _extract_scales,
+                    logic_map_enhanced, self.feature_extractor, _extract_scales,
                     tile_size=_global_tile_size,
                     overlap=_global_tile_overlap,
                     max_features_per_tile=_global_tile_feature_cap,
@@ -97,7 +97,7 @@ class SharedFeatureResources:
             else:
                 print(f"正在分块提取大地图特征点... (tile={_global_tile_size}, overlap={_global_tile_overlap})")
                 self.kp_big_all, self.des_big_all = extract_map_features_tiled(
-                    logic_map_enhanced, self.sift,
+                    logic_map_enhanced, self.feature_extractor,
                     tile_size=_global_tile_size,
                     overlap=_global_tile_overlap,
                     max_features_per_tile=_global_tile_feature_cap,
@@ -119,16 +119,17 @@ class SharedFeatureResources:
 
         self.kp_coords = np.array([kp.pt for kp in self.kp_big_all], dtype=np.float32)
 
-        print("正在构建全局 FLANN 索引...")
-        self.flann_global = create_flann(self.des_big_all)
-        self.flann_global_lsh = None
-        if bool(getattr(config, 'MATCHER_GLOBAL_USE_LSH', True)):
-            try:
-                _lsh_checks = int(getattr(config, 'MATCHER_LSH_CHECKS', 50))
-                self.flann_global_lsh = create_flann_lsh(self.des_big_all, checks=_lsh_checks)
-                print("[OK] 已构建全局 FLANN-LSH 索引")
-            except Exception as _e:
-                print(f"[WARN] FLANN-LSH 构建失败，回退 BF: {_e}")
+        # ── 全局匹配器：优先 FLANN-LSH（近似最近邻，O(log N)），回退 BF-Hamming ──
+        # BF-Hamming 在 300K+ 特征池上耗时 2-8 秒/帧，是识别延迟和卡顿的主要根因。
+        # FLANN-LSH 将同等匹配降至 ~10-50ms，且 ratio test + RANSAC 可有效补偿近似误差。
+        _lsh_checks = int(getattr(config, 'MATCHER_LSH_CHECKS', 50))
+        print(f"正在构建全局 FLANN-LSH 索引（{len(self.kp_big_all)} 个特征点）...")
+        try:
+            self.flann_global = create_flann_lsh(self.des_big_all, checks=_lsh_checks)
+            print("[OK] 全局匹配器: FLANN-LSH")
+        except Exception as _e:
+            print(f"[WARN] FLANN-LSH 构建失败，回退 BF-Hamming: {_e}")
+            self.flann_global = create_flann(self.des_big_all)
 
         # 哈希索引：用于全局丢失、冻结恢复后的快速粗定位
         self._hash_index = MapHashIndex(
@@ -177,7 +178,10 @@ class SharedFeatureResources:
                     self.kp_big_sat = _kp_sat
                     self.des_big_sat = _des_sat
                     self.kp_coords_sat = np.array([kp.pt for kp in _kp_sat], dtype=np.float32)
-                    self.flann_global_sat = create_flann(_des_sat)
+                    try:
+                        self.flann_global_sat = create_flann_lsh(_des_sat, checks=_lsh_checks)
+                    except Exception:
+                        self.flann_global_sat = create_flann(_des_sat)
                     print(f"[OK] 从缓存加载 S 通道特征点: {len(_kp_sat)} 个")
                 else:
                     # 分块提取 ORB 特征，缩小每块 tile 特征数限制内存峰值
@@ -185,7 +189,7 @@ class SharedFeatureResources:
                     _sat_cap = getattr(config, 'SAT_ORB_MAX_FEATURES_PER_TILE', 600)
                     print(f"  S通道分块提取... (tile={_sat_tile_size}, cap/tile={_sat_cap})")
                     _kp_sat, _des_sat = extract_map_features_tiled(
-                        _map_sat_clahe, self.sift,
+                        _map_sat_clahe, self.feature_extractor,
                         tile_size=_sat_tile_size,
                         overlap=_global_tile_overlap,
                         max_features_per_tile=_sat_cap,
@@ -194,7 +198,10 @@ class SharedFeatureResources:
                         self.kp_big_sat = _kp_sat
                         self.des_big_sat = _des_sat
                         self.kp_coords_sat = np.array([kp.pt for kp in _kp_sat], dtype=np.float32)
-                        self.flann_global_sat = create_flann(_des_sat)
+                        try:
+                            self.flann_global_sat = create_flann_lsh(_des_sat, checks=_lsh_checks)
+                        except Exception:
+                            self.flann_global_sat = create_flann(_des_sat)
                         print(f"[OK] S通道特征点: {len(_kp_sat)} 个")
                         if _cache_enabled:
                             try:
@@ -279,12 +286,12 @@ def classify_scene(texture_std: float) -> str:
 
 
 class FeatureMapTracker:
-    """SIFT 传统特征匹配引擎（per-session 实例，共享只读资源）"""
+    """ORB 传统特征匹配引擎（per-session 实例，共享只读资源）"""
 
     def __init__(self, shared: SharedFeatureResources):
         bind_scope(self, DataScope.SESSION_SCOPED)
         # 引用共享只读资源
-        self.sift = shared.sift
+        self.feature_extractor = shared.feature_extractor
         self._logic_map_gray = shared._logic_map_gray
         self._logic_map_gray_clahe = shared._logic_map_gray_clahe
         self.map_height = shared.map_height
@@ -293,7 +300,6 @@ class FeatureMapTracker:
         self.des_big_all = shared.des_big_all
         self.kp_coords = shared.kp_coords
         self.flann_global = shared.flann_global
-        self.flann_global_lsh = getattr(shared, 'flann_global_lsh', None)
         self._hash_index = shared._hash_index
 
         # S 通道辅助资源（只读共享，低纹理/海洋场景）
@@ -354,7 +360,7 @@ class FeatureMapTracker:
             min_conf=getattr(config, 'LK_MIN_CONFIDENCE', 0.5),
             mask_cache=self._mask_cache,
         )
-        self._lk.map_scale = 4.0   # 初始比例，SIFT 匹配成功后更新
+        self._lk.map_scale = 4.0   # 初始比例，特征匹配成功后更新
 
         # ECC 局部像素对齐兜底
         self._ecc_enabled = getattr(config, 'ECC_ENABLED', True)
@@ -363,7 +369,7 @@ class FeatureMapTracker:
 
         self._relocalize_cd = 0   # 粗定位冷却帧数
 
-        # 看门狗：LK 累积位移 vs SIFT 结果一致性，连续不一致时强制解锁死锁状态
+        # 看门狗：LK 累积位移 vs 特征匹配结果一致性，连续不一致时强制解锁死锁状态
         self._watchdog_accum_dx: float = 0.0
         self._watchdog_accum_dy: float = 0.0
         self._watchdog_suspect_streak: int = 0
@@ -394,7 +400,7 @@ class FeatureMapTracker:
         self.lost_frames = 0
         self._watchdog_triggered = False
 
-        # INERTIAL 坐标锁定检测：SIFT 连续失败时若画面仍在变化，提前退出惯性保持以免坐标卡死
+        # INERTIAL 坐标锁定检测：特征匹配连续失败时若画面仍在变化，提前退出惯性保持以免坐标卡死
         self._inertial_entry_gray: np.ndarray | None = None
         self._inertial_failed_feature_count: int = 0
 
@@ -512,7 +518,7 @@ class FeatureMapTracker:
     def _try_nearby_match_stack(self, kp_mini, des_mini, minimap_gray, hint_x, hint_y,
                                 radius, allow_ecc=True, source_prefix='',
                                 minimap_center: tuple[float, float] | None = None):
-        """复用的附近搜索链：SIFT nearby → 可选 ECC → Template Matching兜底。"""
+        """复用的附近搜索链：ORB nearby → 可选 ECC → Template Matching兜底。"""
         nearby_kp, nearby_des, nearby_flann = self._get_or_build_nearby_flann(hint_x, hint_y, radius)
         if nearby_flann is not None:
             result = match_region(
@@ -864,7 +870,7 @@ class FeatureMapTracker:
                 tp_far_candidate = (gx, gy, gquality)
             return None, tp_far_candidate, True
 
-        revalidated_source = 'SIFT_GLOBAL_REVALIDATED' if str(_source).startswith('SIFT_') else 'ORB_GLOBAL_REVALIDATED'
+        revalidated_source = 'ORB_GLOBAL_REVALIDATED'
         return (gx, gy, ginliers, gquality, gscale, revalidated_source), tp_far_candidate, True
 
     def _maybe_revalidate_local_match(self, kp_mini, des_mini, mm_shape,
@@ -873,13 +879,15 @@ class FeatureMapTracker:
                                       low_texture_like: bool = False,
                                       minimap_center: tuple[float, float] | None = None):
         tx, ty, inlier_count, quality, avg_scale, source = local_match
-        self._local_success_streak += 1
+        # 高质量匹配不计入周期性重验证倒计时
+        if quality < 0.8:
+            self._local_success_streak += 1
         need_validate = (
             self._force_global_revalidate
             or quality < self._local_revalidate_min_quality
             or self._local_success_streak >= self._local_revalidate_interval
         )
-        # _force_global_revalidate 超过 3 个 SIFT 周期未消费则自动过期
+        # _force_global_revalidate 超过 3 个特征匹配周期未消费则自动过期
         if self._force_global_revalidate:
             _max_stale = self._lk.feature_every * 3
             if self._lk.frame_num - self._force_global_revalidate_frame > _max_stale:
@@ -893,44 +901,27 @@ class FeatureMapTracker:
 
         self._force_global_revalidate = False
         self._local_success_streak = 0
-        _frame_cfg = frame_cfg or {}
-        _use_lsh = (
-            bool(_frame_cfg.get('matcher_policy_enable', False))
-            and bool(_frame_cfg.get('matcher_global_use_lsh', False))
-            and (not low_texture_like)
-            and self.flann_global_lsh is not None
-            and len(kp_mini) >= int(_frame_cfg.get('matcher_lsh_min_kp', 120))
-        )
-        _use_gms = (
-            bool(_frame_cfg.get('matcher_policy_enable', False))
-            and bool(_frame_cfg.get('matcher_gms_enable', False))
-            and (not low_texture_like)
-            and len(kp_mini) >= int(_frame_cfg.get('matcher_gms_min_kp', 140))
-        )
+
+        # 使用 nearby FLANN（~600px 半径，~10-15K 特征）代替全局 FLANN-LSH（328K 特征），
+        # 将重验证耗时从 ~3s 降到 ~50ms，同时仍能检测局部匹配的显著偏差。
+        _reval_radius = max(self.NEARBY_SEARCH_RADIUS, self._local_revalidate_diff * 2)
+        nearby_kp, nearby_des, nearby_flann = self._get_or_build_nearby_flann(
+            tx, ty, _reval_radius)
+        if nearby_flann is None:
+            return local_match, tp_far_candidate, False
 
         global_result = match_region(
             kp_mini, des_mini, mm_shape,
-            self.kp_big_all, (self.flann_global_lsh if _use_lsh else self.flann_global), ratio, min_match,
+            nearby_kp, nearby_flann, ratio, min_match,
             self.map_width, self.map_height,
-            minimap_center=minimap_center,
-            use_gms=_use_gms,
-            gms_train_shape=(self.map_height, self.map_width),
-            gms_min_matches=int(_frame_cfg.get('matcher_gms_min_matches', 20)),
-            gms_with_rotation=bool(_frame_cfg.get('matcher_gms_with_rotation', True)),
-            gms_with_scale=bool(_frame_cfg.get('matcher_gms_with_scale', False)))
+            minimap_center=minimap_center)
         if global_result is None:
             return local_match, tp_far_candidate, False
         resolved, tp_far_candidate, blocked = self._resolve_local_revalidation(local_match, global_result, tp_far_candidate)
         if resolved is not None:
             gx, gy, ginliers, gquality, gscale, gsrc = resolved
-            if gsrc in ('ORB_GLOBAL_REVALIDATED', 'SIFT_GLOBAL_REVALIDATED'):
-                tags = []
-                if _use_lsh:
-                    tags.append('LSH')
-                if _use_gms:
-                    tags.append('GMS')
-                if tags and gsrc == 'ORB_GLOBAL_REVALIDATED':
-                    gsrc = 'ORB_GLOBAL_REVALIDATED_' + '_'.join(tags)
+            if gsrc == 'ORB_GLOBAL_REVALIDATED':
+                gsrc = 'ORB_NEARBY_REVALIDATED'
                 resolved = (gx, gy, ginliers, gquality, gscale, gsrc)
         return resolved, tp_far_candidate, blocked
 
@@ -1188,9 +1179,15 @@ class FeatureMapTracker:
             'watchdog_hash_min_matches': int(getattr(config, 'WATCHDOG_HASH_MIN_MATCH_COUNT', 6)),
             'watchdog_hash_check_radius': int(getattr(config, 'WATCHDOG_HASH_CHECK_RADIUS', 320)),
             'watchdog_hash_hamming_margin': int(getattr(config, 'WATCHDOG_HASH_HAMMING_MARGIN', 6)),
-            'watchdog_inertial_min_sift_fails': int(getattr(config, 'WATCHDOG_INERTIAL_MIN_SIFT_FAILS', 3)),
+            'watchdog_inertial_min_feature_fails': int(getattr(config, 'WATCHDOG_INERTIAL_MIN_FEATURE_FAILS', 3)),
             'watchdog_inertial_mad_threshold': float(getattr(config, 'WATCHDOG_INERTIAL_MAD_THRESHOLD', 22.0)),
             'max_lost_frames': int(getattr(config, 'MAX_LOST_FRAMES', 50)),
+            'inertial_max_hold_frames': int(getattr(config, 'INERTIAL_MAX_HOLD_FRAMES', 12)),
+            'inertial_max_hold_frames_low_texture': int(getattr(
+                config,
+                'INERTIAL_MAX_HOLD_FRAMES_LOW_TEXTURE',
+                getattr(config, 'MAX_LOST_FRAMES', 50),
+            )),
             'bridge_hash_candidates': int(getattr(config, 'LOW_TEXTURE_BRIDGE_HASH_CANDIDATES', 4)),
             'bridge_hash_radius': int(getattr(config, 'LOW_TEXTURE_BRIDGE_HASH_RADIUS', 900)),
             # 色彩智能增强开关
@@ -1255,20 +1252,20 @@ class FeatureMapTracker:
 
         # ── 场景优化灰度图（仅 ocean/grassland/snow，~0.2ms）─────────────────
         # 按主色调调整通道权重，使小地图灰度图在该场景下对比度/梯度更丰富，
-        # SIFT 可提取更多高质量特征。minimap_gray_raw 保持标准灰度（供哈希用）。
-        _sift_input_gray = minimap_gray_raw
+        # ORB 可提取更多高质量特征。minimap_gray_raw 保持标准灰度（供哈希用）。
+        _feature_input_gray = minimap_gray_raw
         if frame_cfg['scene_boosted_gray_enabled'] and scene_detail in ('ocean', 'grassland', 'snow'):
             _boosted = make_scene_boosted_gray(minimap_bgr, scene_detail)
             if _boosted is not None:
-                _sift_input_gray = _boosted
+                _feature_input_gray = _boosted
 
         # 自适应 CLAHE + 纹理增强（合并为单次调用，消除双 CLAHE）
-        minimap_gray = enhance_minimap(_sift_input_gray, texture_std,
+        minimap_gray = enhance_minimap(_feature_input_gray, texture_std,
                                        self._clahe_normal, self._clahe_low,
                                        self._low_texture_thresh)
 
         self._lk.frame_num += 1
-        run_sift = self._lk.should_run_sift(scene=scene_detail)
+        run_feature = self._lk.should_run_feature(scene=scene_detail)
 
         if self._watchdog_cooldown > 0:
             self._watchdog_cooldown -= 1
@@ -1276,7 +1273,7 @@ class FeatureMapTracker:
         if self._relocalize_cd > 0:
             self._relocalize_cd -= 1
 
-        _tp_far_candidate = None  # 传送候选：全局 SIFT 匹配成功但超跳变阈值
+        _tp_far_candidate = None  # 传送候选：全局特征匹配成功但超跳变阈值
         _sat_mini_cached: np.ndarray | None = None
 
         def _get_sat_mini_cached() -> np.ndarray:
@@ -1287,7 +1284,7 @@ class FeatureMapTracker:
             return _sat_mini_cached
 
         # ======================================================
-        # 第一层：LK 光流快速跟踪（每帧 ~2ms，跳过部分 SIFT 调用）
+        # 第一层：LK 光流快速跟踪（每帧 ~2ms，跳过部分特征匹配调用）
         # ======================================================
         lk_result = self._lk.track(minimap_gray, self.last_x)
 
@@ -1300,23 +1297,42 @@ class FeatureMapTracker:
             # 更新 LK 置信度用于动态间隔调度
             self._lk.update_lk_confidence(_wconf)
 
-        if lk_result is not None and not run_sift:
+        # 保留 LK 预测位置，用于 ORB 结果的交叉验证
+        _lk_predicted_x: int | None = None
+        _lk_predicted_y: int | None = None
+        _lk_conf_val: float = 0.0
+
+        if lk_result is not None:
             dx_map, dy_map, lk_conf = lk_result
-            if lk_conf >= self._lk.min_conf:
-                tx = int(round(self.last_x + dx_map))
-                ty = int(round(self.last_y + dy_map))
-                if (0 <= tx < self.map_width and 0 <= ty < self.map_height
+            _lk_conf_val = lk_conf
+            if lk_conf >= self._lk.min_conf and self.last_x is not None:
+                _lk_tx = int(round(self.last_x + dx_map))
+                _lk_ty = int(round(self.last_y + dy_map))
+                if (0 <= _lk_tx < self.map_width and 0 <= _lk_ty < self.map_height
                         and abs(dx_map) + abs(dy_map) < self.JUMP_THRESHOLD):
-                    found, center_x, center_y = True, tx, ty
-                    match_quality = lk_conf * 0.7
-                    source = 'LK'
+                    _lk_predicted_x, _lk_predicted_y = _lk_tx, _lk_ty
+                    if not run_feature:
+                        found, center_x, center_y = True, _lk_tx, _lk_ty
+                        match_quality = lk_conf * 0.7
+                        source = 'LK'
 
         # ======================================================
-        # 第二层：SIFT 精确匹配（周期性运行 + LK 失败时触发）
+        # 非特征匹配帧快速路径：LK 失败时保持上一位置，强制下帧重试
+        # 小地图无旋转、固定缩放 → LK-only 帧不需要跑全量搜索级联
+        # ======================================================
+        if not found and not run_feature and self.last_x is not None:
+            self._lk._force_feature_on_next = True
+            found = True
+            center_x, center_y = self.last_x, self.last_y
+            is_inertial = True
+            source = 'LK_HOLD'
+
+        # ======================================================
+        # 第二层：特征精确匹配（周期性运行 + LK 失败时触发）
         # ======================================================
         if not found:
             # 提取特征
-            kp_mini, des_mini = extract_minimap_features(minimap_gray, self.sift, self._mask_cache,
+            kp_mini, des_mini = extract_minimap_features(minimap_gray, self.feature_extractor, self._mask_cache,
                                                            texture_std=texture_std,
                                                            mask_center=minimap_center,
                                                            mask_radius=minimap_radius)
@@ -1324,10 +1340,10 @@ class FeatureMapTracker:
             # 超低/低纹理 + 特征过少 → 更激进的预处理重试
             # 方案A: 扩展到 low_texture（海岸线），不只限于 ocean
             if low_texture_like and (des_mini is None or len(kp_mini) < 15):
-                enhanced = enhance_minimap(_sift_input_gray, 5,
+                enhanced = enhance_minimap(_feature_input_gray, 5,
                                            self._clahe_normal, self._clahe_low,
                                            self._low_texture_thresh)
-                kp_retry, des_retry = extract_minimap_features(enhanced, self.sift, self._mask_cache,
+                kp_retry, des_retry = extract_minimap_features(enhanced, self.feature_extractor, self._mask_cache,
                                                                 texture_std=texture_std,
                                                                 mask_center=minimap_center,
                                                                 mask_radius=minimap_radius)
@@ -1363,7 +1379,7 @@ class FeatureMapTracker:
                         self._last_feature_scale = avg_scale
                         self._lk.map_scale = avg_scale
 
-                # ---- SIFT 第一轮：局部 → 全局回退 ----
+                # ---- 特征第一轮：局部 → 全局回退 ----
                 for search_round in range(2):
                     if found:
                         break
@@ -1371,22 +1387,27 @@ class FeatureMapTracker:
                     if search_round == 0 and self.using_local:
                         current_kp, current_flann = self.kp_local, self.flann_local
                     elif search_round == 0:
+                        # 全局搜索跳过条件：
+                        # (a) 低纹理 + 已知位置 → ORB 在低纹理区几乎无效，直接走 phaseCorrelate
+                        # (b) LK 高置信度 + 无强制重验 → 信任 LK，跳过昂贵全局匹配
+                        if self.last_x is not None and not self._force_global_revalidate:
+                            if low_texture_like:
+                                break
+                            if _lk_predicted_x is not None and _lk_conf_val >= 0.7:
+                                break
                         current_kp, current_flann = self.kp_big_all, self.flann_global
                         _is_global_round = True
                     else:
                         if not self.using_local:
                             break
+                        # 局部失败 → 全局回退的跳过条件（同上）
+                        if self.last_x is not None and not self._force_global_revalidate:
+                            if low_texture_like:
+                                break
+                            if _lk_predicted_x is not None and _lk_conf_val >= 0.7:
+                                break
                         current_kp, current_flann = self.kp_big_all, self.flann_global
                         _is_global_round = True
-
-                    # 全局轮可选使用 FLANN-LSH（高纹理 + 特征点足够），失败时 match_region 自然返回 None
-                    if (_is_global_round
-                            and frame_cfg['matcher_policy_enable']
-                            and frame_cfg['matcher_global_use_lsh']
-                            and (not low_texture_like)
-                            and self.flann_global_lsh is not None
-                            and len(kp_mini) >= frame_cfg['matcher_lsh_min_kp']):
-                        current_flann = self.flann_global_lsh
 
                     _use_gms = (
                         frame_cfg['matcher_policy_enable']
@@ -1411,16 +1432,10 @@ class FeatureMapTracker:
                         tx, ty, inlier_count, quality, avg_scale = result
                         candidate_source = 'ORB_LOCAL' if (search_round == 0 and self.using_local) else 'ORB_GLOBAL'
                         if candidate_source == 'ORB_GLOBAL':
-                            tags = []
-                            if (_is_global_round
-                                    and frame_cfg['matcher_policy_enable']
-                                    and frame_cfg['matcher_global_use_lsh']
-                                    and (current_flann is self.flann_global_lsh)):
-                                tags.append('LSH')
+                            tags = ['LSH']  # flann_global 始终为 FLANN-LSH
                             if _use_gms:
                                 tags.append('GMS')
-                            if tags:
-                                candidate_source = 'ORB_GLOBAL_' + '_'.join(tags)
+                            candidate_source = 'ORB_GLOBAL_' + '_'.join(tags)
                         if self.last_x is not None:
                             max_jump = self.JUMP_THRESHOLD if search_round == 0 else self.JUMP_THRESHOLD * 2
                             if abs(tx - self.last_x) + abs(ty - self.last_y) >= max_jump:
@@ -1440,13 +1455,26 @@ class FeatureMapTracker:
                                 self._local_success_streak = 0
                                 break
                             tx, ty, inlier_count, quality, avg_scale, candidate_source = local_match
+                            # LK-ORB 交叉验证：LK 置信度高时，如果 ORB_LOCAL 偏离 LK 预测过远，
+                            # 优先使用 LK 以避免 ORB 偶发误匹配破坏跟踪连续性。
+                            _LK_ORB_CONSISTENCY_THRESHOLD = 40  # px
+                            if (_lk_predicted_x is not None
+                                    and _lk_conf_val >= 0.6
+                                    and quality < 0.8):
+                                _orb_lk_dist = abs(tx - _lk_predicted_x) + abs(ty - _lk_predicted_y)
+                                if _orb_lk_dist > _LK_ORB_CONSISTENCY_THRESHOLD:
+                                    # ORB 偏离 LK 预测 → 回退 LK
+                                    found, center_x, center_y = True, _lk_predicted_x, _lk_predicted_y
+                                    match_quality = _lk_conf_val * 0.7
+                                    source = 'LK'
+                                    break
                         else:
                             self._local_success_streak = 0
                             self._force_global_revalidate = False
                         match_count = inlier_count
                         found, center_x, center_y, match_quality = True, tx, ty, quality
                         source = candidate_source
-                        # SIFT 成功 → 同步 scale
+                        # 特征匹配成功 → 同步 scale
                         self._last_feature_scale = avg_scale
                         self._lk.map_scale = avg_scale
                         break
@@ -1456,7 +1484,7 @@ class FeatureMapTracker:
                             pass  # 设置 found=True，下面的第二轮附近搜索会被 "if not found" 过滤掉
 
 
-                # ---- SIFT 第二轮：附近搜索（使用 FLANN 缓存）----
+                # ---- 特征第二轮：附近搜索（使用 FLANN 缓存）----
                 if not found and self.last_x is not None and not revalidation_blocked:
                     nr = self.NEARBY_SEARCH_RADIUS
                     nearby_match = self._try_nearby_match_stack(
@@ -1472,8 +1500,17 @@ class FeatureMapTracker:
                         if avg_scale is not None:
                             self._last_feature_scale = avg_scale
                             self._lk.map_scale = avg_scale
+            # ---- Feature Lite: LK 高置信度 → 跳过昂贵级联搜索 ----
+            # ORB/nearby 均失败时，信任 LK 而非花 1-3s 跑 phaseCorrelate/SAT/hash
+            if (not found and _lk_predicted_x is not None
+                    and _lk_conf_val >= 0.7
+                    and not self._force_global_revalidate):
+                found, center_x, center_y = True, _lk_predicted_x, _lk_predicted_y
+                match_quality = _lk_conf_val * 0.7
+                source = 'LK'
+
             # ---- phaseCorrelate：频域互相关（有位置提示时的低纹理/海洋兜底）----
-            # 在 SIFT+ECC 全失败后触发；FFT 全局最优，不受重复纹理/描述子歧义影响
+            # 在特征+ECC 全失败后触发；FFT 全局最优，不受重复纹理/描述子歧义影响
             # 约 1-2ms；需要 last_x/last_y 作为搜索中心
             if (not found and low_texture_like
                     and self.last_x is not None
@@ -1505,12 +1542,12 @@ class FeatureMapTracker:
                         source = 'PHASE_CORRELATE_SAT'
 
             # ---- 方案B: S通道辅助匹配（低纹理/海洋场景最终兜底）----
-            # 灰度 SIFT 全链路失败后才触发，运行时开销 ~3-5ms（含 cvtColor + SIFT）
+            # 灰度特征全链路失败后才触发，运行时开销 ~3-5ms（含 cvtColor + ORB）
             if not found and low_texture_like and self._clahe_sat is not None:
                 _sat_mini = _get_sat_mini_cached()
                 # inner_ratio 固定用 hard 值，排除玩家箭头对 S 通道的干扰
                 kp_sat_mini, des_sat_mini = extract_minimap_features(
-                    _sat_mini, self.sift, self._mask_cache,
+                    _sat_mini, self.feature_extractor, self._mask_cache,
                     texture_std=None, inner_ratio=0.18,
                     mask_center=minimap_center,
                     mask_radius=minimap_radius)
@@ -1536,7 +1573,7 @@ class FeatureMapTracker:
                                 self._last_feature_scale = avg_scale
                                 self._lk.map_scale = avg_scale
 
-                # ---- S通道 ECC 兜底（有位置提示、SAT SIFT 依然失败时）----
+                # ---- S通道 ECC 兜底（有位置提示、SAT 特征链路依然失败时）----
                 # _sat_mini 已在上方计算，直接复用，无额外 cvtColor 开销
                 if not found and self.last_x is not None \
                         and self._logic_map_sat_clahe is not None and self._ecc_enabled:
@@ -1557,7 +1594,7 @@ class FeatureMapTracker:
         _wd_limit = frame_cfg['watchdog_suspect_limit']
         _hash_limit = frame_cfg['watchdog_hash_mismatch_limit']
 
-        if run_sift:
+        if run_feature:
             if self._watchdog_cooldown > 0:
                 # 冷却中，仅保持同步基准
                 if found and not is_inertial and _wd_is_feature_source:
@@ -1575,12 +1612,12 @@ class FeatureMapTracker:
                     self._watchdog_last_feature_y = center_y
                     self._watchdog_anchor_gray = minimap_gray_raw.copy()
                 else:
-                    _sift_moved = abs(center_x - self._watchdog_last_feature_x) + abs(center_y - self._watchdog_last_feature_y)
+                    _feature_moved = abs(center_x - self._watchdog_last_feature_x) + abs(center_y - self._watchdog_last_feature_y)
                     
-                    if _sift_moved < 15:
+                    if _feature_moved < 15:
                         self._watchdog_suspect_streak += 1
                         
-                        # SIFT 连续几帧卡在同一个极小的坐标内
+                        # 特征匹配连续几帧卡在同一个极小的坐标内
                         if self._watchdog_suspect_streak >= _wd_limit:
                             # 终极拷问：既然坐标没变，那游戏小地图内的画面到底动没动？
                             # 提取中心 160x160 区域计算像素平差 (MAD)
@@ -1616,13 +1653,13 @@ class FeatureMapTracker:
 
                             _wd_mad_thresh = frame_cfg['watchdog_mad_threshold']
                             if mad > _wd_mad_thresh:
-                                # 实锤死锁：画面变化极大（玩家在动）但 SIFT 坐标卡死
-                                print(f"[看门狗-死锁确诊] 画面剧烈波动(MAD={mad:.1f}) 但 SIFT 坐标卡死在({center_x},{center_y})!")
+                                # 实锤死锁：画面变化极大（玩家在动）但识别坐标卡死
+                                print(f"[看门狗-死锁确诊] 画面剧烈波动(MAD={mad:.1f}) 但识别坐标卡死在({center_x},{center_y})!")
                                 self._trigger_watchdog_unlock('基于全图真差的死锁确诊强制解绑')
                                 found = False
                                 self._watchdog_suspect_streak = 0
                             else:
-                                # 玩家真正挂机静止：MAD 极低，证明此时不需要移动，SIFT 卡着是对的
+                                # 玩家真正挂机静止：MAD 极低，证明此时不需要移动，坐标保持是合理的
                                 self._watchdog_static_streak += 1
                                 _wd_static_limit = frame_cfg['watchdog_static_limit']
                                 if self._watchdog_static_streak >= _wd_static_limit:
@@ -1648,7 +1685,7 @@ class FeatureMapTracker:
                     _hash_min_matches = frame_cfg['watchdog_hash_min_matches']
                     
                     if match_quality >= _hash_min_quality and match_count >= _hash_min_matches:
-                        if _sift_moved >= 15 or self._watchdog_suspect_streak == 0:
+                        if _feature_moved >= 15 or self._watchdog_suspect_streak == 0:
                             _hash_radius = frame_cfg['watchdog_hash_check_radius']
                             _hash_margin = frame_cfg['watchdog_hash_hamming_margin']
                             consistent, best_dist, _ = self._hash_index.check_consistency_details(
@@ -1714,6 +1751,19 @@ class FeatureMapTracker:
             found, center_x, center_y, match_quality, source, low_texture_like, lk_result
         )
 
+        # ── 特征帧 LK 兜底：特征周期帧全链路失败但 LK 光流跟踪成功时，
+        # 使用 LK 结果而非直接进入 INERTIAL 静止保持，避免玩家移动时画面卡冻。
+        if not found and run_feature and lk_result is not None and self.last_x is not None:
+            _lb_dx, _lb_dy, _lb_conf = lk_result
+            if _lb_conf >= self._lk.min_conf:
+                _lb_tx = int(round(self.last_x + _lb_dx))
+                _lb_ty = int(round(self.last_y + _lb_dy))
+                if (0 <= _lb_tx < self.map_width and 0 <= _lb_ty < self.map_height
+                        and abs(_lb_dx) + abs(_lb_dy) < self.JUMP_THRESHOLD):
+                    found, center_x, center_y = True, _lb_tx, _lb_ty
+                    match_quality = _lb_conf * 0.7
+                    source = 'LK'
+
         # 更新 LK 上一帧（不论用哪层跟踪，都更新灰度图）
         self._lk.prev_gray = minimap_gray.copy()
         if found and not is_inertial:
@@ -1746,17 +1796,33 @@ class FeatureMapTracker:
                     self._switch_to_global()
                     self._nearby_flann_cache.clear()  # 切全局时清缓存
             if self.last_x is not None and self.lost_frames <= frame_cfg['max_lost_frames']:
+                # 限制惯性坐标保持时长：避免识别连续失败时旧坐标“卡住几秒不动”。
+                _inertial_hold_cap_default = max(1, int(frame_cfg.get('inertial_max_hold_frames', 12)))
+                _inertial_hold_cap_lowtex = max(1, int(
+                    frame_cfg.get('inertial_max_hold_frames_low_texture', frame_cfg['max_lost_frames'])
+                ))
+                _inertial_hold_cap = _inertial_hold_cap_lowtex if low_texture_like else _inertial_hold_cap_default
+                if self.lost_frames > _inertial_hold_cap:
+                    self.last_x = self.last_y = None
+                    self._lk.prev_gray = None
+                    self._lk.prev_pts = None
+                    self._bridge.reset()
+                    if self.using_local:
+                        self._switch_to_global()
+                        self._nearby_flann_cache.clear()
+
+            if self.last_x is not None and self.lost_frames <= frame_cfg['max_lost_frames']:
                 # ── INERTIAL 坐标锁定检测 ──────────────────────────────────────────────
-                # 非低纹理场景：SIFT 若连续失败且画面已明显变化，则提前退出 INERTIAL
+                # 非低纹理场景：特征匹配若连续失败且画面已明显变化，则提前退出 INERTIAL
                 # 防止"坐标卡死但系统以为还在原地"的死坐标锁定问题
                 if self.lost_frames == 1:
                     # 首次进入 INERTIAL：记录入场基准帧，用于后续帧差检测
                     self._inertial_entry_gray = minimap_gray_raw.copy()
                     self._inertial_failed_feature_count = 0
-                elif run_sift and not low_texture_like:
-                    # 非低纹理场景每次 SIFT 运行时累计失败次数，并检查画面是否变化
+                elif run_feature and not low_texture_like:
+                    # 非低纹理场景每次特征匹配运行时累计失败次数，并检查画面是否变化
                     self._inertial_failed_feature_count += 1
-                    _iner_min = frame_cfg['watchdog_inertial_min_sift_fails']
+                    _iner_min = frame_cfg['watchdog_inertial_min_feature_fails']
                     _iner_thresh = frame_cfg['watchdog_inertial_mad_threshold']
                     if self._inertial_failed_feature_count >= _iner_min and self._inertial_entry_gray is not None:
                         _h_i, _w_i = minimap_gray_raw.shape[:2]
@@ -1780,8 +1846,10 @@ class FeatureMapTracker:
                                         _roi_old_i[_y1o_i:_y1o_i+_ch2_i, _x1o_i:_x1o_i+_cw2_i]
                                     )))
                                     if _iner_mad > _iner_thresh:
-                                        print(f"[锁定-INERTIAL漂移] SIFT连续失败{self._inertial_failed_feature_count}次, "
-                                              f"画面MAD={_iner_mad:.1f}>{_iner_thresh}, 提前退出INERTIAL")
+                                        print(
+                                            f"[锁定-INERTIAL漂移] 特征匹配连续失败{self._inertial_failed_feature_count}次, "
+                                            f"画面MAD={_iner_mad:.1f}>{_iner_thresh}, 提前退出INERTIAL"
+                                        )
                                         self.last_x = self.last_y = None
                                         self._lk.prev_gray = None
                                         self._lk.prev_pts = None

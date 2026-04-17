@@ -47,7 +47,7 @@ class _StaticFlannLSHMatcher:
         return self._flann.knnMatch(query, k=k)
 
 
-class ORBBeblidFeature2D:
+class OrbBeblidExtractor:
     """组合特征算子：ORB 提取关键点 + BEBLID 计算描述子。"""
 
     def __init__(self) -> None:
@@ -95,8 +95,8 @@ def ensure_beblid_runtime() -> None:
         )
 
 
-def create_orb_beblid_feature2d() -> ORBBeblidFeature2D:
-    return ORBBeblidFeature2D()
+def create_orb_beblid_feature2d() -> OrbBeblidExtractor:
+    return OrbBeblidExtractor()
 
 
 # ---------------------------------------------------------------------------
@@ -176,11 +176,11 @@ class CircularMaskCache:
 
 
 # ---------------------------------------------------------------------------
-# 匹配器工厂（兼容旧接口名 create_flann）
+# 匹配器工厂
 # ---------------------------------------------------------------------------
 
 def create_flann(descriptors: np.ndarray):
-    """兼容旧函数名：二进制描述子走 BF-Hamming，浮点描述子走 FLANN(KDTree)。"""
+    """二进制描述子走 BF-Hamming，浮点描述子走 FLANN(KDTree)。"""
     des = np.asarray(descriptors)
     if np.issubdtype(des.dtype, np.floating):
         des = np.asarray(des, dtype=np.float32)
@@ -206,7 +206,7 @@ def create_flann_lsh(descriptors: np.ndarray, *, checks: int = 50):
 
 def extract_minimap_features(
     minimap_gray: np.ndarray,
-    sift,
+    extractor,
     mask_cache: CircularMaskCache,
     *,
     texture_std: float | None = None,
@@ -241,7 +241,7 @@ def extract_minimap_features(
         radius=mask_radius,
     )
 
-    kp, des = sift.detectAndCompute(minimap_gray, mask)
+    kp, des = extractor.detectAndCompute(minimap_gray, mask)
     if des is None or len(kp) < 2:
         return None, None
     return kp, np.asarray(des)
@@ -249,14 +249,14 @@ def extract_minimap_features(
 
 def extract_map_features_tiled(
     map_gray: np.ndarray,
-    sift,
+    extractor,
     *,
     tile_size: int,
     overlap: int = 0,
     max_features_per_tile: int = 0,
 ) -> tuple[list, np.ndarray | None]:
     """
-    以分块方式提取整张大地图的 SIFT 特征，降低 detectAndCompute 的峰值内存。
+    以分块方式提取整张大地图的 ORB+BEBLID 特征，降低 detectAndCompute 的峰值内存。
 
     overlap 用于覆盖 tile 边界附近的特征；通过“归属区域”裁剪避免重复保留。
     """
@@ -280,7 +280,7 @@ def extract_map_features_tiled(
             own_right = x1 if x1 == w else x1 - half_overlap
 
             tile = map_gray[y0:y1, x0:x1]
-            kp_tile, des_tile = sift.detectAndCompute(tile, None)
+            kp_tile, des_tile = extractor.detectAndCompute(tile, None)
             if des_tile is None or not kp_tile:
                 continue
 
@@ -394,6 +394,11 @@ def match_region(
     if len(good) < min_match:
         return None
 
+    # Top-K 匹配质量过滤：按描述子距离排序取前 K 个最佳匹配，降低噪声匹配
+    _top_k = int(getattr(config, 'FEATURE_MATCH_TOP_K', 100))
+    if _top_k > 0 and len(good) > _top_k:
+        good = sorted(good, key=lambda m: m.distance)[:_top_k]
+
     src_pts = np.float32([kp_mini[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
     dst_pts = np.float32([region_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
     M, inliers = cv2.estimateAffinePartial2D(
@@ -448,9 +453,17 @@ def _compute_feature_fingerprint(
         file_info = f"{stat.st_size}:{int(stat.st_mtime * 1000)}"
     except OSError:
         file_info = "?"
+    fast_th = int(getattr(config, 'ORB_BEBLID_FAST_THRESHOLD', 6))
+    edge_th = int(getattr(config, 'ORB_BEBLID_EDGE_THRESHOLD', 15))
+    grid_enabled = bool(getattr(config, 'FEATURE_GRID_ENABLED', False))
+    grid_fast = int(getattr(config, 'FEATURE_GRID_FAST_THRESHOLD', 2)) if grid_enabled else 0
+    grid_cell = int(getattr(config, 'FEATURE_GRID_CELL_SIZE', 96)) if grid_enabled else 0
+    grid_per = int(getattr(config, 'FEATURE_GRID_FEATURES_PER_CELL', 30)) if grid_enabled else 0
+    grid_min = int(getattr(config, 'FEATURE_GRID_MIN_TILE_FEATURES', 500)) if grid_enabled else 0
     params = (
         f"scales={sorted(scales)}|tile={tile_size}|overlap={overlap}"
-        f"|nf={nfeatures}|bits={n_bits}"
+        f"|nf={nfeatures}|bits={n_bits}|fast={fast_th}|edge={edge_th}"
+        f"|grid={grid_enabled}|gcell={grid_cell}|gfast={grid_fast}|gper={grid_per}|gmin={grid_min}"
     )
     return hashlib.md5(f"{file_info}|{params}".encode()).hexdigest()[:16]
 
@@ -512,7 +525,7 @@ def load_features_npz(
 
 def extract_map_features_multiscale(
     map_gray: np.ndarray,
-    sift,
+    extractor,
     scales: list[float],
     *,
     tile_size: int,
@@ -522,45 +535,182 @@ def extract_map_features_multiscale(
     """
     多尺度分块特征提取：在多个缩放倍率下提取，坐标归一化回原图坐标系后合并。
 
-    相比单尺度，能有效应对游戏视角缩放（小地图 FOV 变化）时的匹配率下降问题。
-    scales 为空时等价于单尺度 extract_map_features_tiled。
+    当 FEATURE_GRID_ENABLED=True 时，采用混合模式：
+    标准 tiled 提取为主 → 检测低密度 tile → 自动用网格均匀提取补充。
     """
     if not scales:
-        return extract_map_features_tiled(
-            map_gray, sift, tile_size=tile_size, overlap=overlap,
+        kp, des = extract_map_features_tiled(
+            map_gray, extractor, tile_size=tile_size, overlap=overlap,
             max_features_per_tile=max_features_per_tile)
+    else:
+        h0, w0 = map_gray.shape[:2]
+        all_kp: list = []
+        all_des_chunks: list[np.ndarray] = []
 
-    h0, w0 = map_gray.shape[:2]
-    all_kp: list = []
-    all_des_chunks: list[np.ndarray] = []
+        for s in scales:
+            if abs(s - 1.0) < 1e-6:
+                layer = map_gray
+            else:
+                nw = max(16, int(round(w0 * s)))
+                nh = max(16, int(round(h0 * s)))
+                layer = cv2.resize(map_gray, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-    for s in scales:
-        if abs(s - 1.0) < 1e-6:
-            layer = map_gray
+            kp_s, des_s = extract_map_features_tiled(
+                layer, extractor,
+                tile_size=tile_size,
+                overlap=overlap,
+                max_features_per_tile=max_features_per_tile,
+            )
+            if des_s is None or not kp_s:
+                continue
+
+            if abs(s - 1.0) >= 1e-6:
+                for kp_item in kp_s:
+                    kp_item.pt = (kp_item.pt[0] / s, kp_item.pt[1] / s)
+
+            all_kp.extend(kp_s)
+            all_des_chunks.append(des_s)
+
+        if not all_des_chunks:
+            kp, des = [], None
         else:
-            nw = max(16, int(round(w0 * s)))
-            nh = max(16, int(round(h0 * s)))
-            layer = cv2.resize(map_gray, (nw, nh), interpolation=cv2.INTER_LINEAR)
+            kp, des = all_kp, np.vstack(all_des_chunks)
 
-        kp_s, des_s = extract_map_features_tiled(
-            layer, sift,
-            tile_size=tile_size,
-            overlap=overlap,
-            max_features_per_tile=max_features_per_tile,
-        )
-        if des_s is None or not kp_s:
-            continue
+    # 混合模式：对标准提取中特征稀疏的 tile 进行网格补充
+    _grid_enabled = getattr(config, 'FEATURE_GRID_ENABLED', False)
+    if _grid_enabled and kp and des is not None:
+        grid_kp, grid_des = _supplement_sparse_tiles_with_grid(
+            map_gray, extractor, kp,
+            tile_size=tile_size, overlap=overlap)
+        if grid_kp and grid_des is not None:
+            kp.extend(grid_kp)
+            des = np.vstack([des, grid_des])
 
-        # 坐标归一化：缩放坐标 → 原图坐标系
-        if abs(s - 1.0) >= 1e-6:
-            for kp in kp_s:
-                kp.pt = (kp.pt[0] / s, kp.pt[1] / s)
+    return kp, des
 
-        all_kp.extend(kp_s)
-        all_des_chunks.append(des_s)
 
-    if not all_des_chunks:
+def _supplement_sparse_tiles_with_grid(
+    map_gray: np.ndarray,
+    extractor,
+    existing_kp: list,
+    *,
+    tile_size: int,
+    overlap: int = 0,
+) -> tuple[list, np.ndarray | None]:
+    """
+    混合模式的核心：仅对特征密度不足的 tile 做网格均匀补充。
+
+    1. 统计每个 tile 已有的标准特征数量
+    2. 对特征数 < FEATURE_GRID_MIN_TILE_FEATURES 的 tile 执行网格提取
+    3. 返回补充特征（不包含已有特征）
+    """
+    min_tile_features = int(getattr(config, 'FEATURE_GRID_MIN_TILE_FEATURES', 500))
+    cell_size = int(getattr(config, 'FEATURE_GRID_CELL_SIZE', 96))
+    per_cell = int(getattr(config, 'FEATURE_GRID_FEATURES_PER_CELL', 30))
+    fast_th = int(getattr(config, 'FEATURE_GRID_FAST_THRESHOLD', 2))
+    edge_th = int(getattr(config, 'FEATURE_GRID_EDGE_THRESHOLD', 1))
+
+    h, w = map_gray.shape[:2]
+    tile_size = max(256, int(tile_size))
+    overlap = max(0, min(int(overlap), tile_size // 2))
+    step = max(1, tile_size - overlap)
+    half_overlap = overlap // 2
+
+    # 构建 tile 网格信息
+    tiles_info: list[tuple[int, int, int, int, int, int, int, int]] = []
+    for y0 in range(0, h, step):
+        y1 = min(h, y0 + tile_size)
+        own_top = y0 if y0 == 0 else y0 + half_overlap
+        own_bottom = y1 if y1 == h else y1 - half_overlap
+        for x0 in range(0, w, step):
+            x1 = min(w, x0 + tile_size)
+            own_left = x0 if x0 == 0 else x0 + half_overlap
+            own_right = x1 if x1 == w else x1 - half_overlap
+            tiles_info.append((x0, y0, x1, y1, own_left, own_top, own_right, own_bottom))
+
+    # 统计每个 tile 归属区域内已有的特征点数量
+    tile_counts = [0] * len(tiles_info)
+    for kp in existing_kp:
+        px, py = kp.pt
+        for ti, (_, _, _, _, ol, ot, or_, ob) in enumerate(tiles_info):
+            if ol <= px < or_ and ot <= py < ob:
+                tile_counts[ti] += 1
+                break
+
+    # 收集需要补充的 tile 索引
+    sparse_tiles = [i for i, c in enumerate(tile_counts) if c < min_tile_features]
+    if not sparse_tiles:
         return [], None
 
-    return all_kp, np.vstack(all_des_chunks)
+    # 创建低阈值 ORB（仅用于关键点检测）
+    grid_orb = cv2.ORB_create(
+        nfeatures=per_cell,
+        scaleFactor=1.2,
+        nlevels=8,
+        edgeThreshold=edge_th,
+        fastThreshold=fast_th,
+    )
+    beblid = extractor._beblid
+
+    all_keypoints: list = []
+    descriptor_chunks: list[np.ndarray] = []
+
+    for ti in sparse_tiles:
+        x0, y0, x1, y1, own_left, own_top, own_right, own_bottom = tiles_info[ti]
+        tile = map_gray[y0:y1, x0:x1]
+        th, tw = tile.shape[:2]
+
+        # 子格检测
+        tile_kps: list[cv2.KeyPoint] = []
+        for cy in range(0, th, cell_size):
+            cy_end = min(th, cy + cell_size)
+            if cy_end - cy < 16:
+                continue
+            for cx in range(0, tw, cell_size):
+                cx_end = min(tw, cx + cell_size)
+                if cx_end - cx < 16:
+                    continue
+                cell = tile[cy:cy_end, cx:cx_end]
+                kps_cell = grid_orb.detect(cell, None)
+                for kp in kps_cell:
+                    kp.pt = (kp.pt[0] + cx, kp.pt[1] + cy)
+                    tile_kps.append(kp)
+
+        if not tile_kps:
+            continue
+
+        # BEBLID 描述子
+        tile_kps_out, des_tile = beblid.compute(tile, tile_kps)
+        if des_tile is None or len(tile_kps_out) == 0:
+            continue
+
+        # 归属区域过滤 + 全局坐标偏移
+        kept_indices: list[int] = []
+        for idx, kp in enumerate(tile_kps_out):
+            gx = kp.pt[0] + x0
+            gy = kp.pt[1] + y0
+            if own_left <= gx < own_right and own_top <= gy < own_bottom:
+                kept_indices.append(idx)
+
+        if not kept_indices:
+            continue
+
+        des_kept = np.asarray(des_tile[kept_indices], dtype=np.uint8)
+        descriptor_chunks.append(des_kept)
+
+        for idx in kept_indices:
+            kp = tile_kps_out[idx]
+            gx = kp.pt[0] + x0
+            gy = kp.pt[1] + y0
+            all_keypoints.append(cv2.KeyPoint(
+                x=float(gx), y=float(gy),
+                size=kp.size, angle=kp.angle,
+                response=kp.response, octave=kp.octave,
+                class_id=kp.class_id,
+            ))
+
+    if not descriptor_chunks:
+        return [], None
+
+    return all_keypoints, np.vstack(descriptor_chunks)
 

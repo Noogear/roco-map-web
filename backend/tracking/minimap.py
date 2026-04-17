@@ -194,7 +194,7 @@ def detect_and_extract_with_meta(
     Args:
         square_bgr  : 原始方形截取帧（BGR）
         calibrator  : 圆校准实例（有状态，外部持有）
-        engine_frozen: 当前 SIFT 引擎是否处于冻结状态
+        engine_frozen: 当前特征引擎是否处于冻结状态
 
     Returns:
         包含小地图图像、真实圆心相对坐标和半径的裁剪结果；失败返回 None。
@@ -261,12 +261,3 @@ def detect_and_extract_with_meta(
 
     return _extract_circle_crop(square_bgr, int(det_cx), int(det_cy), int(det_r))
 
-
-def detect_and_extract(
-    square_bgr: np.ndarray,
-    calibrator: CircleCalibrator,
-    engine_frozen: bool,
-) -> np.ndarray | None:
-    """兼容旧接口：仅返回小地图图像。"""
-    extracted = detect_and_extract_with_meta(square_bgr, calibrator, engine_frozen)
-    return None if extracted is None else extracted.image

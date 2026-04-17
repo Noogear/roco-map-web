@@ -837,7 +837,7 @@ const prefs = AppCommon.loadPrefs();
         }
 
         function isGlobalFeatureSource(src) {
-            return src.indexOf('SIFT_GLOBAL_') === 0 || src.indexOf('ORB_GLOBAL_') === 0;
+            return src.indexOf('ORB_GLOBAL_') === 0;
         }
 
         function getStatusScore(st) {
@@ -866,7 +866,7 @@ const prefs = AppCommon.loadPrefs();
                 return q >= 0.35;
             }
 
-            // 全局特征主路径（SIFT/ORB）：放宽但保持可信门槛
+            // 全局特征主路径（ORB）：放宽但保持可信门槛
             if (isGlobalFeatureSource(src)) {
                 return (m >= 8 && q >= 0.20) || (m >= 20 && q >= 0.12) || q >= 0.55;
             }
@@ -947,7 +947,7 @@ const prefs = AppCommon.loadPrefs();
                             position: { x: 0, y: 0 },
                             matches: Number(only.matches || 0),
                             match_quality: Number(only.match_quality || 0),
-                            mode: 'sift',
+                            mode: 'orb',
                             source: only.source || ''
                         }
                     };

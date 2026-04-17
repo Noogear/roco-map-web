@@ -175,20 +175,20 @@ _SCENE_GRAY_WEIGHTS: dict[str, tuple[float, float, float]] = {
 
 def make_scene_boosted_gray(bgr: np.ndarray, scene_detail: str) -> np.ndarray | None:
     """
-    按场景类型生成色彩优化灰度图，最大化该场景下 SIFT 特征数量。
+    按场景类型生成色彩优化灰度图，最大化该场景下 ORB 特征数量。
 
     仅对 ocean / grassland / snow 三种场景做优化；其余返回 None，
     调用方退回到标准 cv2.BGR2GRAY 路径。
 
     海洋
-        B 通道权重提至 0.50，岸线轮廓在灰度图中对比更强，SIFT 可提取
+        B 通道权重提至 0.50，岸线轮廓在灰度图中对比更强，ORB 可提取
         到更多描述岸线走向的特征点。
     草原
         G 通道权重提至 0.70，草地 vs 细小道路/石块的亮度差被放大，
         低纹理草原中的稀疏路径能产生更多可重复匹配的特征。
     雪地
         标准灰度转换后做 5%~95% 百分位拉伸，将雪地中的微弱纹理（
-        坡度阴影、融雪水迹）拉伸至全动态范围，供 SIFT 抓取。
+        坡度阴影、融雪水迹）拉伸至全动态范围，供 ORB 抓取。
 
     Returns
     -------

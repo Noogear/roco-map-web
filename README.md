@@ -104,16 +104,12 @@ SOCKETIO_ASYNC_MODE=gevent gunicorn -w 4 --threads 2 -k geventwebsocket.gunicorn
 # 启动 Web 后端（默认入口）
 python run_web.py
 
-# 启动识别模式入口
-python run_sift.py
-
 # 仅执行前端预构建（不启动服务）
 python -m backend.frontend_build
 
 # 安装后可用脚本入口
 map-tracker-build-frontend
 map-tracker-web
-map-tracker-sift
 ```
 
 ### 后端运行时调参命令（服务端控制台）

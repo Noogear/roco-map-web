@@ -31,12 +31,7 @@ from flask import Flask, jsonify, redirect, request, send_file, send_from_direct
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_compress import Compress
 from backend.tracker_core import MapTrackerWeb
-try:
-    # 新版特征引擎入口
-    from backend.tracker_engines import get_shared_feature
-except ImportError:
-    # 兼容测试替身/旧实现：仅暴露 get_shared_sift 的场景
-    from backend.tracker_engines import get_shared_sift as get_shared_feature
+from backend.tracker_engines import get_shared_feature
 from backend.core.context import SessionRegistry
 from backend.core.data_standards import DataScope, audit_tracker_scope
 from backend.core.fastjson import OrjsonProvider, dumps_bytes
@@ -91,10 +86,10 @@ else:
     print('[frontend-build] 未检测到可用 active 构建产物，静态资源将回退到 frontend/ 源码目录。')
 
 
-# 固定使用 SIFT 引擎
+# 固定使用 ORB 引擎
 
 # OpenCV 内部线程数配置：
-#   单进程部署（python main_web.py）→ 让 OpenCV 使用全部核心做 SIFT 内部并行（默认行为）
+#   单进程部署（python main_web.py）→ 让 OpenCV 使用全部核心做特征匹配内部并行（默认行为）
 #   多进程部署（gunicorn -w N）→ 每个 worker 设为 cpu_count//N，避免线程过多竞争
 #   可通过环境变量 CV2_NUM_THREADS 覆盖，例如: CV2_NUM_THREADS=4 python main_web.py cpu
 _cv2_threads = int(os.environ.get('CV2_NUM_THREADS', 0))  # 0 = OpenCV 自动选择
@@ -306,7 +301,7 @@ def _make_status_json(tracker_obj: MapTrackerWeb) -> bytes:
 
 def _on_result_ready(token: str, tracker_obj: MapTrackerWeb):
     """
-    Plan A 推送回调：sift-worker 处理完帧后立即调用，主动推送新结果。
+    Plan A 推送回调：feature-worker 处理完帧后立即调用，主动推送新结果。
     比 pull 模式（等下一帧 ws_receive_frame）延迟低 ~80ms。
 
     JPEG 模式：由 _jpeg_mgr.push_result() 负责节流决策，定向推送 result/coords。
@@ -435,7 +430,7 @@ def _decode_images_from_request(max_count: int = 8) -> list[np.ndarray]:
 @app.route('/api/upload_minimap', methods=['POST'])
 def upload_minimap():
     """接收前端上传的小地图图片（支持 FormData 和 JSON base64 两种格式）。
-    同步处理并返回结果，不唤醒后台 SIFT 工作线程。"""
+    同步处理并返回结果，不唤醒后台特征工作线程。"""
     tracker_obj = _get_tracker_for_http_request()
     img = _decode_image_from_request()
 
@@ -455,7 +450,7 @@ def upload_minimap():
 
 @app.route('/api/recognize_single', methods=['POST'])
 def recognize_single():
-    """无状态单次识别：直接做全局 SIFT 匹配，不操作/不依赖共享 tracker 状态。
+    """无状态单次识别：直接做全局 ORB 匹配，不操作/不依赖共享 tracker 状态。
     适用于上传截图测试场景。"""
     from backend.core.features import extract_minimap_features, match_region, CircularMaskCache
     from backend.core.enhance import (
@@ -543,20 +538,20 @@ def recognize_single():
         or texture_std < float(getattr(config, 'LOW_TEXTURE_LIKE_STD_THRESHOLD', 40.0))
     )
 
-    sift_input = gray_raw
+    feature_input = gray_raw
     if bool(getattr(config, 'SCENE_BOOSTED_GRAY_ENABLED', True)) and scene_detail in ('ocean', 'grassland', 'snow'):
         boosted = make_scene_boosted_gray(img, scene_detail)
         if boosted is not None:
-            sift_input = boosted
+            feature_input = boosted
 
     clahe_normal, clahe_low = make_clahe_pair()
     low_thresh = getattr(config, 'CLAHE_LOW_TEXTURE_THRESHOLD', 30)
-    gray = enhance_minimap(sift_input, texture_std, clahe_normal, clahe_low, low_thresh)
+    gray = enhance_minimap(feature_input, texture_std, clahe_normal, clahe_low, low_thresh)
 
     # 3. 提取小地图特征点
     mask_cache = CircularMaskCache()
     kp_mini, des_mini = extract_minimap_features(
-        gray, shared.sift, mask_cache,
+        gray, shared.feature_extractor, mask_cache,
         texture_std=texture_std,
         mask_center=minimap_center,
         mask_radius=minimap_radius,
@@ -567,23 +562,16 @@ def recognize_single():
             'status': {
                 'state': 'NO_FEATURES', 'found': False,
                 'position': {'x': 0, 'y': 0}, 'matches': 0,
-                'match_quality': 0, 'mode': 'sift',
+                'match_quality': 0, 'mode': 'orb',
             }
         })
 
     hash_index = getattr(shared, '_hash_index', None)
 
-    # 4. 全局匹配（与主链策略保持一致：高纹理可选 LSH/GMS）
+    # 4. 全局匹配（flann_global 始终为 FLANN-LSH）
     match_ratio = getattr(config, 'FEATURE_MATCH_RATIO', 0.82)
     min_match = getattr(config, 'FEATURE_MIN_MATCH_COUNT', 5)
 
-    use_lsh = (
-        bool(getattr(config, 'MATCHER_POLICY_ENABLE', True))
-        and bool(getattr(config, 'MATCHER_GLOBAL_USE_LSH', True))
-        and (not low_texture_like)
-        and (getattr(shared, 'flann_global_lsh', None) is not None)
-        and len(kp_mini) >= int(getattr(config, 'MATCHER_LSH_MIN_KP', 120))
-    )
     use_gms = (
         bool(getattr(config, 'MATCHER_POLICY_ENABLE', True))
         and bool(getattr(config, 'MATCHER_GMS_ENABLE', True))
@@ -591,10 +579,9 @@ def recognize_single():
         and len(kp_mini) >= int(getattr(config, 'MATCHER_GMS_MIN_KP', 140))
     )
 
-    global_matcher = shared.flann_global_lsh if use_lsh else shared.flann_global
     result = match_region(
         kp_mini, des_mini, gray.shape,
-        shared.kp_big_all, global_matcher,
+        shared.kp_big_all, shared.flann_global,
         match_ratio, min_match,
         shared.map_width, shared.map_height,
         minimap_center=minimap_center,
@@ -608,7 +595,7 @@ def recognize_single():
         # 尝试宽松参数
         result = match_region(
             kp_mini, des_mini, gray.shape,
-            shared.kp_big_all, global_matcher,
+            shared.kp_big_all, shared.flann_global,
             0.88, 3,
             shared.map_width, shared.map_height,
             minimap_center=minimap_center,
@@ -633,7 +620,7 @@ def recognize_single():
             'status': {
                 'state': 'NOT_FOUND', 'found': False,
                 'position': {'x': 0, 'y': 0}, 'matches': 0,
-                'match_quality': 0, 'mode': 'sift',
+                'match_quality': 0, 'mode': 'orb',
             }
         })
 
@@ -659,7 +646,7 @@ def recognize_single():
             'status': {
                 'state': 'LOW_CONFIDENCE', 'found': False,
                 'position': {'x': 0, 'y': 0}, 'matches': int(inlier_count),
-                'match_quality': float(quality), 'mode': 'sift',
+                'match_quality': float(quality), 'mode': 'orb',
                 'source': f'ORB_GLOBAL_{source_tag}',
             }
         })
@@ -685,8 +672,7 @@ def recognize_single():
     img_b64 = 'data:image/jpeg;base64,' + base64.b64encode(jpeg_buf.tobytes()).decode('utf-8')
 
     source_parts = ['ORB_GLOBAL']
-    if use_lsh:
-        source_parts.append('LSH')
+    source_parts.append('LSH')
     if use_gms:
         source_parts.append('GMS')
     source_name = '_'.join(source_parts) + f'_{source_tag}'
@@ -697,7 +683,7 @@ def recognize_single():
         'status': {
             'state': 'FOUND', 'found': True, 'source': source_name,
             'position': {'x': int(tx), 'y': int(ty)}, 'matches': int(inlier_count),
-            'match_quality': float(quality), 'mode': 'sift',
+            'match_quality': float(quality), 'mode': 'orb',
         }
     })
 
@@ -1042,7 +1028,7 @@ def ws_request_jpeg():
 def ws_receive_frame(raw_bytes):
     """
     JPEG 模式专用：接收二进制 JPEG 帧，存帧并立即返回缓存坐标（pull 兜底）。
-    SIFT 运行在后台线程，完成后由 _on_result_ready 主动推送新结果（Plan A）。
+    特征匹配运行在后台线程，完成后由 _on_result_ready 主动推送新结果（Plan A）。
     协议: 客户端发送原始 JPEG bytes → 服务端返回 [JSON头(4字节长度) + JSON]
     """
     if len(raw_bytes) > _WS_FRAME_MAX_BYTES:
@@ -1059,7 +1045,7 @@ def ws_receive_frame(raw_bytes):
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if img is not None:
-        tracker_obj.set_minimap(img, token=token)  # 存帧并唤醒后台 SIFT 线程，结果由 _on_result_ready 定向推送
+        tracker_obj.set_minimap(img, token=token)  # 存帧并唤醒后台特征线程，结果由 _on_result_ready 定向推送
     else:
         err = b'{"error":"decode_fail"}'
         emit('error', struct.pack('>I', len(err)) + err)
@@ -1085,7 +1071,7 @@ def ws_frame_coords(raw_bytes):
         if not _jpeg_mgr.has_jpeg_clients(token):
             tracker_obj._push_jpeg = False
 
-        tracker_obj.set_minimap(img, token=token)  # 存帧并唤醒后台 SIFT 线程，结果由 _on_result_ready 定向推送
+        tracker_obj.set_minimap(img, token=token)  # 存帧并唤醒后台特征线程，结果由 _on_result_ready 定向推送
     else:
         err = b'{"error":"decode_fail"}'
         emit('error', struct.pack('>I', len(err)) + err)
@@ -1271,13 +1257,13 @@ def ws_bcast_frame(raw_bytes):
 
 # ---- 多用户/生产部署（gunicorn）说明 ----
 # 单用户直接: python main_web.py cpu
-# 多用户 6 核: MAP_TRACKER_MODE=sift SOCKETIO_ASYNC_MODE=gevent \
+# 多用户 6 核: MAP_TRACKER_MODE=orb SOCKETIO_ASYNC_MODE=gevent \
 #              gunicorn -w 4 --threads 2 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
 #              --preload "main_web:app"
-# 多用户 16 核: MAP_TRACKER_MODE=sift SOCKETIO_ASYNC_MODE=gevent \
+# 多用户 16 核: MAP_TRACKER_MODE=orb SOCKETIO_ASYNC_MODE=gevent \
 #               gunicorn -w 12 --threads 2 -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
 #              --preload "main_web:app"
-# --preload 保证 SIFT 特征点/FLANN 索引只构建一次，fork 后各 worker 共享只读内存（Linux CoW）
+# --preload 保证 ORB 特征点/FLANN 索引只构建一次，fork 后各 worker 共享只读内存（Linux CoW）
 # SocketIO 需要 geventwebsocket: pip install gevent gevent-websocket
 # 多进程时建议通过环境变量限制每进程 cv2 线程数: CV2_NUM_THREADS=2 gunicorn ...
 
@@ -1285,7 +1271,7 @@ def ws_bcast_frame(raw_bytes):
 def main():
     """\u63a7\u5236\u53f0\u5165\u53e3\uff1a\u4e0e pyproject.toml \u7684 console_scripts \u5bf9\u9f50\u3002"""
     print("=" * 50)
-    print("  \u5730\u56fe\u8ddf\u70b9 - \u7f51\u9875\u7248 [SIFT]")
+    print("  \u5730\u56fe\u8ddf\u70b9 - \u7f51\u9875\u7248 [ORB]")
     print(f"  SocketIO async_mode: {_SOCKETIO_ASYNC_MODE}")
     print(f"  SocketIO allow_upgrades: {_SOCKETIO_ALLOW_UPGRADES}")
     _log_socketio_runtime_diagnostics()

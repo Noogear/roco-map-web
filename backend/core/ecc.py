@@ -15,7 +15,7 @@ def phase_correlate(
     logic_map_gray: np.ndarray,
     cx_hint: int,
     cy_hint: int,
-    last_sift_scale: float,
+    last_feature_scale: float,
     map_width: int,
     map_height: int,
     jump_threshold: int,
@@ -33,7 +33,7 @@ def phase_correlate(
         mini(x) ≈ ref(x - shift_x)，即 minimap 中心对应
         ref 中 (w/2 - shift_x, h/2 - shift_y) 处。
     """
-    s = last_sift_scale
+    s = last_feature_scale
     h_mm, w_mm = minimap_gray.shape[:2]
     crop_w = int(w_mm * s * crop_ratio)
     crop_h = int(h_mm * s * crop_ratio)
@@ -78,7 +78,7 @@ def ecc_align(
     logic_map_gray: np.ndarray,
     cx_hint: int,
     cy_hint: int,
-    last_sift_scale: float,
+    last_feature_scale: float,
     map_width: int,
     map_height: int,
     jump_threshold: int,
@@ -94,7 +94,7 @@ def ecc_align(
         return_cc=True : (map_x, map_y, cc)
         失败时返回 None（失败/超跳变阈值）。
     """
-    s = last_sift_scale
+    s = last_feature_scale
     h_mm, w_mm = minimap_gray.shape[:2]
     crop_w = int(w_mm * s * 1.5)
     crop_h = int(h_mm * s * 1.5)

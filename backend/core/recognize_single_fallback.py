@@ -106,7 +106,7 @@ def build_hash_ecc_or_hash_fallback_status(
             'position': {'x': best_hit['x'], 'y': best_hit['y']},
             'matches': 0,
             'match_quality': best_hit['quality'],
-            'mode': 'sift',
+            'mode': 'orb',
         }
 
     hx, hy, hdist = candidates[0]
@@ -117,5 +117,5 @@ def build_hash_ecc_or_hash_fallback_status(
         'position': {'x': int(hx), 'y': int(hy)},
         'matches': 0,
         'match_quality': max(0.15, 0.35 - float(hdist) * 0.02),
-        'mode': 'sift',
+        'mode': 'orb',
     }

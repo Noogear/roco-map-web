@@ -3,7 +3,7 @@ push/manager.py — JPEG 客户端注册表与推送决策
 
 职责:
   - 追踪哪些 WebSocket 客户端处于 JPEG 模式（plan B: 控制后台 JPEG 编码开关）
-  - 记录 Plan A push 目标 SID（sift-worker 完成后定向推送）
+    - 记录 Plan A push 目标 SID（feature-worker 完成后定向推送）
   - 每客户端维护独立的 PushSession（节流锚点、force_next_jpeg）
   - 根据位移判断发送 result+JPEG 还是仅发 coords
 

@@ -2,7 +2,7 @@
 tracker_core.py - 追踪器编排层（无 Web 框架依赖）
 
 职责:
-  - 管理引擎实例(SIFT)的生命周期
+    - 管理特征引擎实例(ORB)的生命周期
   - 坐标平滑/线性过滤/异常值过滤
   - 帧处理流程编排: set_minimap -> process_frame
   - 结果渲染(裁剪地图 + 画箭头 + 编码PNG/JPEG)
@@ -53,12 +53,6 @@ class MapTrackerWeb:
     不包含任何 Web/Flask/SocketIO 代码。
     """
 
-    def __getattr__(self, name):
-        # 兼容旧测试桩：仅注入 sift_engine 时，feature_engine 自动回退到 sift_engine。
-        if name == 'feature_engine' and 'sift_engine' in self.__dict__:
-            return self.__dict__['sift_engine']
-        raise AttributeError(f"{self.__class__.__name__!s} object has no attribute {name!r}")
-
     def __init__(self, session_id: str = 'default', shared: SharedFeatureResources | None = None):
         bind_scope(self, DataScope.SESSION_SCOPED)
         # --- 会话标识 ---
@@ -69,7 +63,7 @@ class MapTrackerWeb:
             shared = get_shared_feature()
         self._shared = shared
         self.feature_engine = FeatureMapTracker(shared)
-        self.current_mode = 'sift'
+        self.current_mode = 'orb'
 
         # 显示地图改为模块级共享单例
         self.map_height = shared.map_height
@@ -77,7 +71,7 @@ class MapTrackerWeb:
 
         # 线程安全锁
         self.lock = Lock()          # 保护 current_frame_bgr 的读写
-        self._process_lock = Lock() # 防止后台线程与 HTTP 路由并发跑 SIFT
+        self._process_lock = Lock() # 防止后台线程与 HTTP 路由并发跑特征匹配
 
         # 当前帧数据
         self.current_frame_bgr = None
@@ -120,7 +114,7 @@ class MapTrackerWeb:
         self._last_active_ts: float = _time.time()
 
         self.latest_status = {
-            'mode': 'sift',
+            'mode': 'orb',
             'state': '--',
             'position': {'x': 0, 'y': 0},
             'found': False,
@@ -134,8 +128,8 @@ class MapTrackerWeb:
             },
         }
 
-        # ========== 后台帧处理线程（解耦 SIFT 与 WebSocket 热路径）==========
-        # SIFT 匹配运行在独立线程，WebSocket handler 可立即返回上一帧缓存结果。
+        # ========== 后台帧处理线程（解耦特征匹配与 WebSocket 热路径）==========
+        # 特征匹配运行在独立线程，WebSocket handler 可立即返回上一帧缓存结果。
         # 自动跳帧：若处理跟不上帧率，Event 被多次 set() 后只唤醒一次，
         # 每次 wait() 后取到的是最新的 current_frame_bgr（旧帧自动丢弃）。
         # Plan B: _push_jpeg=False 时跳过 cv2.imencode，节省 10-15ms/帧。
@@ -148,10 +142,10 @@ class MapTrackerWeb:
         self._worker_thread = Thread(
             target=self._background_processor,
             daemon=True,
-            name='sift-worker',
+            name='feature-worker',
         )
         self._worker_thread.start()
-        print("  [*] SIFT 后台处理线程已启动")
+        print("  [*] ORB 后台处理线程已启动")
 
     # ========== 场景切换检测 ==========
 
@@ -164,11 +158,11 @@ class MapTrackerWeb:
         with self.lock:
             self.current_frame_bgr = minimap_bgr.copy()
             self.current_frame_token = str(token or '')
-        self._new_frame_event.set()  # 唤醒后台 SIFT 工作线程
+        self._new_frame_event.set()  # 唤醒后台特征工作线程
 
     def _background_processor(self):
         """
-        后台 SIFT 工作线程：持续处理最新帧，不阻塞 WebSocket 接收。
+        后台特征工作线程：持续处理最新帧，不阻塞 WebSocket 接收。
 
         Event 语义保证自动跳帧：多帧对应同一个 Event.set()，
         clear() 后 current_frame_bgr 始终是最新帧（旧帧自动丢弃）。
@@ -179,13 +173,13 @@ class MapTrackerWeb:
             try:
                 self.process_frame(need_base64=False, need_jpeg=self._push_jpeg)
             except Exception as e:
-                print(f"[sift-worker] 处理异常: {e}")
+                print(f"[feature-worker] 处理异常: {e}")
                 continue
             if self.result_callback is not None:
                 try:
                     self.result_callback()
                 except Exception as cb_e:
-                    print(f"[sift-worker] result_callback 异常: {cb_e}")
+                    print(f"[feature-worker] result_callback 异常: {cb_e}")
 
     def reset_history(self):
         """清空平滑/历史状态，返回 cleared_count。"""
@@ -204,7 +198,7 @@ class MapTrackerWeb:
     def _full_reset_locked(self):
         """full_reset 的实际实现，调用前必须持有 _process_lock。"""
         cleared = self.reset_history()
-        # 重置 SIFT 引擎内部状态
+        # 重置特征引擎内部状态
         eng = self.feature_engine
         eng.last_x = None
         eng.last_y = None
@@ -259,7 +253,7 @@ class MapTrackerWeb:
         self._ab_prev_raw_xy = None
         # 重置 latest_status
         self.latest_status = {
-            'mode': 'sift',
+            'mode': 'orb',
             'state': '--',
             'position': {'x': 0, 'y': 0},
             'found': False,
@@ -287,7 +281,7 @@ class MapTrackerWeb:
 
     def _render_hold_position(self, x, y, state, half_view):
         """在保持旧坐标的场景下复用同一套渲染逻辑。"""
-        display_crop, _ = self._render_sift_crop(
+        display_crop, _ = self._render_tracking_crop(
             x, y, x, y, True, True, half_view)
         return True, display_crop, state, 0, x, y
 
@@ -323,7 +317,7 @@ class MapTrackerWeb:
         need_jpeg:
             是否立即生成 JPEG 字节（WebSocket / 最新帧接口使用）
         """
-        # 防止后台线程与 HTTP 同步路由（upload_minimap / /api/process）并发跑 SIFT。
+        # 防止后台线程与 HTTP 同步路由（upload_minimap / /api/process）并发跑特征匹配。
         # 后来的调用者等前一次完成后才进入，避免双重处理和结果互相覆盖。
         with self._process_lock:
             return self._process_frame_locked(need_base64, need_jpeg)
@@ -365,7 +359,7 @@ class MapTrackerWeb:
         half_view = config.VIEW_SIZE // 2
 
         t0 = time.perf_counter()
-        result = self._process_sift(minimap_bgr, half_view)
+        result = self._process_tracking(minimap_bgr, half_view)
         dt_ms = (time.perf_counter() - t0) * 1000.0
 
         found, display_crop, status_state, match_count, last_x, last_y = result
@@ -426,8 +420,8 @@ class MapTrackerWeb:
 
     # ========== 内部处理方法 ==========
 
-    def _process_sift(self, minimap_bgr, half_view):
-        """SIFT 模式的完整处理流程，返回 (found, crop, state, matches, x, y)"""
+    def _process_tracking(self, minimap_bgr, half_view):
+        """ORB 模式的完整处理流程，返回 (found, crop, state, matches, x, y)。"""
 
         engine = self.feature_engine
 
@@ -540,14 +534,14 @@ class MapTrackerWeb:
             engine.sync_external_position(smooth_x, smooth_y)
 
         # 渲染裁剪区域 + 画点
-        display_crop, status_state = self._render_sift_crop(
+        display_crop, status_state = self._render_tracking_crop(
             smooth_x, smooth_y, cx, cy, found, is_inertial, half_view)
 
         match_count = 0
         last_x = smooth_x
         last_y = smooth_y
 
-        # 取出 SIFT 引擎返回的实际匹配内点数
+        # 取出特征引擎返回的实际匹配内点数
         if found and not is_inertial:
             match_count = result.get('match_count', 0)
 
@@ -556,8 +550,8 @@ class MapTrackerWeb:
     def _ensure_display_map(self):
         return _ensure_shared_display_map()
 
-    def _render_sift_crop(self, smooth_x, smooth_y, cx, cy, found, is_inertial, half_view):
-        """SIFT 模式的地图裁剪，返回 (display_crop, status_state)。
+    def _render_tracking_crop(self, smooth_x, smooth_y, cx, cy, found, is_inertial, half_view):
+        """ORB 模式的地图裁剪，返回 (display_crop, status_state)。
         扩边 JPEG_PAD 像素供前端亚帧微平移；箭头/圆点由前端 60fps 叠加，此处不绘制。
         """
         display_map = self._ensure_display_map()

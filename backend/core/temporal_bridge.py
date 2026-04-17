@@ -2,7 +2,7 @@
 core/temporal_bridge.py - 低纹理时序桥接器（多假设轨迹）
 
 用途：
-    在 ocean / low_texture 场景中，融合弱观测（SIFT/ECC/HASH）与运动先验，
+    在 ocean / low_texture 场景中，融合弱观测（ORB/ECC/HASH）与运动先验，
     用 top-k 多假设做时序打分，避免逐帧贪心导致的错误吸附。
 """
 
@@ -65,10 +65,8 @@ class LowTextureTemporalBridge:
     def _is_strong_source(source: str) -> bool:
         if not source:
             return False
-        # 兼容旧命名(SIFT_*)与当前命名(ORB_*)
         return (
-            source in {'SIFT_LOCAL', 'SIFT_GLOBAL', 'SIFT_GLOBAL_REVALIDATED'}
-            or source == 'ORB_LOCAL'
+            source == 'ORB_LOCAL'
             or source.startswith('ORB_GLOBAL')
         )
 

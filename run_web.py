@@ -5,7 +5,7 @@ run_web.py - Web 版启动器（薄入口）
   python run_web.py
 
 gunicorn 生产部署:
-  MAP_TRACKER_MODE=sift SOCKETIO_ASYNC_MODE=gevent \
+    MAP_TRACKER_MODE=orb SOCKETIO_ASYNC_MODE=gevent \
   gunicorn -w 4 --threads 2 \
     -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker \
     --preload "backend.server:app"
@@ -71,7 +71,7 @@ def main() -> int:
 
     print(f"[startup] 前端静态资源来源: {build_result.get('activeSource', 'source')}")
 
-    # 仅在确认可启动后再导入，避免端口占用时重复初始化 SIFT 资源。
+    # 仅在确认可启动后再导入，避免端口占用时重复初始化特征资源。
     from backend.server import main as server_main
 
     server_main()
