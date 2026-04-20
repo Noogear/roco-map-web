@@ -1,0 +1,9 @@
+total_processed_frames: 500
+elapsed_sec: 2.98
+cumulative_path_length_px: 0.00
+cumulative_displacement_px: 0.00
+cumulative_dx: 0.00
+cumulative_dy: 0.00
+mean_latency_ms: 1.9
+median_latency_ms: 0.9
+p95_latency_ms: 1.4

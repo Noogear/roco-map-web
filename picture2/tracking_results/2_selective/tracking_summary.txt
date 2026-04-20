@@ -1,0 +1,7 @@
+total_processed_frames: 100
+elapsed_sec: 4.06
+cumulative_path_length_px: 0.00
+cumulative_displacement_px: 0.00
+cumulative_dx: 0.00
+cumulative_dy: 0.00
+tracked_icon_count: 1

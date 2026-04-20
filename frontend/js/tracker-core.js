@@ -73,7 +73,9 @@ const TrackerCore = (() => {
     var _fmtResult = function(st, kbStr) {
         var state = st.state || '';
         var icon, tag;
-        if (state === 'SCENE_CHANGE') {
+        if (st.frozen) {
+            icon = '❄️'; tag = '冻结';
+        } else if (state === 'SCENE_CHANGE') {
             icon = '🔄'; tag = '切场';
         } else if (state === 'GLOBAL_SCAN' && !st.found) {
             icon = '🔍'; tag = '全扫';
@@ -178,11 +180,10 @@ const TrackerCore = (() => {
         var cx = sc.cx * vw, cy = sc.cy * vh, r = sc.r * bs;
         var margin = 1.4;
         var sz = Math.max(10, Math.round(r * 2 * margin));
-        return {
-            sz: sz,
-            rx: Math.round(cx - sz / 2),
-            ry: Math.round(cy - sz / 2),
-        };
+        // 钳位到视频边界，防止 drawImage 源坐标越界导致图像偏移
+        var rx = Math.max(0, Math.min(Math.round(cx - sz / 2), vw - sz));
+        var ry = Math.max(0, Math.min(Math.round(cy - sz / 2), vh - sz));
+        return { sz: sz, rx: rx, ry: ry };
     };
 
     var _drawCaptureToCanvas = function(vid, rect) {
@@ -314,7 +315,9 @@ const TrackerCore = (() => {
             var text = '--', cls = 'green', label = '';
             var found = !!status.found;
             if (status.mode === 'orb') {
-                if (status.state === 'SCENE_CHANGE') {
+                if (status.frozen) {
+                    text = '冻结'; cls = 'yellow'; label = '冻结保持';
+                } else if (status.state === 'SCENE_CHANGE') {
                     text = '切场'; cls = 'yellow'; label = '场景切换';
                 } else if (!found) {
                     text = '丢失'; cls = 'red'; label = '未找到';
@@ -454,6 +457,8 @@ const TrackerCore = (() => {
                         S.videoW = osv.videoWidth;
                         S.videoH = osv.videoHeight;
                         if (o.onMeta) o.onMeta(S.videoW, S.videoH);
+                        // 自动校准：首帧就发送全帧进行小地图检测
+                        self._autoCalibrate();
                     };
                 }
 
@@ -556,6 +561,38 @@ const TrackerCore = (() => {
             return new Promise(function (resolve) {
                 c.toBlob(function (blob) { resolve(blob); }, 'image/jpeg', quality || 0.85);
             });
+        },
+
+        /**
+         * 自动校准：发送全帧到后端 auto-detect API，更新 selCircle。
+         * 在屏幕捕获开始时自动调用一次。
+         */
+        _autoCalibrate() {
+            var self = this;
+            // 延迟 500ms 确保视频帧已渲染
+            setTimeout(function() {
+                self.captureFullFrameBlob(0.85).then(function(blob) {
+                    if (!blob) { self.log('⚠️ 自动校准：无法获取全帧'); return; }
+                    self.log('🔍 正在自动检测小地图位置...');
+                    var fd = new FormData();
+                    fd.append('image', blob, 'fullframe.jpg');
+                    fetch('/api/detect_minimap_circle', { method: 'POST', body: fd })
+                        .then(function(r) { return r.json(); })
+                        .then(function(data) {
+                            if (data && data.ok) {
+                                S.selCircle.cx = data.cx;
+                                S.selCircle.cy = data.cy;
+                                S.selCircle.r  = data.r;
+                                S.captureCanvas = null;
+                                try { localStorage.setItem('tc_selCircle', JSON.stringify({ cx: data.cx, cy: data.cy, r: data.r })); } catch (_e) {}
+                                self.log('✅ 小地图位置已自动校准: cx=' + data.cx.toFixed(3) + ' cy=' + data.cy.toFixed(3) + ' r=' + data.r.toFixed(3) + ' (置信度=' + (data.confidence || 0).toFixed(2) + ')');
+                            } else {
+                                self.log('⚠️ 自动校准失败: ' + (data.error || '未知错误') + '，使用默认位置');
+                            }
+                        })
+                        .catch(function(e) { self.log('⚠️ 自动校准请求失败: ' + e.message); });
+                });
+            }, 500);
         },
         sendAndDisplay(imageDataURL) {
             var self = this;
@@ -666,6 +703,7 @@ const TrackerCore = (() => {
                                 arrow_stopped: !!status.as,
                                 coord_lock: !!status.l,
                                 source: status.src || '',
+                                frozen: !!status.fz,
                             }
                         };
                         self.logUpdate(_fmtResult(result.status, (byteLen / 1024).toFixed(1)));
@@ -699,10 +737,47 @@ const TrackerCore = (() => {
                             coord_lock: !!status.l,
                             is_teleport: !!status.tp,
                             source: status.src || '',
+                            frozen: !!status.fz,
                         }
                     };
                     self.logUpdate(_fmtResult(result.status, (buf.byteLength / 1024).toFixed(1)));
                     if (opts.onAnalyzeResult) opts.onAnalyzeResult(result);
+                };
+
+                // 诊断面板：渲染裁剪区域和小地图缩略图
+                var _renderDebugCrop = function(cropB64, cropSize, mmB64, mmSize, st) {
+                    var section = document.getElementById('debugCropSection');
+                    if (!section) return;
+                    section.style.display = '';
+                    // 辅助：将 base64 JPEG 渲染到 canvas，尺寸变化时才重置（防清空闪帧）
+                    function _drawToCanvas(canvasId, b64) {
+                        var canvas = document.getElementById(canvasId);
+                        if (!canvas || !b64) return;
+                        // 用缓存 key 避免相同帧重复解码
+                        if (canvas._lastB64 === b64) return;
+                        canvas._lastB64 = b64;
+                        var imgEl = new Image();
+                        imgEl.onload = function() {
+                            if (canvas.width !== imgEl.width || canvas.height !== imgEl.height) {
+                                canvas.width = imgEl.width;
+                                canvas.height = imgEl.height;
+                            }
+                            var ctx = canvas.getContext('2d');
+                            if (ctx) ctx.drawImage(imgEl, 0, 0);
+                        };
+                        imgEl.src = 'data:image/jpeg;base64,' + b64;
+                    }
+                    _drawToCanvas('debugCropCanvas', cropB64);
+                    _drawToCanvas('debugMinimapCanvas', mmB64);
+                    var info = document.getElementById('debugCropInfo');
+                    if (info) {
+                        var sc = S.selCircle;
+                        info.textContent = '裁剪=' + (cropSize || '?') +
+                            ' 小地图=' + (mmSize || '?') +
+                            ' | selCircle: cx=' + sc.cx.toFixed(3) + ' cy=' + sc.cy.toFixed(3) + ' r=' + sc.r.toFixed(3) +
+                            ' | 状态=' + (st.state || '?') + ' 匹配=' + st.matches + ' 质量=' + (st.match_quality || 0).toFixed(2) +
+                            ' 来源=' + (st.source || '-');
+                    }
                 };
 
                 var bindResultHandlers = function(sock) {
@@ -732,6 +807,47 @@ const TrackerCore = (() => {
                             data.arrayBuffer().then(function(ab) { _processCoordsResult(ab); });
                         }
                     });
+
+                    /* selCircle 自愈：后端检测到持续匹配失败，请求全帧用于重新校准 */
+                    sock.on('request_fullframe', function() {
+                        self.log('🔄 后端请求重新校准小地图位置...');
+                        var vid = S.offscreenVid;
+                        if (!vid || !vid.videoWidth) {
+                            self.log('⚠️ 视频流未就绪，无法发送全帧');
+                            return;
+                        }
+                        var vw = vid.videoWidth, vh = vid.videoHeight;
+                        var c = document.createElement('canvas');
+                        c.width = vw; c.height = vh;
+                        var ctx = c.getContext('2d');
+                        if (!ctx) return;
+                        ctx.drawImage(vid, 0, 0, vw, vh);
+                        c.toBlob(function(blob) {
+                            if (!blob) return;
+                            blob.arrayBuffer().then(function(ab) {
+                                sock.emit('fullframe_for_calibration', ab);
+                            });
+                        }, 'image/jpeg', 0.85);
+                    });
+
+                    /* selCircle 自愈：后端返回新校准值 */
+                    sock.on('calibration_update', function(data) {
+                        if (!data || !data.ok) return;
+                        var oldCx = S.selCircle.cx, oldCy = S.selCircle.cy;
+                        S.selCircle.cx = data.cx;
+                        S.selCircle.cy = data.cy;
+                        S.selCircle.r  = data.r;
+                        S.captureCanvas = null;
+                        try { localStorage.setItem('tc_selCircle', JSON.stringify({ cx: data.cx, cy: data.cy, r: data.r })); } catch (_e) {}
+                        var reason = data.reason === 'auto_detected' ? '自动检测' : '默认值';
+                        self.log('✅ 小地图位置已自动重新校准（' + reason + '）: cx=' + data.cx.toFixed(3) + ' cy=' + data.cy.toFixed(3));
+                    });
+
+                    /* 诊断：接收后端推送的调试裁剪图 */
+                    sock.on('debug_crop', function(data) {
+                        if (!data) return;
+                        _renderDebugCrop(data._dc, data._dcs, data._dm, data._dms, {});
+                    });
                 };
 
                 var attemptConnect = function(pollingOnly) {
@@ -743,14 +859,6 @@ const TrackerCore = (() => {
                         S.wsTransportName = _getSocketTransportName(sock);
                         S.wsConnecting = null;
                         _bindSocketTransportEvents(sock, self);
-
-                        try {
-                            if (S.wsTransportName === 'websocket') {
-                                localStorage.removeItem('tc_ws_polling_only');
-                            } else {
-                                localStorage.setItem('tc_ws_polling_only', '1');
-                            }
-                        } catch (_e) {}
 
                         // 多会话: 报告 token 绑定会话
                         var token = self._ensureSessionToken();
@@ -798,11 +906,8 @@ const TrackerCore = (() => {
                 };
 
                 try {
-                    var preferPollingOnly = false;
-                    try {
-                        preferPollingOnly = localStorage.getItem('tc_ws_polling_only') === '1';
-                    } catch (_e) {}
-                    attemptConnect(preferPollingOnly);
+                    // 始终尝试 WebSocket 升级（polling 先建连，再尝试 upgrade）
+                    attemptConnect(false);
                 } catch(e) {
                     reject(e);
                 }

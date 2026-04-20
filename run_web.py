@@ -16,7 +16,7 @@ import socket
 from pathlib import Path
 
 from backend import config
-from backend.frontend_build import prebuild_frontend
+from backend.web.io.frontend_build import prebuild_frontend
 
 
 def _load_dotenv_defaults(dotenv_path: Path) -> None:
@@ -71,7 +71,7 @@ def main() -> int:
 
     print(f"[startup] 前端静态资源来源: {build_result.get('activeSource', 'source')}")
 
-    # 仅在确认可启动后再导入，避免端口占用时重复初始化特征资源。
+    # 仅在确认可启动后再导入，避免端口占用时重复初始化资源。
     from backend.server import main as server_main
 
     server_main()

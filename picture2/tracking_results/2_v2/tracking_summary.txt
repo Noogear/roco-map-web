@@ -1,0 +1,12 @@
+total_processed_frames: 200
+elapsed_sec: 201.80
+cumulative_path_length_px: 348.52
+cumulative_displacement_px: 78.16
+cumulative_dx: 19.25
+cumulative_dy: -75.75
+tracked_icon_count: 33
+moving_frames: 159
+mean_frame_disp: 2.19
+median_frame_disp: 1.41
+p95_frame_disp: 5.21
+max_frame_disp: 27.80

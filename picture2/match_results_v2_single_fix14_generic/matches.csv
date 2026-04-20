@@ -1,0 +1,4 @@
+image,icon,score,color_sim,masked_ncc,x,y,w,h,center_x,center_y,is_edge,minimap_w,minimap_h,minimap_r,detect_center_x,detect_center_y
+QQ20260412-010841.png,0002,0.6425,0.0,0.6425,145,100,25,30,157.5,115.0,True,172,172,86,1925,175
+QQ20260412-010841.png,055,0.6325,0.0,0.6325,28,18,25,24,40.5,30.0,True,172,172,86,1925,175
+QQ20260412-010841.png,021,0.5696,0.0,0.5696,104,110,32,22,120.0,121.0,False,172,172,86,1925,175

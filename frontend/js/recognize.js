@@ -18,7 +18,7 @@ const prefs = AppCommon.loadPrefs();
         renderFps: prefs.renderFps || 60,
         displayMap: null, mapLoadProgress: 0,
         displayMapLoading: false, displayMapReady: false, displayMapFailed: false,
-        displayMapUrl: '/img/map/map_z7.webp',
+        displayMapUrl: '/assets/map/map_z7.webp',
         displayMapNaturalWidth: 0, displayMapNaturalHeight: 0,
         renderPos: null,
         lastJpegImg: null, lastJpegPos: null, prevJpegImg: null, prevJpegPos: null,
@@ -196,7 +196,7 @@ const prefs = AppCommon.loadPrefs();
         onAnalyzeResult: function (result) {
             if (result.status && result.status.position) {
                 var st = result.status;
-                var hasTrackPos = !!st.found || st.state === 'INERTIAL' || st.state === 'SCENE_CHANGE';
+                var hasTrackPos = !!st.found || !!st.frozen || st.state === 'INERTIAL' || st.state === 'SCENE_CHANGE';
                 var prevState = R.mapState;
                 var nx = (st.position && typeof st.position.x === 'number') ? st.position.x : (prevState ? prevState.x : 0);
                 var ny = (st.position && typeof st.position.y === 'number') ? st.position.y : (prevState ? prevState.y : 0);
@@ -211,7 +211,7 @@ const prefs = AppCommon.loadPrefs();
                 R.mapState = {
                     x: nx, y: ny, angle: st.arrow_angle || 0,
                     stopped: !!st.arrow_stopped, found: !!st.found,
-                    isInertial: st.state === 'INERTIAL', isSceneChange: st.state === 'SCENE_CHANGE',
+                    isInertial: st.state === 'INERTIAL', isSceneChange: st.state === 'SCENE_CHANGE', isFrozen: !!st.frozen,
                     ts: performance.now()
                 };
 
@@ -231,7 +231,9 @@ const prefs = AppCommon.loadPrefs();
                 TC.updateStatusDOM(result.status);
                 var fmt = TC.formatStatus(result.status);
                 statusStateText.textContent = fmt.stateText;
-                screenStateChip.textContent = result.status.found ? '📡 已识别' : '📡 等待识别';
+                screenStateChip.textContent = result.status.frozen
+                    ? '🧊 冻结中'
+                    : (result.status.found ? '📡 已识别' : '📡 等待识别');
                 /* 额外状态格 */
                 var angleEl = document.getElementById('statusAngle');
                 if (angleEl) angleEl.textContent = result.status.arrow_angle != null
@@ -956,7 +958,7 @@ const prefs = AppCommon.loadPrefs();
                 // 手动更新前端 UI（复用 onAnalyzeResult 的逻辑）
                 if (result && result.status) {
                     var st = result.status;
-                    var hasTrackPos = !!st.found || st.state === 'INERTIAL' || st.state === 'SCENE_CHANGE';
+                    var hasTrackPos = !!st.found || !!st.frozen || st.state === 'INERTIAL' || st.state === 'SCENE_CHANGE';
                     var prevState = R.mapState;
 
                     R.mapStatePrev = R.mapState;
@@ -975,7 +977,7 @@ const prefs = AppCommon.loadPrefs();
                         R.mapState = {
                             x: nx, y: ny, angle: st.arrow_angle || 0,
                             stopped: true, found: !!st.found,
-                            isInertial: st.state === 'INERTIAL', isSceneChange: st.state === 'SCENE_CHANGE',
+                            isInertial: st.state === 'INERTIAL', isSceneChange: st.state === 'SCENE_CHANGE', isFrozen: !!st.frozen,
                             ts: performance.now()
                         };
 

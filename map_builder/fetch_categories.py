@@ -2,9 +2,16 @@ import os
 import re
 import json
 import requests
+import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_CATS = os.path.join(_HERE, "categories.json")
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from path_config import ASSETS_MARKER_DATA_DIR
+
+OUTPUT_CATS = os.path.join(str(ASSETS_MARKER_DATA_DIR), "categories.json")
 
 def find_main_js_url(session):
     """Finds the main hashed JS file from the 17173 interactive map HTML."""
@@ -117,6 +124,7 @@ def main():
         print("[错误] 解析分类字典失败")
         return
         
+    os.makedirs(str(ASSETS_MARKER_DATA_DIR), exist_ok=True)
     with open(OUTPUT_CATS, "w", encoding="utf-8") as f:
         json.dump(cat_dict, f, ensure_ascii=False, indent=2)
         

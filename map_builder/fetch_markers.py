@@ -13,15 +13,20 @@ import os
 import sys
 import requests
 
-# ── 配置 ──────────────────────────────────────────────────────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(os.path.dirname(_HERE))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from path_config import ASSETS_MARKER_DATA_DIR, FRONTEND_IMG_DIR
+
+# ── 配置 ─────────────────────────────────────────────────
 MAP_ID = 4010
 API_URL = f"https://map.17173.com/app/location/list?mapIds={MAP_ID}"
 ICON_CDN = "https://ue.17173cdn.com/a/terra/icon/rocom/{cat_id}.png"
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_HERE = os.path.dirname(os.path.abspath(__file__))
-ICON_DIR = os.path.join(_ROOT, "frontend", "img")   # 图标保存路径
-OUTPUT_LITE_JSON = os.path.join(_HERE, "rocom_markers_lite.json")
-OUTPUT_DETAIL_JSON = os.path.join(_HERE, "rocom_markers_detail.json")
+ICON_DIR = str(FRONTEND_IMG_DIR)   # 图标保存路径
+OUTPUT_LITE_JSON = os.path.join(str(ASSETS_MARKER_DATA_DIR), "rocom_markers_lite.json")
+OUTPUT_DETAIL_JSON = os.path.join(str(ASSETS_MARKER_DATA_DIR), "rocom_markers_detail.json")
 
 # 地图 Mapbox GL bounds：[west_lng, south_lat, east_lng, north_lat]
 BOUNDS_W, BOUNDS_S, BOUNDS_E, BOUNDS_N = -1.4, 0.0, 0.0, 1.4
@@ -119,6 +124,7 @@ def main():
 
     print(f"共获取到 {len(raw_list)} 个标记点，开始转换坐标并下载图标…")
     os.makedirs(ICON_DIR, exist_ok=True)
+    os.makedirs(str(ASSETS_MARKER_DATA_DIR), exist_ok=True)
 
     icon_ids_seen: set[int] = set()
     points_lite = []
@@ -182,8 +188,8 @@ def main():
     print(f"详情数据已保存到 {OUTPUT_DETAIL_JSON}")
     print(f"图标已下载到 {ICON_DIR}/")
     print(f"\n使用方式：")
-    print(f"  points_lite  = json.load(open('rocom_markers_lite.json'))    # 前端仅需要 id, markType, x, y")
-    print(f"  points_detail = json.load(open('rocom_markers_detail.json'))  # 弹窗所需的图片文本")
+    print(f"  points_lite  = json.load(open('{OUTPUT_LITE_JSON}'))    # 前端仅需要 id, markType, x, y")
+    print(f"  points_detail = json.load(open('{OUTPUT_DETAIL_JSON}'))  # 弹窗所需的图片文本")
 
 
 if __name__ == "__main__":

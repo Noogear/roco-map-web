@@ -132,6 +132,26 @@
                                     </button>
                                 </div>
                             </section>
+
+                            <section class="rec-panel-section" id="debugCropSection" style="display:none;">
+                                <div class="rec-section-head">
+                                    <div>
+                                        <div class="rec-section-kicker">Debug</div>
+                                        <div class="rec-section-title">裁剪诊断</div>
+                                    </div>
+                                </div>
+                                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                                    <div style="text-align:center;">
+                                        <div style="font-size:11px;color:#888;margin-bottom:2px;">裁剪区域</div>
+                                        <canvas id="debugCropCanvas" width="120" height="120" style="border:1px solid #555;border-radius:4px;"></canvas>
+                                    </div>
+                                    <div style="text-align:center;">
+                                        <div style="font-size:11px;color:#888;margin-bottom:2px;">提取小地图</div>
+                                        <canvas id="debugMinimapCanvas" width="120" height="120" style="border:1px solid #555;border-radius:4px;"></canvas>
+                                    </div>
+                                </div>
+                                <div id="debugCropInfo" style="font-size:11px;color:#aaa;margin-top:4px;word-break:break-all;"></div>
+                            </section>
                         </div>
                     </aside>
                 </div>

@@ -13,7 +13,7 @@ const prefs = AppCommon.loadPrefs();
         MC: document.getElementById('mc'),
         MW: document.getElementById('mw'),
         MI: document.getElementById('mi'),
-        mapImageUrl: '/img/map/map_z7.webp',
+        mapImageUrl: '/assets/map/map_z7.webp',
         MARKER_CANVAS: document.getElementById('markerCanvas'),
         markerCtx: document.getElementById('markerCanvas').getContext('2d'),
         PLAYER_DOT: document.getElementById('playerDot'),
